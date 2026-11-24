@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.impeccable/
+
+# Local configuration and workspace data
+.env
+.env.*
+!.env.example
+.flash-marking-down/
+
+# Local coordination and trial materials
+/AGENTS.md
+/PROGRESS.md
+/docs/validation/
+/docs/产品方案_v0.2_2026-11-17.md

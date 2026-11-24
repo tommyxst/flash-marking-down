@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "capture-window",
+  "description": "监听快捷窗关闭请求",
+  "windows": ["capture"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

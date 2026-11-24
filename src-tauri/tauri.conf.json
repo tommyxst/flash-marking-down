@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Flash Marking Down",
+  "version": "0.1.0",
+  "identifier": "com.flash-marking-down.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Flash Marking Down",
+        "decorations": false,
+        "theme": "Dark",
+        "width": 1280,
+        "height": 900,
+        "minWidth": 640,
+        "minHeight": 480,
+        "preventOverflow": true
+      },
+      {
+        "label": "capture",
+        "create": false,
+        "title": "随手记",
+        "decorations": false,
+        "theme": "Dark",
+        "width": 540,
+        "height": 380,
+        "minWidth": 420,
+        "minHeight": 280,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}
