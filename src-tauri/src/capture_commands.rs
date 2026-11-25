@@ -1,15 +1,12 @@
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use tauri::async_runtime::{self, Mutex as AsyncMutex};
 use tauri::menu::{Menu, MenuEvent, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{
-    AppHandle, Emitter, Manager, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
+    AppHandle, Emitter, Listener, Manager, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
 
 use crate::dto::{
@@ -17,10 +14,10 @@ use crate::dto::{
     RecoveryErrorDto, SearchHitDto, SearchPageDto,
 };
 use crate::platform::ForegroundWindow;
-use crate::storage::{RecoveryOutcome, SearchReader, Storage, StorageError, error};
+use crate::settings;
+use crate::storage::{SearchReader, Storage, StorageError, WorkspaceStorage};
 use crate::workspace::STATE_DIR;
 
-const SELECTION_FILE: &str = "last-workspace.sqlite";
 const CAPTURE_DRAFT: &str = "quick-capture";
 const MAIN_WINDOW: &str = "main";
 const CAPTURE_WINDOW: &str = "capture";
@@ -112,124 +109,20 @@ fn capture_closed(app: &AppHandle) {
     }
 }
 
-struct WorkspaceSelection {
-    root: String,
-    capture_dir: String,
-    workspace_id: String,
-    file_identity: String,
-}
-
-impl WorkspaceSelection {
-    fn load(path: &Path) -> Result<Option<Self>, StorageError> {
-        match fs::symlink_metadata(path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(selection_error(error)),
-        }
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(selection_error)?;
-        connection
-            .pragma_update(None, "busy_timeout", 5000)
-            .map_err(selection_error)?;
-        let initialized: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'last_workspace')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(selection_error)?;
-        if !initialized {
-            return Ok(None);
-        }
-        connection
-            .query_row(
-                "SELECT root, capture_dir, workspace_id, file_identity
-                 FROM last_workspace WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok(Self {
-                        root: row.get(0)?,
-                        capture_dir: row.get(1)?,
-                        workspace_id: row.get(2)?,
-                        file_identity: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(selection_error)
-    }
-
-    fn save(path: &Path, root: &str, storage: &Storage) -> Result<(), StorageError> {
-        fs::create_dir_all(
-            path.parent()
-                .expect("selection file is in an app directory"),
-        )
-        .map_err(selection_error)?;
-        let mut connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(selection_error)?;
-        connection
-            .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;")
-            .map_err(selection_error)?;
-        let tx = connection.transaction().map_err(selection_error)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS last_workspace (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                 root TEXT NOT NULL, capture_dir TEXT NOT NULL,
-                 workspace_id TEXT NOT NULL, file_identity TEXT NOT NULL
-             );",
-        )
-        .map_err(selection_error)?;
-        tx.execute(
-            "INSERT INTO last_workspace (singleton, root, capture_dir, workspace_id, file_identity)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(singleton) DO UPDATE SET root = excluded.root,
-                 capture_dir = excluded.capture_dir, workspace_id = excluded.workspace_id,
-                 file_identity = excluded.file_identity",
-            params![
-                root,
-                storage.capture_dir(),
-                storage.workspace_id(),
-                storage.file_identity()
-            ],
-        )
-        .map_err(selection_error)?;
-        tx.commit().map_err(selection_error)
-    }
-}
-
-fn selection_error(detail: impl std::fmt::Display) -> StorageError {
-    error(
-        "WRITE_FAILED",
-        "workspace_selection",
-        None,
-        true,
-        "无法读取或保存上次工作区设置",
-        detail,
-    )
-}
-
 #[derive(Default)]
 pub(crate) struct WorkspaceState {
     generation: u64,
-    active: Option<Storage>,
+    active: Option<WorkspaceStorage>,
     root: String,
 }
 
 impl WorkspaceState {
     fn activate(
         &mut self,
-        selection_file: &Path,
+        settings_file: &Path,
         root: &str,
         capture_dir: &str,
-        expected: Option<&WorkspaceSelection>,
+        remember: bool,
     ) -> Result<OpenedWorkspaceDto, StorageError> {
         let root_path = Path::new(root);
         let capture_path = Path::new(if capture_dir.is_empty() {
@@ -237,67 +130,31 @@ impl WorkspaceState {
         } else {
             capture_dir
         });
-        let mut opened = None;
-        let storage = match self.active.as_mut() {
-            Some(storage) if storage.matches_root(root_path)? => {
-                if let Some(expected) = expected {
-                    storage.verify_capture_dir(capture_path)?;
-                    storage.verify_identity(&expected.workspace_id, &expected.file_identity)?;
-                } else {
-                    storage.update_capture_dir(capture_path)?;
-                }
-                storage
-            }
-            _ => opened.insert(match expected {
-                Some(expected) => Storage::reopen(
-                    root_path,
-                    capture_path,
-                    STATE_DIR,
-                    &expected.workspace_id,
-                    &expected.file_identity,
-                )?,
-                None => Storage::open(root_path, capture_path, STATE_DIR)?,
-            }),
-        };
-
+        let mut storage = Storage::open(root_path, capture_path, STATE_DIR)?;
         let generation = self.generation + 1;
-        let mut view = workspace_view(storage, generation.to_string(), root)?;
-        for (id, state, message) in storage.recover_wiki_changes()? {
-            if state != "applied" {
-                view.recovery_errors.push(RecoveryErrorDto {
-                    request_id: id,
-                    message,
-                });
-            }
+        let view = workspace_view(&mut storage, generation.to_string(), root)?;
+        if remember {
+            settings::update(settings_file, |settings| {
+                settings.last_workspace_root = Some(root.to_owned());
+                settings.last_capture_dir = storage.capture_dir().to_owned();
+            })?;
         }
-        if expected.is_none() {
-            WorkspaceSelection::save(selection_file, root, storage)?;
-        }
-        if let Some(storage) = opened {
-            self.active = Some(storage);
-        }
+        self.active = Some(storage.into_workspace());
         self.generation = generation;
         self.root = root.to_owned();
         Ok(view)
     }
 
-    fn resume(
-        &mut self,
-        selection_file: &Path,
-    ) -> Result<Option<OpenedWorkspaceDto>, StorageError> {
-        WorkspaceSelection::load(selection_file)?
-            .map(|selection| {
-                self.activate(
-                    selection_file,
-                    &selection.root,
-                    &selection.capture_dir,
-                    Some(&selection),
-                )
-            })
+    fn resume(&mut self, settings_file: &Path) -> Result<Option<OpenedWorkspaceDto>, StorageError> {
+        let settings = settings::read(settings_file)?;
+        settings
+            .last_workspace_root
+            .as_deref()
+            .map(|root| self.activate(settings_file, root, &settings.last_capture_dir, false))
             .transpose()
     }
 
-    fn workspace(&mut self, session: &str) -> Result<&mut Storage, AppError> {
+    fn workspace(&mut self, session: &str) -> Result<&mut WorkspaceStorage, AppError> {
         self.active
             .as_mut()
             .filter(|_| session == self.generation.to_string())
@@ -316,24 +173,28 @@ impl WorkspaceState {
             .active
             .as_mut()
             .ok_or_else(|| AppError::invalid("workspace", "请先在主窗口打开工作区"))?;
-        workspace_view(storage, self.generation.to_string(), &self.root).map_err(AppError::from)
+        storage.with_storage(|storage| {
+            workspace_view(storage, self.generation.to_string(), &self.root).map_err(AppError::from)
+        })
     }
 
-    fn read_active(&self) -> Result<OpenedWorkspaceDto, AppError> {
+    fn read_active(&mut self) -> Result<OpenedWorkspaceDto, AppError> {
         let storage = self
             .active
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| AppError::invalid("workspace", "请先在主窗口打开工作区"))?;
-        let pending = storage.current_draft_intent(CAPTURE_DRAFT)?;
-        let (revision, body) = storage.draft_state(CAPTURE_DRAFT)?;
-        Ok(OpenedWorkspaceDto {
-            session: self.generation.to_string(),
-            root: self.root.clone(),
-            capture_dir: storage.capture_dir().to_owned(),
-            draft: DraftDto { revision, body },
-            recovered: Vec::new(),
-            recovery_errors: Vec::new(),
-            pending_request_id: pending.map(|(request, ..)| request),
+        storage.with_storage(|storage| {
+            let pending = storage.committed_draft(CAPTURE_DRAFT)?;
+            let (revision, body) = storage.draft_state(CAPTURE_DRAFT)?;
+            Ok(OpenedWorkspaceDto {
+                session: self.generation.to_string(),
+                root: self.root.clone(),
+                capture_dir: storage.capture_dir().to_owned(),
+                draft: DraftDto { revision, body },
+                recovered: Vec::new(),
+                recovery_errors: Vec::new(),
+                pending_request_id: pending.map(|(request, ..)| request),
+            })
         })
     }
 }
@@ -345,30 +206,17 @@ fn workspace_view(
 ) -> Result<OpenedWorkspaceDto, StorageError> {
     let mut recovered = Vec::new();
     let mut failures = Vec::new();
-    for RecoveryOutcome { request_id, result } in storage.recover_pending()? {
-        match result {
-            Ok(record) => recovered.push(record.relative_path),
-            Err(error) => failures.push(RecoveryErrorDto {
-                request_id,
-                message: error.safe_message.to_owned(),
-            }),
-        }
-    }
     let mut pending = None;
-    if let Some((request_id, path, committed)) = storage.current_draft_intent(CAPTURE_DRAFT)? {
-        if committed {
-            if !recovered.contains(&path) {
-                recovered.push(path);
-            }
-            if let Err(error) = storage.clear_committed_draft(&request_id) {
+    if let Some((request_id, path)) = storage.committed_draft(CAPTURE_DRAFT)? {
+        match storage.clear_committed_draft(&request_id) {
+            Ok(_) => recovered.push(path),
+            Err(error) => {
                 failures.push(RecoveryErrorDto {
                     request_id: request_id.clone(),
                     message: error.safe_message.to_owned(),
                 });
                 pending = Some(request_id);
             }
-        } else {
-            pending = Some(request_id);
         }
     }
     let (revision, body) = storage.draft_state(CAPTURE_DRAFT)?;
@@ -381,13 +229,6 @@ fn workspace_view(
         recovery_errors: failures,
         pending_request_id: pending,
     })
-}
-
-fn selection_file(app: &AppHandle) -> Result<PathBuf, AppError> {
-    app.path()
-        .app_local_data_dir()
-        .map(|path| path.join(SELECTION_FILE))
-        .map_err(|error| AppError::from(selection_error(error)))
 }
 
 async fn in_main_window<T: Send + 'static>(
@@ -442,7 +283,10 @@ pub(crate) async fn with_workspace<T: Send + 'static>(
     session: String,
     action: impl FnOnce(&mut Storage) -> Result<T, AppError> + Send + 'static,
 ) -> Result<T, AppError> {
-    in_main_window(window, move |state, _| action(state.workspace(&session)?)).await
+    in_main_window(window, move |state, _| {
+        state.workspace(&session)?.with_storage(action)
+    })
+    .await
 }
 
 async fn with_draft_workspace<T: Send + 'static>(
@@ -459,7 +303,7 @@ async fn with_draft_workspace<T: Send + 'static>(
         if capture != app.state::<DesktopWindows>().capture_active() {
             return Err(AppError::invalid("draft", "请在当前记录窗口操作草稿"));
         }
-        action(state.workspace(&session)?)
+        state.workspace(&session)?.with_storage(action)
     })
     .await
 }
@@ -470,12 +314,33 @@ pub(crate) async fn open_workspace(
     root: String,
     capture_dir: String,
 ) -> Result<OpenedWorkspaceDto, AppError> {
+    if window.label() == MAIN_WINDOW
+        && window.state::<DesktopWindows>().capture_active()
+        && let Some(capture) = window.get_webview_window(CAPTURE_WINDOW)
+    {
+        let desktop = window.state::<DesktopWindows>();
+        *desktop.previous_focus.lock().unwrap() =
+            ForegroundWindow::remember(window.hwnd().map_err(window_error)?.0);
+        focus_window(&capture)?;
+        let (closed, wait) = std::sync::mpsc::channel();
+        let listener = window.once("capture-closed", move |_| {
+            let _ = closed.send(());
+        });
+        let request = capture.emit_to(CAPTURE_WINDOW, "capture-close-requested", ());
+        if request.is_ok() && desktop.capture_active() {
+            // Allow the draft's SQLite busy timeout to finish; a failed write keeps its editor open.
+            const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+            let _ = async_runtime::spawn_blocking(move || wait.recv_timeout(CLOSE_TIMEOUT)).await;
+        }
+        window.unlisten(listener);
+        request.map_err(window_error)?;
+    }
     in_main_window(window, move |state, app| {
         app.state::<DesktopWindows>()
             .allow_workspace_switch()
             .map_err(|msg| AppError::from_message("WINDOW_BUSY", "workspace", true, msg))?;
         state
-            .activate(&selection_file(app)?, &root, &capture_dir, None)
+            .activate(&settings::settings_path(app)?, &root, &capture_dir, true)
             .map_err(AppError::from)
     })
     .await
@@ -486,10 +351,12 @@ pub(crate) async fn resume_workspace(
     window: WebviewWindow,
 ) -> Result<Option<OpenedWorkspaceDto>, AppError> {
     in_main_window(window, move |state, app| {
-        if app.state::<DesktopWindows>().capture_active() {
+        if state.active.is_some() {
             return state.read_active().map(Some);
         }
-        state.resume(&selection_file(app)?).map_err(AppError::from)
+        state
+            .resume(&settings::settings_path(app)?)
+            .map_err(AppError::from)
     })
     .await
 }
@@ -641,7 +508,7 @@ async fn open_capture(
             state.workspace(&session)?;
         } else if state.active.is_none()
             && state
-                .resume(&selection_file(app)?)
+                .resume(&settings::settings_path(app)?)
                 .map_err(AppError::from)?
                 .is_none()
         {
@@ -777,13 +644,16 @@ pub(crate) async fn list_recent_captures(
         let recent = storage.list_recent_captures()?;
         Ok(recent
             .into_iter()
-            .map(|(path, captured_at, body, content_hash)| RecentCaptureDto {
-                path,
-                captured_at,
-                body,
-                content_hash,
-                is_capture: true,
-            })
+            .map(
+                |(path, captured_at, body, content_hash, block_id)| RecentCaptureDto {
+                    path,
+                    block_id,
+                    captured_at,
+                    body,
+                    content_hash,
+                    is_capture: true,
+                },
+            )
             .collect())
     })
     .await
@@ -794,8 +664,12 @@ pub(crate) async fn with_search_reader<T: Send + 'static>(
     session: String,
     action: impl FnOnce(SearchReader) -> Result<T, StorageError> + Send + 'static,
 ) -> Result<T, AppError> {
-    let reader = with_workspace(window.clone(), session.clone(), |storage| {
-        storage.search_reader().map_err(AppError::from)
+    let expected = session.clone();
+    let reader = in_main_window(window.clone(), move |state, _| {
+        state
+            .workspace(&expected)?
+            .search_reader()
+            .map_err(AppError::from)
     })
     .await?;
     // File enumeration must not hold the mutex used by quick capture.
@@ -804,7 +678,11 @@ pub(crate) async fn with_search_reader<T: Send + 'static>(
         .map_err(|_| {
             AppError::from_message("CANCELLED", "search", true, "索引或原文读取中断，请重试")
         })?;
-    with_workspace(window, session, |_| result.map_err(AppError::from)).await
+    in_main_window(window, move |state, _| {
+        state.workspace(&session)?;
+        result.map_err(AppError::from)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -925,6 +803,7 @@ pub(crate) async fn confirm_capture(
 mod tests {
     use super::*;
     use crate::storage::tests::TestDir;
+    use std::fs;
 
     #[test]
     fn active_capture_allows_main_close_and_prevents_workspace_switch() {
@@ -949,15 +828,15 @@ mod tests {
     fn capture_load_reuses_the_session_and_recovers_an_unconfirmed_commit() {
         let workspace = TestDir::new();
         let data = TestDir::new();
-        let file = data.0.join(SELECTION_FILE);
+        let file = data.0.join(settings::FILE_NAME);
         let root = workspace.0.to_str().unwrap();
         let mut state = WorkspaceState::default();
-        let opened = state.activate(&file, root, "", None).unwrap();
+        let opened = state.activate(&file, root, "", true).unwrap();
         let session = opened.session;
         state
             .workspace(&session)
             .unwrap()
-            .save_draft(CAPTURE_DRAFT, 1, "快捷窗草稿")
+            .with_storage(|storage| storage.save_draft(CAPTURE_DRAFT, 1, "快捷窗草稿"))
             .unwrap();
         let capture_view = state.load_capture().unwrap();
         assert_eq!(capture_view.session, session);
@@ -968,7 +847,9 @@ mod tests {
         let record = state
             .workspace(&capture_view.session)
             .unwrap()
-            .save_record("quick-capture-request", CAPTURE_DRAFT, 1, "快捷窗草稿")
+            .with_storage(|storage| {
+                storage.save_record("quick-capture-request", CAPTURE_DRAFT, 1, "快捷窗草稿")
+            })
             .unwrap();
         let active_view = state.read_active().unwrap();
         assert_eq!(active_view.session, capture_view.session);
@@ -994,28 +875,28 @@ mod tests {
     fn resumes_unacknowledged_commit_and_keeps_newer_draft() {
         let workspace = TestDir::new();
         let data = TestDir::new();
-        let file = data.0.join(SELECTION_FILE);
+        let file = data.0.join(settings::FILE_NAME);
         let root = workspace.0.to_str().unwrap();
 
         for newer in [false, true] {
             let mut state = WorkspaceState::default();
-            let opened = state.activate(&file, root, "", None).unwrap();
+            let opened = state.activate(&file, root, "", true).unwrap();
             let session = opened.session;
             let base_revision = opened.draft.revision;
             let storage = state.workspace(&session).unwrap();
             let revision = base_revision + 1;
-            storage
-                .save_draft(CAPTURE_DRAFT, revision, "合成草稿")
-                .unwrap();
             let request_id = format!("request-{revision}");
             let record = storage
-                .save_record(&request_id, CAPTURE_DRAFT, revision, "合成草稿")
+                .with_storage(|storage| {
+                    storage.save_draft(CAPTURE_DRAFT, revision, "合成草稿")?;
+                    let record =
+                        storage.save_record(&request_id, CAPTURE_DRAFT, revision, "合成草稿")?;
+                    if newer {
+                        storage.save_draft(CAPTURE_DRAFT, revision + 1, "后来编辑")?;
+                    }
+                    Ok::<_, StorageError>(record)
+                })
                 .unwrap();
-            if newer {
-                storage
-                    .save_draft(CAPTURE_DRAFT, revision + 1, "后来编辑")
-                    .unwrap();
-            }
             drop(state);
 
             let mut state = WorkspaceState::default();
@@ -1036,7 +917,12 @@ mod tests {
                 state
                     .workspace(&resumed.session)
                     .unwrap()
-                    .save_record(&request_id, CAPTURE_DRAFT, revision, "合成草稿")
+                    .with_storage(|storage| storage.save_record(
+                        &request_id,
+                        CAPTURE_DRAFT,
+                        revision,
+                        "合成草稿"
+                    ))
                     .unwrap(),
                 record
             );
@@ -1044,112 +930,36 @@ mod tests {
     }
 
     #[test]
-    fn failed_recovery_reuses_the_request_after_reopen() {
-        let workspace = TestDir::new();
-        let data = TestDir::new();
-        let file = data.0.join(SELECTION_FILE);
-        let root = workspace.0.to_str().unwrap();
-        let mut state = WorkspaceState::default();
-        let session = state.activate(&file, root, "", None).unwrap().session;
-        let connection =
-            Connection::open(workspace.0.join(STATE_DIR).join("state.sqlite")).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TRIGGER fail_commit BEFORE INSERT ON records
-                 BEGIN SELECT RAISE(FAIL, 'synthetic commit failure'); END;",
-            )
-            .unwrap();
-        let storage = state.workspace(&session).unwrap();
-        storage.save_draft(CAPTURE_DRAFT, 1, "合成草稿").unwrap();
-        assert_eq!(
-            storage
-                .save_record("request", CAPTURE_DRAFT, 1, "合成草稿")
-                .unwrap_err()
-                .code,
-            "WRITE_FAILED"
-        );
-        drop(state);
-
-        let mut state = WorkspaceState::default();
-        let resumed = state.resume(&file).unwrap().unwrap();
-        assert_eq!(resumed.draft.revision, 1);
-        assert_eq!(resumed.draft.body.as_deref(), Some("合成草稿"));
-        assert!(resumed.recovered.is_empty());
-        assert_eq!(
-            resumed.recovery_errors,
-            [RecoveryErrorDto {
-                request_id: "request".to_owned(),
-                message: "本地状态库操作失败".to_owned(),
-            }]
-        );
-        assert_eq!(resumed.pending_request_id.as_deref(), Some("request"));
-
-        connection
-            .execute_batch("DROP TRIGGER fail_commit")
-            .unwrap();
-        let storage = state.workspace(&resumed.session).unwrap();
-        let record = storage
-            .save_record(
-                resumed.pending_request_id.as_deref().unwrap(),
-                CAPTURE_DRAFT,
-                1,
-                "合成草稿",
-            )
-            .unwrap();
-        assert!(workspace.0.join(&record.relative_path).is_file());
-        assert!(storage.clear_committed_draft("request").unwrap());
-        assert_eq!(storage.draft_state(CAPTURE_DRAFT).unwrap(), (1, None));
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM records", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn switching_revokes_the_old_session_and_resume_requires_the_saved_workspace() {
+    fn switching_revokes_old_sessions_and_resume_accepts_a_restored_directory() {
         let first = TestDir::new();
         let second = TestDir::new();
         let data = TestDir::new();
-        let file = data.0.join(SELECTION_FILE);
+        let file = data.0.join(settings::FILE_NAME);
         let first_workspace = first.0.join("workspace");
         fs::create_dir(&first_workspace).unwrap();
         let first_root = first_workspace.to_str().unwrap();
         let second_root = second.0.to_str().unwrap();
         let mut state = WorkspaceState::default();
         assert!(state.resume(&file).unwrap().is_none());
-        let first_session = state.activate(&file, first_root, "", None).unwrap().session;
-        let refreshed_session = state.activate(&file, first_root, "", None).unwrap().session;
+        let first_session = state.activate(&file, first_root, "", true).unwrap().session;
+        let refreshed_session = state.activate(&file, first_root, "", true).unwrap().session;
         assert!(state.workspace(&first_session).is_err());
-        assert!(state.activate(&file, second_root, "missing", None).is_err());
+        assert!(state.activate(&file, second_root, "missing", true).is_err());
         assert!(state.workspace(&refreshed_session).is_ok());
         let second_session = state
-            .activate(&file, second_root, "", None)
+            .activate(&file, second_root, "", true)
             .unwrap()
             .session;
-        let latest_session = state.activate(&file, first_root, "", None).unwrap().session;
+        let latest_session = state.activate(&file, first_root, "", true).unwrap().session;
         assert!(state.workspace(&refreshed_session).is_err());
         assert!(state.workspace(&second_session).is_err());
         assert!(state.workspace(&latest_session).is_ok());
-        drop(state);
-
-        let state_dir = first_workspace.join(STATE_DIR);
-        let moved = first_workspace.join("old-state");
-        fs::rename(&state_dir, &moved).unwrap();
+        let moved_root = first.0.join("backup");
+        fs::rename(&first_workspace, &moved_root).unwrap();
         let mut state = WorkspaceState::default();
         assert!(state.resume(&file).is_err());
-        assert!(!state_dir.exists());
-        let replacement = Storage::open(&first_workspace, Path::new("."), STATE_DIR).unwrap();
-        drop(replacement);
-        assert!(state.resume(&file).is_err());
-        assert!(state.active.is_none());
-
-        let moved_root = first.0.join("old-root");
-        fs::rename(&first_workspace, &moved_root).unwrap();
         fs::create_dir(&first_workspace).unwrap();
-        fs::rename(moved_root.join("old-state"), &state_dir).unwrap();
-        assert!(state.resume(&file).is_err());
+        let resumed = state.resume(&file).unwrap().unwrap();
+        assert_eq!(resumed.root, first_root);
     }
 }

@@ -3,12 +3,14 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { api } from '../api/client'
 import { parseAppError, type UiError } from '../api/errors'
 import ErrorNotice from './ErrorNotice.vue'
+import AutoActionsSettings from './AutoActionsSettings.vue'
 import UiIcon from '../UiIcon.vue'
 import type {
   CredentialReference,
   CredentialSlot,
   CredentialState,
   HotkeyStatus,
+  IntegrationsConfig,
   ModelConfig,
   OpenedWorkspace,
 } from '../m2'
@@ -43,8 +45,6 @@ const emit = defineEmits<{
 
 const dialogEl = ref<HTMLDialogElement>()
 const hotkeySelect = ref<HTMLSelectElement>()
-const modelEndpointInput = ref<HTMLInputElement>()
-
 const rootInput = ref('')
 const captureInput = ref('')
 const pickingFolder = ref(false)
@@ -54,18 +54,25 @@ const settingsWindowError = ref<UiError | null>(null)
 
 const hotkeyChoice = ref('')
 
-const modelEndpoint = ref('')
-const modelName = ref('')
-const modelEnabled = ref(false)
-const modelBusy = ref(false)
-const modelError = ref<UiError | null>(null)
-const modelFeedback = ref('')
+const slots = ['model', 'memory'] as const
+function emptyForm() {
+  return {
+    endpoint: '', name: '', enabled: false, secret: '',
+    saved: null as { endpoint: string; name: string; enabled: boolean } | null,
+    credential: undefined as CredentialReference | undefined,
+    pending: '' as '' | 'save' | 'test' | 'link',
+    error: null as UiError | null, feedback: '',
+  }
+}
+const forms = ref({ model: emptyForm(), memory: emptyForm() })
+const loading = ref(false)
+const loadError = ref<UiError | null>(null)
 
-const credentials = ref<CredentialReference[]>([])
-const credentialBusy = ref(false)
-const credentialError = ref<UiError | null>(null)
-const credentialSecret = ref('')
-const credentialFeedback = ref('')
+function dirty(slot: CredentialSlot) {
+  const f = forms.value[slot]
+  return !f.saved || f.endpoint.trim() !== f.saved.endpoint || f.name.trim() !== f.saved.name ||
+    f.enabled !== f.saved.enabled || Boolean(f.secret.trim())
+}
 
 const isBusy = computed(() => props.opening || workspaceBusy.value)
 const activeHotkeyLabel = computed(() => {
@@ -73,10 +80,6 @@ const activeHotkeyLabel = computed(() => {
   if (status?.active) return status.choices.find((choice) => choice.id === status.id)?.label
   return undefined
 })
-const modelCredential = computed(() => credentials.value.find((item) => item.slot === 'model'))
-const modelCredentialState = computed(() => modelCredential.value?.state)
-const modelReady = computed(() => Boolean(props.modelConfig?.ready))
-
 watch([() => props.open, dialogEl], ([open, dialog]) => {
   if (open && dialog && !dialog.open) dialog.showModal()
   if (!open && dialog?.open) dialog.close()
@@ -85,10 +88,6 @@ watch([() => props.open, dialogEl], ([open, dialog]) => {
     captureInput.value = props.workspace?.captureDir ?? ''
     workspaceError.value = props.initialWorkspaceError
     settingsWindowError.value = null
-    if (props.workspace) void refreshCredentials(props.workspace.session)
-  } else {
-    credentialSecret.value = ''
-    credentialFeedback.value = ''
   }
 }, { flush: 'post' })
 
@@ -104,26 +103,12 @@ watch(() => props.hotkey, (status) => {
   }
 }, { immediate: true })
 
-watch(() => props.modelConfig, (config) => {
-  if (config) {
-    modelEndpoint.value = config.endpoint
-    modelName.value = config.model
-    modelEnabled.value = config.enabled
-  } else {
-    modelEndpoint.value = modelName.value = ''
-    modelEnabled.value = false
-  }
+watch([() => props.open, () => props.workspace?.session], ([open, session]) => {
+  forms.value = { model: emptyForm(), memory: emptyForm() }
+  loading.value = false
+  loadError.value = null
+  if (open && session) void loadIntegrations(session)
 }, { immediate: true })
-
-watch(() => props.workspace?.session, (session) => {
-  credentials.value = []
-  credentialSecret.value = ''
-  credentialFeedback.value = ''
-  credentialError.value = null
-  modelFeedback.value = ''
-  modelError.value = null
-  if (session && props.open) void refreshCredentials(session)
-})
 
 function cancelSettings() {
   if (isBusy.value || pickingFolder.value || !props.workspace) return
@@ -166,116 +151,69 @@ async function openWorkspace() {
   }
 }
 
-async function refreshModelConfig(session: string) {
-  modelBusy.value = true
-  modelError.value = null
-  modelFeedback.value = ''
+function updateForm(config: IntegrationsConfig, slot: CredentialSlot) {
+  const form = forms.value[slot]
+  const value = slot === 'model' && config.model
+    ? { endpoint: config.model.endpoint, name: config.model.model, enabled: config.model.enabled }
+    : slot === 'memory' && config.memory
+      ? { endpoint: config.memory.baseUrl, name: config.memory.namespace, enabled: config.memory.enabled }
+      : null
+  if (value) Object.assign(form, value)
+  form.saved = value
+  form.credential = config.credentials.find(item => item.slot === slot)
+}
+
+async function loadIntegrations(session: string) {
+  const current = forms.value
+  loading.value = true
+  loadError.value = null
   try {
-    const config = await api.getModelConfig(session)
-    if (props.workspace?.session === session) emit('modelUpdated', config)
+    const config = await api.getIntegrationsConfig(session)
+    if (current !== forms.value) return
+    for (const slot of slots) updateForm(config, slot)
+    emit('modelUpdated', config.model)
   } catch (error) {
-    if (props.workspace?.session === session) modelError.value = parseAppError(error)
+    if (current === forms.value) loadError.value = parseAppError(error)
   } finally {
-    if (props.workspace?.session === session) modelBusy.value = false
+    if (current === forms.value) loading.value = false
   }
 }
 
-async function saveModelConfig() {
+async function apply(slot: CredentialSlot, action: 'save' | 'test' | 'link', linked = false) {
   const session = props.workspace?.session
-  if (!session || modelBusy.value || isBusy.value) return
-  modelBusy.value = true
-  modelError.value = null
-  modelFeedback.value = ''
+  const form = forms.value[slot]
+  if (!session || form.pending || isBusy.value || loading.value || loadError.value) return
+  form.pending = action
+  form.error = null
+  form.feedback = ''
   try {
-    const config = await api.setModelConfig(session, modelEndpoint.value.trim(), modelName.value.trim(), modelEnabled.value)
-    if (props.workspace?.session === session) {
-      emit('modelUpdated', config)
-      modelFeedback.value = '已保存模型配置。'
+    if (action === 'test') {
+      form.feedback = await api.testConnection(session, slot)
+      return
     }
-  } catch (error) {
-    if (props.workspace?.session === session) modelError.value = parseAppError(error)
-  } finally {
-    if (props.workspace?.session === session) modelBusy.value = false
-  }
-}
-
-async function refreshCredentials(session: string) {
-  credentialBusy.value = true
-  credentialError.value = null
-  try {
-    const references = await api.listCredentials(session)
-    if (props.workspace?.session === session) credentials.value = references
-  } catch (error) {
-    if (props.workspace?.session === session) credentialError.value = parseAppError(error)
-  } finally {
-    if (props.workspace?.session === session) credentialBusy.value = false
-  }
-}
-
-async function syncModelReady(session: string) {
-  try {
-    const config = await api.getModelConfig(session)
-    if (props.workspace?.session === session) emit('modelUpdated', config)
-  } catch {
-    // Model config refresh failure will surface if the user edits or saves model settings.
-  }
-}
-
-async function setCredential(slot: CredentialSlot, linked: boolean) {
-  const session = props.workspace?.session
-  if (!session || credentialBusy.value || isBusy.value) return
-  credentialBusy.value = true
-  credentialError.value = null
-  credentialFeedback.value = ''
-  try {
-    const reference = await api.setCredential(session, slot, linked)
-    if (props.workspace?.session === session) {
-      credentials.value = credentials.value.map((entry) => entry.slot === slot ? reference : entry)
-      credentialFeedback.value = linked ? '已关联系统凭据。' : '已解除凭据关联。'
-      await syncModelReady(session)
+    if (action === 'link') {
+      form.credential = await api.setCredential(session, slot, linked)
+      form.feedback = linked ? '已关联系统凭据。' : '已解除关联。'
+    } else {
+      const secret = form.secret.trim() || undefined
+      if (slot === 'model') await api.saveModelConfig(session, form.endpoint, form.name, form.enabled, secret)
+      else await api.saveMemoryConfig(session, form.endpoint, form.name, form.enabled, secret)
+      form.secret = ''
+      form.feedback = '已保存配置。'
     }
+    const config = await api.getIntegrationsConfig(session)
+    if (form !== forms.value[slot]) return
+    if (action === 'save') updateForm(config, slot)
+    emit('modelUpdated', config.model)
   } catch (error) {
-    if (props.workspace?.session === session) credentialError.value = parseAppError(error)
+    form.error = parseAppError(error)
   } finally {
-    if (props.workspace?.session === session) credentialBusy.value = false
-  }
-}
-
-async function saveCredential(slot: CredentialSlot) {
-  const session = props.workspace?.session
-  const secret = credentialSecret.value
-  if (!session || !secret.trim() || credentialBusy.value || isBusy.value) return
-  credentialBusy.value = true
-  credentialError.value = null
-  credentialFeedback.value = ''
-  try {
-    const reference = await api.saveCredential(session, slot, secret)
-    if (props.workspace?.session === session) {
-      credentialSecret.value = ''
-      credentials.value = credentials.value.map((entry) => entry.slot === slot ? reference : entry)
-      credentialFeedback.value = '已写入 Windows 凭据管理器并自动关联（密钥未写入工作区）。'
-      await syncModelReady(session)
-    }
-  } catch (error) {
-    if (props.workspace?.session === session) credentialError.value = parseAppError(error)
-  } finally {
-    if (props.workspace?.session === session) credentialBusy.value = false
-  }
-}
-
-async function copyTargetName(target: string) {
-  credentialFeedback.value = ''
-  credentialError.value = null
-  try {
-    await navigator.clipboard.writeText(target)
-    credentialFeedback.value = '已复制凭据目标名称。'
-  } catch {
-    credentialError.value = { safeMessage: '无法访问剪贴板，请手动选中复制。' }
+    form.pending = ''
   }
 }
 
 defineExpose({
-  focusModel: () => void nextTick(() => modelEndpointInput.value?.focus()),
+  focusModel: () => void nextTick(() => dialogEl.value?.querySelector<HTMLInputElement>('#model-endpoint')?.focus()),
   focusHotkey: () => void nextTick(() => hotkeySelect.value?.focus()),
   setWindowError: (err: UiError | null) => { settingsWindowError.value = err },
 })
@@ -334,45 +272,56 @@ defineExpose({
       <p class="hint">关闭工作台后，仍可从 Windows 托盘新建笔记、打开工作台或退出应用。</p>
     </form>
 
-    <form v-if="workspace" class="settings-form settings-model" aria-labelledby="model-settings-heading" @submit.prevent="saveModelConfig">
-      <h3 id="model-settings-heading">整理与问答模型</h3>
-      <label for="model-endpoint">模型地址（完整 URL）</label>
-      <input id="model-endpoint" ref="modelEndpointInput" v-model="modelEndpoint" type="url" required :disabled="modelBusy || isBusy" spellcheck="false" aria-describedby="model-endpoint-help">
-      <p id="model-endpoint-help" class="hint">填写完整的 Chat Completions 地址（支持 query 参数，如 Azure api-version）。公网端点须使用 HTTPS 并配置 API Key；本机（localhost / 127.0.0.1 / [::1]）或局域网私有地址可使用 HTTP，并按需免凭据。</p>
-      <label for="model-name">模型名称</label>
-      <input id="model-name" v-model="modelName" required :disabled="modelBusy || isBusy" spellcheck="false">
-      <label class="m2-check"><input v-model="modelEnabled" type="checkbox" :disabled="modelBusy || isBusy">启用整理与问答</label>
-      <p class="hint">启用后，整理与问答将直接发送所选记录或命中片段至上述端点，无需逐次二次确认。</p>
-      <p v-if="modelConfig?.enabled && !modelReady && !credentialBusy" class="notice" role="status">模型已启用。请展开模型凭据，录入 API Key 或关联系统凭据。</p>
-      <p v-if="modelFeedback" class="notice success" role="status">{{ modelFeedback }}</p>
-      <ErrorNotice :error="modelError" />
-      <div class="actions">
-        <button type="submit" :disabled="modelBusy || isBusy">{{ modelBusy ? '载入配置…' : '保存模型配置' }}</button>
-        <button v-if="modelError" type="button" :disabled="modelBusy || isBusy" @click="refreshModelConfig(workspace.session)">重新读取</button>
+    <template v-if="workspace">
+      <AutoActionsSettings :open="open" />
+      <div v-if="loadError" class="settings-form">
+        <ErrorNotice :error="loadError" />
+        <button type="button" @click="loadIntegrations(workspace.session)">重新读取服务配置</button>
       </div>
-      <details class="settings-details" :key="workspace.session" :open="Boolean(modelConfig?.enabled && !modelReady)">
-        <summary>模型凭据（API Key）</summary>
-        <template v-if="modelCredential">
-          <div class="credential-target-row">
-            <span class="badge" :class="modelCredential.state === 'linked' ? 'badge-success' : modelCredential.state === 'missing' ? 'badge-error' : 'badge-muted'">{{ credentialStates[modelCredential.state] }}</span>
-            <code>{{ modelCredential.target }}</code>
-            <button type="button" class="quiet" @click="copyTargetName(modelCredential.target)"><UiIcon name="copy" />复制目标名</button>
+      <form v-for="slot in slots" :key="slot" class="settings-form settings-model"
+        :aria-labelledby="slot + '-settings-heading'" @submit.prevent="apply(slot, 'save')">
+        <h3 :id="slot + '-settings-heading'">{{ slot === 'model' ? '整理与问答模型' : 'OpenViking 记忆服务' }}</h3>
+        <fieldset class="settings-form service-fields" :disabled="Boolean(forms[slot].pending || loading || loadError || isBusy)"
+          @input="forms[slot].feedback = ''; forms[slot].error = null">
+          <label :for="slot + '-endpoint'">{{ slot === 'model' ? '模型地址（完整 Chat Completions URL）' : 'OpenViking 服务地址' }}</label>
+          <input :id="slot + '-endpoint'" v-model="forms[slot].endpoint" type="url" required spellcheck="false"
+            :placeholder="slot === 'model' ? 'https://…/v1/chat/completions' : 'http://localhost:1933'">
+          <label :for="slot + '-name'">{{ slot === 'model' ? '模型名称' : '工作区命名空间' }}</label>
+          <input :id="slot + '-name'" v-model="forms[slot].name" required spellcheck="false"
+            :placeholder="slot === 'model' ? '例如：gpt-4.1-mini' : '例如：default'">
+          <label :for="slot + '-api-key'">API Key（保存在 Windows 凭据管理器）</label>
+          <input :id="slot + '-api-key'" v-model="forms[slot].secret" type="password" autocomplete="off"
+            :placeholder="forms[slot].credential?.state === 'linked' ? '已关联，留空保留当前密钥' : '公网服务必填，本机或局域网按需填写'" spellcheck="false">
+          <label class="m2-check"><input v-model="forms[slot].enabled" type="checkbox">
+            {{ slot === 'model' ? '启用整理与问答' : '启用 OpenViking' }}
+          </label>
+          <p v-if="slot === 'model'" class="hint">整理与问答会向此地址发送所选记录或检索命中的片段。测试连接仅发送固定测试消息。</p>
+          <div class="actions">
+            <button class="primary" type="submit">{{ forms[slot].pending === 'save' ? '正在保存…' : slot === 'model' ? '保存模型配置' : '保存 OpenViking 配置' }}</button>
+            <button type="button" :disabled="dirty(slot)" @click="apply(slot, 'test')">{{ forms[slot].pending === 'test' ? '正在连接…' : '测试连接' }}</button>
           </div>
-          <label for="model-api-key">录入或更新 API Key（直接安全写入 Windows 凭据管理器，不落盘到工作区）</label>
-          <div class="folder-field">
-            <input id="model-api-key" v-model="credentialSecret" type="password" autocomplete="off" placeholder="粘贴 API Key…" :disabled="credentialBusy || isBusy" spellcheck="false">
-            <button type="button" class="primary" :disabled="credentialBusy || isBusy || !credentialSecret.trim()" @click="saveCredential('model')">保存并关联</button>
-          </div>
-          <p class="hint">提交后输入框立即清空；也可以自行在 Windows 凭据管理器中使用上方目标名称管理。</p>
-        </template>
-        <div class="actions">
-          <button type="button" :disabled="credentialBusy || isBusy" @click="refreshCredentials(workspace.session)">检查凭据状态</button>
-          <button v-if="modelCredentialState === 'unlinked' || modelCredentialState === 'missing'" type="button" :disabled="credentialBusy || isBusy" @click="setCredential('model', true)">关联已有系统凭据</button>
-          <button v-if="modelCredentialState && modelCredentialState !== 'unlinked'" type="button" :disabled="credentialBusy || isBusy" @click="setCredential('model', false)">解除关联</button>
-        </div>
-        <p v-if="credentialFeedback" class="notice success" role="status">{{ credentialFeedback }}</p>
-        <ErrorNotice :error="credentialError" />
-      </details>
-    </form>
+          <p v-if="dirty(slot)" class="hint">保存当前配置后即可测试连接。</p>
+          <details v-if="forms[slot].credential" class="settings-details">
+            <summary>系统凭据 · {{ credentialStates[forms[slot].credential!.state] }}</summary>
+            <code>{{ forms[slot].credential!.target }}</code>
+            <div class="actions">
+              <button v-if="forms[slot].credential!.state !== 'linked'" type="button" @click="apply(slot, 'link', true)">关联已有系统凭据</button>
+              <button v-if="forms[slot].credential!.state !== 'unlinked'" type="button" @click="apply(slot, 'link', false)">解除关联</button>
+            </div>
+          </details>
+        </fieldset>
+        <p v-if="forms[slot].feedback" class="notice success" role="status">{{ forms[slot].feedback }}</p>
+        <ErrorNotice :error="forms[slot].error" />
+      </form>
+    </template>
   </dialog>
 </template>
+
+<style scoped>
+.service-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+</style>

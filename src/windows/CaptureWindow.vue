@@ -28,6 +28,7 @@ const pendingCapture = ref<PendingCapture | null>(null)
 const savedPath = ref('')
 const saveError = ref<UiError | null>(null)
 const closing = ref(false)
+const exitRequested = ref(false)
 const composing = ref(false)
 const windowError = ref<UiError | null>(null)
 const copyStatus = ref('')
@@ -41,6 +42,7 @@ let disposed = false
 const captureFolderLabel = computed(() => workspace.value?.captureDir || '工作区根目录')
 const canSave = computed(() => !opening.value && !saving.value && !closing.value && !composing.value
   && Boolean(pendingCapture.value || body.value.trim()))
+const showEscape = computed(() => Boolean(draftError.value || saveError.value || windowError.value || recoveryErrors.value.length))
 
 const draftStatus = computed(() => {
   if (saving.value) return '正在保存原文…'
@@ -72,6 +74,8 @@ const editorBody = computed({
   get: () => body.value,
   set: (value: string) => {
     if (value === body.value) return
+    pendingCapture.value = null
+    savedPath.value = ''
     body.value = value
     revision.value += 1
     scheduleDraftPersist()
@@ -79,6 +83,10 @@ const editorBody = computed({
 })
 
 function applyWorkspace(opened: OpenedWorkspace) {
+  window.clearTimeout(draftTimer)
+  draftWrite = undefined
+  closing.value = composing.value = false
+  windowError.value = null
   workspace.value = { session: opened.session, root: opened.root, captureDir: opened.captureDir }
   revision.value = persistedRevision.value = opened.draft.revision
   body.value = opened.draft.body ?? ''
@@ -107,18 +115,24 @@ onMounted(async () => {
       }))
       trackUnlisten(await desktopWindow.listen<OpenedWorkspace>('capture-opened', ({ payload }) => {
         opening.value = false
+        exitRequested.value = false
         workspaceError.value = null
         copyStatus.value = ''
         applyWorkspace(payload)
       }))
       trackUnlisten(await desktopWindow.listen('capture-focus-editor', focusCaptureEditor))
-      trackUnlisten(await desktopWindow.listen('exit-requested', () => { void closeCapture(true) }))
+      trackUnlisten(await desktopWindow.listen('capture-close-requested', () => { void closeCapture() }))
+      trackUnlisten(await desktopWindow.listen('exit-requested', () => {
+        exitRequested.value = true
+        void closeCapture()
+      }))
     }
     applyWorkspace(await api.loadCaptureWorkspace())
   } catch (error) {
     workspaceError.value = parseAppError(error)
   } finally {
     opening.value = false
+    if (exitRequested.value) void closeCapture()
   }
 })
 
@@ -140,21 +154,25 @@ async function dragWindow() {
 }
 
 function persistDraft() {
-  const session = workspace.value?.session
-  if (!session) return Promise.resolve(false)
-  draftWrite ??= flushDraft(session).finally(() => { draftWrite = undefined })
+  const current = workspace.value
+  if (!current || opening.value) return Promise.resolve(false)
+  draftWrite ??= flushDraft(current).finally(() => {
+    if (workspace.value === current) draftWrite = undefined
+  })
   return draftWrite
 }
 
-async function flushDraft(session: string) {
+async function flushDraft(current: NonNullable<typeof workspace.value>) {
   try {
     while (revision.value !== persistedRevision.value) {
-      persistedRevision.value = await api.persistDraft(session, revision.value, body.value)
+      const written = await api.persistDraft(current.session, revision.value, body.value)
+      if (workspace.value !== current || opening.value) return false
+      persistedRevision.value = written
     }
     draftError.value = null
     return true
   } catch (error) {
-    draftError.value = parseAppError(error)
+    if (workspace.value === current && !opening.value) draftError.value = parseAppError(error)
     return false
   }
 }
@@ -168,7 +186,7 @@ async function save() {
   try {
     if (!(await flushDraftNow())) return
     const capture = pendingCapture.value ?? {
-      requestId: crypto.randomUUID(),
+      requestId: `${Date.now()}-${crypto.randomUUID()}`,
       revision: revision.value,
       body: body.value,
     }
@@ -187,23 +205,24 @@ async function save() {
   if (savedPath.value) await closeCapture()
 }
 
-async function closeCapture(exit = false) {
+async function closeCapture(ignoreDraft = false) {
   if (!desktopWindow || closing.value) return
   if (opening.value || saving.value) {
-    if (exit) windowError.value = { safeMessage: '请等待当前操作完成，再退出应用。' }
+    if (exitRequested.value) windowError.value = { safeMessage: '正在完成当前操作。' }
     return
   }
-  if (composing.value) {
-    windowError.value = { safeMessage: exit ? '请先完成当前输入，再退出应用。' : '请先完成当前输入，再关闭窗口。' }
+  if (composing.value && !ignoreDraft) {
+    windowError.value = { safeMessage: '请先完成组词，或忽略当前输入强制关闭。' }
     return
   }
   closing.value = true
   windowError.value = null
   try {
-    if (workspace.value && !(await flushDraftNow())) return
+    window.clearTimeout(draftTimer)
+    if (!ignoreDraft && workspace.value && !(await flushDraftNow())) return
     opening.value = true
     await nextTick()
-    await api.closeCaptureWindow(exit)
+    await api.closeCaptureWindow(exitRequested.value)
   } catch (error) {
     opening.value = false
     windowError.value = parseAppError(error)
@@ -223,7 +242,7 @@ async function copyMarkdown(text: string) {
 }
 
 function handleWindowKey(event: KeyboardEvent) {
-  if (event.isComposing || event.keyCode === 229) return
+  if (composing.value || event.isComposing || event.keyCode === 229) return
   if (event.key === 'Escape') {
     event.preventDefault()
     void closeCapture()
@@ -252,21 +271,22 @@ function handleWindowKey(event: KeyboardEvent) {
         <CaptureEditor
           ref="editor"
           v-model="editorBody"
-          :readonly="opening || saving || closing || pendingCapture !== null"
+          :readonly="saving || closing"
           @composition-change="composing = $event"
-          @blur="flushDraftNow"
+          @blur="!draftError && !closing && !composing && flushDraftNow()"
           @ready="nextTick(focusCaptureEditor)"
         />
         <div v-if="draftError || saveError || windowError || recoveredPaths.length || recoveryErrors.length || copyStatus" class="capture-notices">
           <ErrorNotice :error="draftError" suffix="。请重试保留草稿，或复制正文。" />
-          <ErrorNotice :error="saveError" suffix="。正文已保留，可以重试保存或复制正文。" />
+          <ErrorNotice :error="saveError" suffix="。可以继续编辑、重试保存或复制正文。" />
           <ErrorNotice :error="windowError" />
           <p v-if="recoveredPaths.length" class="notice success" role="status">已恢复 {{ recoveredPaths.length }} 条随手记</p>
           <p v-for="item in recoveryErrors" :key="item.requestId" class="notice error" role="alert">恢复遇到问题。{{ item.message }}</p>
           <p v-if="copyStatus" class="notice" role="status">{{ copyStatus }}</p>
-          <div v-if="draftError || saveError || (pendingCapture && recoveryErrors.length)" class="actions">
+          <div v-if="showEscape" class="actions">
             <button v-if="draftError" type="button" :disabled="saving || closing" @click="flushDraftNow">重试保留草稿</button>
             <button type="button" :disabled="!body" @click="copyMarkdown(body)">复制正文</button>
+            <button type="button" :disabled="saving || closing" @click="closeCapture(true)">{{ exitRequested ? '忽略草稿并退出应用' : '忽略草稿强制关闭' }}</button>
           </div>
         </div>
       </div>
@@ -276,7 +296,7 @@ function handleWindowKey(event: KeyboardEvent) {
           {{ savedPath ? '已保存原文' : draftStatus }}
         </p>
         <div class="actions">
-          <button type="button" class="quiet" :disabled="saving || closing" @click="closeCapture()">关闭 <kbd>Esc</kbd></button>
+          <button type="button" class="quiet" :disabled="saving || closing" @click="closeCapture()">{{ exitRequested ? '保留草稿并退出' : '关闭' }} <kbd>Esc</kbd></button>
           <button type="submit" class="primary" :disabled="!canSave">
             {{ pendingCapture ? '重试保存' : '保存并返回' }} <kbd>Ctrl+Enter</kbd>
           </button>

@@ -1,8 +1,8 @@
 # Flash Marking Down
 
-面向个人的 Windows Markdown 快记与记忆工作台，使用 Tauri 2、Vue 3、Rust 和 SQLite。当前开发版支持全局快捷键记录 Markdown、保存到本地工作区、离线搜索，以及配置模型后进行笔记整理、Wiki 变更审阅、待办和带来源的问答。
+面向个人的 Windows Markdown 快记与记忆工作台，使用 Tauri 2、Vue 3、Rust 和 SQLite。当前开发版支持全局快捷键记录 Markdown、按本机日期追加每日文件和离线搜索。工作区设置可保存并测试模型与 OpenViking 连接，映射的 Markdown 待办可直接勾选。
 
-v1.0 计划加入按日文件、一屏三栏工作台、后台自动整理和 OpenViking 双源召回。开发阶段和完成标准见下方实施计划。
+配置模型后可手动整理笔记、审阅 Wiki 变更和进行带来源的问答。一屏三栏工作台、自动整理和 OpenViking 双源召回安排在后续阶段，见实施计划。
 
 ## 文档入口
 

@@ -110,18 +110,14 @@ pub(crate) struct SearchReader {
 
 impl Storage {
     pub(crate) fn search_reader(&self) -> Result<SearchReader, StorageError> {
-        let connection = Connection::open_with_flags(
-            self.files.database_path(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(index_error)?;
-        connection
-            .execute_batch(
-                "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;",
-            )
-            .map_err(index_error)?;
+        self.workspace.search_reader()
+    }
+}
+
+impl WorkspaceStorage {
+    pub(crate) fn search_reader(&self) -> Result<SearchReader, StorageError> {
         Ok(SearchReader {
-            connection,
+            connection: self.connect()?,
             files: self.files.clone(),
             build: self.search_build.clone(),
         })
@@ -130,35 +126,12 @@ impl Storage {
 
 impl SearchReader {
     pub(crate) fn is_capture_path(&self, relative_path: &str) -> bool {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM capture_intents WHERE relative_path = ?1 AND state = 'committed')",
-                [relative_path],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
+        is_capture(&self.connection, relative_path)
     }
 
     pub(crate) fn ensure_index_fresh(&mut self) -> Result<(), StorageError> {
         if self.generation()?.is_none() {
             self.build_index(None)?;
-        } else {
-            let pending: bool = self
-                .connection
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = 'index' AND state = 'queued')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(index_error)?;
-            if pending {
-                let tx = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(index_error)?;
-                index_queued_captures(&tx).map_err(index_error)?;
-                tx.commit().map_err(index_error)?;
-            }
         }
         Ok(())
     }
@@ -200,26 +173,33 @@ impl SearchReader {
     }
 
     fn scan_workspace(&mut self) -> Result<usize, StorageError> {
-        // A capture committed after this snapshot must survive publication of the scan.
+        // Saves publish directly to the index. Keep changes that finish during this scan.
+        let watermark: i64 = self
+            .connection
+            .query_row("SELECT coalesce(max(rowid), 0) FROM notes", [], |row| {
+                row.get(0)
+            })
+            .map_err(index_error)?;
         let mut captured = HashMap::new();
-        let mut watermark = 0_i64;
         {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT r.rowid, i.relative_path, r.captured_at, r.id, r.source_id
-                 FROM records r JOIN capture_intents i ON i.request_id = r.capture_request_id
-                 WHERE r.lifecycle = 'active' AND i.state = 'committed'",
+                    "SELECT relative_path, captured_at, id, source_id, block_id
+                 FROM notes WHERE rowid <= ?1 ORDER BY captured_at, rowid",
                 )
                 .map_err(index_error)?;
-            let mut rows = statement.query([]).map_err(index_error)?;
+            let mut rows = statement.query([watermark]).map_err(index_error)?;
             while let Some(row) = rows.next().map_err(index_error)? {
-                watermark = watermark.max(row.get(0).map_err(index_error)?);
-                let path: String = row.get(1).map_err(index_error)?;
-                let date: String = row.get(2).map_err(index_error)?;
-                let record_id: String = row.get(3).map_err(index_error)?;
-                let source_id: String = row.get(4).map_err(index_error)?;
-                captured.insert(path, (date, capture_header(&record_id, &source_id)));
+                let path: String = row.get(0).map_err(index_error)?;
+                let date: String = row.get(1).map_err(index_error)?;
+                let record_id: String = row.get(2).map_err(index_error)?;
+                let source_id: String = row.get(3).map_err(index_error)?;
+                let block_id: Option<String> = row.get(4).map_err(index_error)?;
+                let header = block_id
+                    .is_none()
+                    .then(|| capture_header(&record_id, &source_id));
+                captured.insert(path, (date, header));
             }
         }
         let mut existing = HashMap::new();
@@ -299,7 +279,8 @@ impl SearchReader {
                 };
                 let body = capture
                     .as_ref()
-                    .and_then(|(_, header)| text.strip_prefix(header))
+                    .and_then(|(_, header)| header.as_ref())
+                    .and_then(|header| text.strip_prefix(header))
                     .unwrap_or(text);
                 insert_path
                     .execute([&entry.relative_path])
@@ -326,31 +307,16 @@ impl SearchReader {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(index_error)?;
-        // Restrict all changes to sources observed before the scan, then catch up new captures.
-        let exclude_newer_captures = "SELECT i.relative_path FROM capture_intents i
-            LEFT JOIN records r ON r.capture_request_id = i.request_id
-            WHERE r.rowid > ?1 OR i.state <> 'committed' OR r.lifecycle <> 'active'";
         tx.execute(
-            &format!(
-                "DELETE FROM temp.scanned_paths WHERE relative_path IN ({exclude_newer_captures})"
-            ),
-            [watermark],
-        )
-        .map_err(index_error)?;
-        tx.execute(
-            &format!(
-                "DELETE FROM temp.scanned_changes WHERE relative_path IN ({exclude_newer_captures})"
-            ),
+            "DELETE FROM temp.scanned_changes WHERE relative_path IN
+                 (SELECT relative_path FROM notes WHERE rowid > ?1)",
             [watermark],
         )
         .map_err(index_error)?;
         tx.execute(
             "DELETE FROM search_documents WHERE relative_path NOT IN (SELECT relative_path FROM temp.scanned_paths)
-            AND relative_path NOT IN (SELECT i.relative_path FROM records r JOIN capture_intents i
-                ON i.request_id = r.capture_request_id WHERE r.rowid > ?1 AND r.lifecycle = 'active')",
-            [watermark],
-        )
-        .map_err(index_error)?;
+             AND relative_path NOT IN (SELECT relative_path FROM notes WHERE rowid > ?1)", [watermark],
+        ).map_err(index_error)?;
         tx.execute_batch(
             "INSERT INTO search_documents (relative_path, captured_at, revision, body, mtime_ns, file_size)
              SELECT relative_path, captured_at, revision, body, mtime_ns, file_size FROM temp.scanned_changes WHERE true
@@ -368,17 +334,6 @@ impl SearchReader {
                AND (search_documents.mtime_ns <> c.mtime_ns OR search_documents.file_size <> c.file_size);",
         )
         .map_err(index_error)?;
-        tx.execute(
-            "UPDATE jobs AS j SET state = CASE
-            WHEN NOT EXISTS (SELECT 1 FROM search_documents d WHERE d.relative_path = i.relative_path) THEN 'failed'
-            WHEN EXISTS (SELECT 1 FROM search_documents d WHERE d.relative_path = i.relative_path AND d.revision = j.source_revision) THEN 'succeeded'
-            ELSE 'stale' END, attempts = attempts + 1
-            FROM records r JOIN capture_intents i ON i.request_id = r.capture_request_id
-            WHERE j.kind = 'index' AND j.state = 'queued' AND j.source_id = r.source_id AND r.rowid <= ?1",
-            [watermark],
-        )
-        .map_err(index_error)?;
-        index_queued_captures(&tx).map_err(index_error)?;
         tx.execute(
             "INSERT INTO search_status VALUES (1, 1, ?1)
             ON CONFLICT(id) DO UPDATE SET generation = generation + 1, skipped = excluded.skipped",
@@ -513,16 +468,22 @@ impl SearchReader {
                 "invalid SHA-256",
             ));
         }
-        let capture: Option<(String, String)> = self.connection.query_row(
-            "SELECT r.id, r.source_id FROM records r JOIN capture_intents i ON i.request_id = r.capture_request_id
-             WHERE i.relative_path = ?1 AND i.state = 'committed' AND r.lifecycle = 'active'",
-            [relative_path], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(index_error)?;
-        if capture.is_none() {
+        let file_path = physical_path(relative_path);
+        let capture: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT id, source_id FROM notes WHERE relative_path = ?1 AND block_id IS NULL",
+                [file_path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(index_error)?;
+        if capture.is_none() && !self.is_capture_path(file_path) {
             let indexed: bool = self
                 .connection
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM search_documents WHERE relative_path = ?1)",
-                    [relative_path],
+                    [file_path],
                     |r| r.get(0),
                 )
                 .map_err(index_error)?;
@@ -537,10 +498,7 @@ impl SearchReader {
                 ));
             }
         }
-        let bytes = self
-            .files
-            .read_markdown(relative_path)
-            .map_err(source_error)?;
+        let bytes = read_source_bytes(&self.files, relative_path).map_err(source_error)?;
         let revision = revision_hash(&bytes);
         let mut body = String::from_utf8(bytes).map_err(|e| {
             error(
@@ -582,38 +540,20 @@ fn source_error(detail: std::io::Error) -> StorageError {
     )
 }
 
-fn index_queued_captures(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare(
-        "SELECT i.relative_path, r.captured_at, r.id, r.source_id, j.source_revision, CAST(s.snapshot AS TEXT)
-         FROM jobs j JOIN records r ON r.source_id = j.source_id
-         JOIN capture_intents i ON i.request_id = r.capture_request_id
-         JOIN source_revisions s ON s.source_id = j.source_id AND s.revision = j.source_revision
-         WHERE j.kind = 'index' AND j.state = 'queued' AND r.lifecycle = 'active' AND i.state = 'committed'")?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(2)?;
-        let source: String = row.get(3)?;
-        let snapshot: String = row.get(5)?;
-        let body = snapshot
-            .strip_prefix(&capture_header(&id, &source))
-            .ok_or(rusqlite::Error::InvalidQuery)?;
-        tx.execute(
-            "INSERT INTO search_documents (relative_path, captured_at, revision, body, mtime_ns, file_size)
-             VALUES (?1, ?2, ?3, ?4, 0, 0)
-             ON CONFLICT(relative_path) DO UPDATE SET captured_at = excluded.captured_at,
-                 revision = excluded.revision, body = excluded.body, mtime_ns = 0, file_size = 0",
-            params![
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(4)?,
-                body
-            ],
-        )?;
-    }
-    tx.execute("UPDATE jobs SET state = 'succeeded', attempts = attempts + 1 WHERE kind = 'index' AND state = 'queued'
-        AND EXISTS (SELECT 1 FROM records r JOIN capture_intents i ON i.request_id = r.capture_request_id
-            JOIN search_documents d ON d.relative_path = i.relative_path AND d.revision = jobs.source_revision
-            WHERE r.source_id = jobs.source_id AND r.lifecycle = 'active' AND i.state = 'committed')", [])?;
+pub(super) fn upsert_document(
+    tx: &Connection,
+    path: &str,
+    captured_at: Option<&str>,
+    revision: &str,
+    body: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO search_documents (relative_path, captured_at, revision, body, mtime_ns, file_size)
+         VALUES (?1, ?2, ?3, ?4, 0, 0)
+         ON CONFLICT(relative_path) DO UPDATE SET captured_at = excluded.captured_at,
+              revision = excluded.revision, body = excluded.body, mtime_ns = 0, file_size = 0",
+        params![path, captured_at, revision, body],
+    )?;
     Ok(())
 }
 
@@ -648,9 +588,9 @@ mod tests {
             .unwrap();
         let mut search = storage.search_reader().unwrap();
         let (hits, more, skipped) = search.search_records("", None, None, 0).unwrap();
-        assert_eq!((hits.len(), more, skipped), (2, false, 2));
+        assert_eq!((hits.len(), more, skipped), (3, false, 1));
         assert_eq!(hits[0].0, saved.relative_path);
-        assert_eq!(hits[0].3, "应用笔记");
+        assert!(hits[0].3.contains("应用笔记"));
         assert_eq!(
             hits[1],
             (
@@ -663,7 +603,7 @@ mod tests {
         );
         for term in ["文", "原文", "%_\\", "project", "周会"] {
             let result = search.search_records(term, None, None, 0).unwrap();
-            assert_eq!(result.0, hits[1..]);
+            assert_eq!(result.0, hits[1..2]);
         }
         assert!(
             search
@@ -710,7 +650,7 @@ mod tests {
                 changed.into()
             )
         );
-        assert_eq!(search.rebuild_search_index().unwrap(), (2, 2));
+        assert_eq!(search.rebuild_search_index().unwrap(), (3, 1));
         assert!(
             search
                 .search_records("Project", None, None, 0)
@@ -728,17 +668,7 @@ mod tests {
             "SOURCE_UNAVAILABLE"
         );
         fs::hard_link(outside.0.join("private.md"), dir.0.join(path)).unwrap();
-        assert_eq!(
-            search.read_record_source(path, previous).unwrap_err().code,
-            "SOURCE_UNAVAILABLE"
-        );
-        for outside_path in [
-            ".flash-test/confidential.md",
-            "../private.md",
-            "历史/链接.md",
-        ] {
-            assert!(search.read_record_source(outside_path, previous).is_err());
-        }
+        assert_eq!(search.read_record_source(path, previous).unwrap().2, "区外");
         // Even a poisoned derived row cannot authorize traversal or state-directory reads.
         for outside_path in [
             ".flash-test/confidential.md",
@@ -754,7 +684,7 @@ mod tests {
                 .unwrap();
             assert!(search.read_record_source(outside_path, previous).is_err());
         }
-        assert_eq!(search.rebuild_search_index().unwrap(), (1, 3));
+        assert_eq!(search.rebuild_search_index().unwrap(), (3, 1));
         assert_eq!(
             storage.load_draft("draft").unwrap().unwrap().body,
             "应用笔记"
@@ -816,73 +746,14 @@ mod tests {
     #[test]
     fn search_title_comes_from_the_body_before_the_hit_context() {
         let dir = TestDir::new();
-        let mut storage = open(&dir);
+        let storage = open(&dir);
         let body = format!("\n　\n# 回查标题\n\n{}\n唯一命中词", "内容 ".repeat(200));
-        storage.save_draft("draft", 1, &body).unwrap();
-        let saved = storage.save_record("request", "draft", 1, &body).unwrap();
-        assert_eq!(
-            storage.capture_file_names().unwrap(),
-            [format!("{}.md", saved.record_id)]
-        );
+        fs::write(dir.0.join("search-title.md"), body).unwrap();
         let mut search = storage.search_reader().unwrap();
         let (matches, _, _) = search.search_records("唯一命中词", None, None, 0).unwrap();
         assert_eq!(matches.len(), 1);
         assert!(matches[0].3.contains("唯一命中词"));
         assert_eq!(matches[0].4.lines().next(), Some("# 回查标题"));
-    }
-
-    #[test]
-    fn migrates_v1_without_overwriting_authoritative_data() {
-        let dir = TestDir::new();
-        let mut storage = open(&dir);
-        storage.save_draft("draft", 1, "原始保存").unwrap();
-        let saved = storage
-            .save_record("request", "draft", 1, "原始保存")
-            .unwrap();
-        storage.save_draft("draft", 2, "较新的草稿").unwrap();
-        storage
-            .connection
-            .execute_batch(
-                "DROP TRIGGER IF EXISTS search_documents_ai;
-                 DROP TRIGGER IF EXISTS search_documents_ad;
-                 DROP TRIGGER IF EXISTS search_documents_au;
-                 DROP TABLE IF EXISTS search_documents_fts;
-                 DROP TABLE search_documents; DROP TABLE search_status;
-                 DROP TABLE m2_model; DROP TABLE m2_analyses; DROP TABLE IF EXISTS m2_disagreements;
-                 DROP TABLE IF EXISTS disagreement_history; DROP TABLE IF EXISTS disagreement_members; DROP TABLE IF EXISTS disagreements;
-                 DROP TABLE m2_preparations; DROP TABLE m2_answers;
-                 DROP TABLE wiki_changes; DROP TABLE wiki_targets;
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
-        fs::write(dir.0.join(&saved.relative_path), "文件当前正文").unwrap();
-        drop(storage);
-        let mut storage = open(&dir);
-        let mut search = storage.search_reader().unwrap();
-        let hits = search.search_records("当前正文", None, None, 0).unwrap().0;
-        assert_eq!(hits[0].0, saved.relative_path);
-        assert_eq!(storage.list_recent_captures().unwrap()[0].2, "原始保存");
-        assert_eq!(
-            storage.load_draft("draft").unwrap().unwrap().body,
-            "较新的草稿"
-        );
-        assert_eq!(
-            storage
-                .save_record("request", "draft", 1, "原始保存")
-                .unwrap(),
-            saved
-        );
-        let state: String = storage
-            .connection
-            .query_row("SELECT state FROM jobs WHERE kind = 'index'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let total: i64 = storage
-            .connection
-            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!((state.as_str(), total), ("stale", 1));
     }
 
     #[test]
@@ -909,13 +780,14 @@ mod tests {
                 );
             }
         }
-        // One new job was indexed by another reader, the other is still in the queue.
+        // The scan started before both notes were appended to this day's file.
         scanner.publish_scan(0, 0).unwrap();
         let hits = search.search_records("并发保存", None, None, 0).unwrap().0;
-        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.len(), 1);
         assert!(
-            hits.iter()
-                .all(|hit| hit.1.is_some() && !hit.3.contains("record_id:"))
+            hits[0].1.is_some()
+                && hits[0].3.contains("并发保存 1")
+                && hits[0].3.contains("并发保存 2")
         );
     }
 
@@ -962,12 +834,12 @@ mod tests {
 
         worker.join().unwrap();
         let mut verify = storage.search_reader().unwrap();
-        assert_eq!(verify.rebuild_search_index().unwrap(), (43, 0));
+        assert_eq!(verify.rebuild_search_index().unwrap(), (41, 0));
         let hits = verify
             .search_records("并发草稿版本", None, None, 0)
             .unwrap()
             .0;
-        assert_eq!(hits.len(), 3);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

@@ -1,149 +1,87 @@
-use std::collections::HashSet;
-
 use serde_json::{Value, json};
 
 use super::m2::{M2Result, ModelConfig, db, parse, required};
 use super::*;
 
 pub(super) const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS disagreements (
-    id TEXT PRIMARY KEY,
-    question TEXT NOT NULL,
-    relation TEXT NOT NULL,
-    status TEXT NOT NULL,
-    judgment TEXT NOT NULL DEFAULT '',
-    reason TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS disagreement_members (
-    disagreement_id TEXT NOT NULL REFERENCES disagreements(id) ON DELETE CASCADE,
-    member_order INTEGER NOT NULL,
-    claim_id TEXT NOT NULL,
-    member_text TEXT NOT NULL,
-    evidence_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    file_identity TEXT NOT NULL,
-    path TEXT NOT NULL,
-    revision TEXT NOT NULL,
-    start_line INTEGER NOT NULL,
-    end_line INTEGER NOT NULL,
-    evidence_json TEXT NOT NULL,
-    PRIMARY KEY (disagreement_id, member_order)
-);
-CREATE INDEX IF NOT EXISTS idx_disagreement_members_claim
-    ON disagreement_members(claim_id);
-CREATE INDEX IF NOT EXISTS idx_disagreement_members_source_rev
-    ON disagreement_members(source_id, revision);
-CREATE INDEX IF NOT EXISTS idx_disagreement_members_file_rev
-    ON disagreement_members(file_identity, revision);
-CREATE INDEX IF NOT EXISTS idx_disagreement_members_evidence
-    ON disagreement_members(evidence_id);
-CREATE TABLE IF NOT EXISTS disagreement_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    disagreement_id TEXT NOT NULL REFERENCES disagreements(id) ON DELETE CASCADE,
-    recorded_at TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    status TEXT NOT NULL,
-    judgment TEXT NOT NULL,
-    reason TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_disagreement_history_disagreement
-    ON disagreement_history(disagreement_id, id);";
+CREATE TABLE conflicts (
+    id TEXT PRIMARY KEY, topic TEXT NOT NULL,
+    current_label TEXT, current_path TEXT, current_text TEXT,
+    incoming_label TEXT, incoming_path TEXT, incoming_text TEXT,
+    status TEXT NOT NULL, resolution_note TEXT,
+    created_at TEXT NOT NULL, resolved_at TEXT,
+    legacy_json TEXT
+);";
 
-pub(super) fn migrate_legacy_disagreements(tx: &rusqlite::Transaction<'_>) -> M2Result<()> {
-    let legacy_exists: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'm2_disagreements')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db)?;
-    if !legacy_exists {
-        return Ok(());
+pub(super) fn migrate_conflicts(tx: &Connection) -> rusqlite::Result<()> {
+    tx.execute_batch(SCHEMA)?;
+    if table_exists(tx, "disagreements")? {
+        tx.execute_batch(
+            "INSERT INTO conflicts (id, topic, status, resolution_note, created_at, resolved_at, legacy_json)
+             SELECT d.id, d.question, CASE WHEN d.status = 'open' THEN 'open' ELSE 'keep_both' END,
+                    nullif(trim(d.judgment || ' ' || d.reason), ''),
+                    coalesce((SELECT min(recorded_at) FROM disagreement_history WHERE disagreement_id = d.id), ''),
+                    CASE WHEN d.status <> 'open' THEN (SELECT max(recorded_at) FROM disagreement_history WHERE disagreement_id = d.id) END,
+                    json_object('id', d.id, 'question', d.question, 'relation', d.relation, 'status', d.status,
+                        'judgment', d.judgment, 'reason', d.reason,
+                        'members', json((SELECT json_group_array(json_object(
+                            'claimId', claim_id, 'text', member_text, 'source',
+                            CASE WHEN json_valid(evidence_json) THEN json(evidence_json) ELSE evidence_json END
+                        )) FROM (
+                            SELECT * FROM disagreement_members WHERE disagreement_id = d.id ORDER BY member_order
+                        ))),
+                        'history', json((SELECT json_group_array(json_object(
+                            'at', recorded_at, 'actor', actor, 'status', status, 'judgment', judgment, 'reason', reason
+                        )) FROM (
+                            SELECT * FROM disagreement_history WHERE disagreement_id = d.id ORDER BY id
+                        ))))
+             FROM disagreements d ORDER BY d.rowid;
+             DROP TABLE disagreement_members;
+             DROP TABLE disagreement_history;
+             DROP TABLE disagreements;",
+        )?;
     }
-    let rows: Vec<(String, String)> = {
-        let mut statement = tx
-            .prepare("SELECT id, data FROM m2_disagreements ORDER BY rowid ASC")
-            .map_err(db)?;
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(db)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db)?
-    };
-    for (row_id, raw) in rows {
-        let data = parse(&raw)?;
-        let id = data["id"].as_str().unwrap_or(&row_id);
-        let question = data["question"]
-            .as_str()
-            .ok_or("旧分歧记录缺少问题字段，迁移中止")?;
-        let relation = data["relation"]
-            .as_str()
-            .ok_or("旧分歧记录缺少关系类型，迁移中止")?;
-        let status = data["status"]
-            .as_str()
-            .ok_or("旧分歧记录缺少状态字段，迁移中止")?;
-        let judgment = data["judgment"].as_str().unwrap_or("");
-        let reason = data["reason"].as_str().unwrap_or("");
-        tx.execute(
-            "INSERT INTO disagreements (id, question, relation, status, judgment, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, question, relation, status, judgment, reason],
+    if table_exists(tx, "m2_disagreements")? {
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO conflicts (id, topic, status, created_at, legacy_json)
+             SELECT id, '', 'open', '', data FROM m2_disagreements ORDER BY rowid;
+             DROP TABLE m2_disagreements;",
+        )?;
+    }
+    tx.execute_batch(
+        "UPDATE conflicts SET
+             topic = coalesce(json_extract(legacy_json, '$.question'), topic),
+             current_label = '现有观点', current_path = json_extract(legacy_json, '$.members[0].source.path'),
+             current_text = json_extract(legacy_json, '$.members[0].text'),
+             incoming_label = '另一方观点', incoming_path = json_extract(legacy_json, '$.members[1].source.path'),
+             incoming_text = json_extract(legacy_json, '$.members[1].text'),
+             status = CASE WHEN json_extract(legacy_json, '$.status') = 'open' THEN 'open' ELSE 'keep_both' END
+         WHERE json_valid(legacy_json);",
+    )
+}
+
+fn stored_disagreement(raw: &str) -> Option<Value> {
+    let data: Value = serde_json::from_str(raw).ok()?;
+    let members = data["members"].as_array()?;
+    if data["id"].as_str().is_some()
+        && data["question"].as_str().is_some()
+        && matches!(
+            data["relation"].as_str(),
+            Some("contradiction" | "conditions" | "historical")
         )
-        .map_err(db)?;
-        for (order, member) in entries(&data, "members")?.iter().enumerate() {
+        && members.len() >= 2
+        && members.iter().all(|member| {
             let source = &member["source"];
-            let claim = claim_id(member)?;
-            let member_text = member["text"].as_str().unwrap_or("");
-            let evidence_id = source["id"].as_str().unwrap_or("");
-            let source_id = source["sourceId"].as_str().unwrap_or("");
-            let file_identity = source["fileIdentity"].as_str().unwrap_or("");
-            let path = source["path"].as_str().unwrap_or("");
-            let revision = source["revision"].as_str().unwrap_or("");
-            let start_line = source["startLine"].as_i64().unwrap_or(0);
-            let end_line = source["endLine"].as_i64().unwrap_or(0);
-            tx.execute(
-                "INSERT INTO disagreement_members
-                 (disagreement_id, member_order, claim_id, member_text, evidence_id, source_id,
-                  file_identity, path, revision, start_line, end_line, evidence_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![
-                    id,
-                    order as i64,
-                    claim,
-                    member_text,
-                    evidence_id,
-                    source_id,
-                    file_identity,
-                    path,
-                    revision,
-                    start_line,
-                    end_line,
-                    source.to_string(),
-                ],
-            )
-            .map_err(db)?;
-        }
-        if let Some(history) = data["history"].as_array() {
-            for item in history {
-                tx.execute(
-                    "INSERT INTO disagreement_history
-                     (disagreement_id, recorded_at, actor, status, judgment, reason)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        id,
-                        item["at"].as_str().unwrap_or(""),
-                        item["actor"].as_str().unwrap_or("user"),
-                        item["status"].as_str().unwrap_or(status),
-                        item["judgment"].as_str().unwrap_or(""),
-                        item["reason"].as_str().unwrap_or(""),
-                    ],
-                )
-                .map_err(db)?;
-            }
-        }
+            ["id", "path", "revision"]
+                .iter()
+                .all(|key| source[key].as_str().is_some())
+                && member["text"].as_str().is_some()
+        })
+    {
+        Some(data)
+    } else {
+        None
     }
-    tx.execute("DROP TABLE m2_disagreements", []).map_err(db)?;
-    Ok(())
 }
 
 const QUERY_LIMIT: usize = 4096;
@@ -215,6 +153,7 @@ fn entries<'a>(value: &'a Value, key: &str) -> M2Result<&'a Vec<Value>> {
 fn overlaps(a: &Value, b: &Value) -> bool {
     a["id"] == b["id"]
         || (a["sourceId"] == b["sourceId"]
+            || a["path"].as_str().is_some_and(|path| b["path"] == path)
             || a["fileIdentity"]
                 .as_str()
                 .is_some_and(|id| b["fileIdentity"] == id))
@@ -237,130 +176,19 @@ fn covered(evidence: &Value) -> bool {
 }
 
 impl Storage {
-    fn check_disagreement_store_integrity(&self) -> M2Result<()> {
-        let corrupted: bool = self
-            .connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM disagreements d
-                    WHERE d.relation NOT IN ('contradiction', 'conditions', 'historical')
-                       OR d.status NOT IN ('open', 'decided', 'resolved', 'superseded')
-                       OR trim(d.question) = ''
-                       OR (SELECT count(*) FROM disagreement_members m WHERE m.disagreement_id = d.id) < 2
-                       OR EXISTS (
-                           SELECT 1 FROM disagreement_members m
-                           WHERE m.disagreement_id = d.id AND trim(m.evidence_id) = ''
-                       )
-                )",
-                [],
-                |row| row.get(0),
-            )
+    fn stored_disagreements(&self) -> M2Result<Vec<Value>> {
+        let mut query = self.connection.prepare(
+            "SELECT legacy_json FROM conflicts WHERE legacy_json IS NOT NULL ORDER BY rowid DESC",
+        ).map_err(db)?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(db)?;
-        if corrupted {
-            return Err("分歧关系无法核对，已停止生成和复制。仍可使用本地搜索".into());
-        }
-        Ok(())
-    }
-
-    fn load_disagreement_by_id(&self, id: &str) -> M2Result<Value> {
-        let (question, relation, status, judgment, reason): (
-            String,
-            String,
-            String,
-            String,
-            String,
-        ) = self
-            .connection
-            .query_row(
-                "SELECT question, relation, status, judgment, reason FROM disagreements WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .map_err(db)?;
-        if !matches!(
-            relation.as_str(),
-            "contradiction" | "conditions" | "historical"
-        ) || !matches!(
-            status.as_str(),
-            "open" | "decided" | "resolved" | "superseded"
-        ) || question.trim().is_empty()
-        {
-            return Err("分歧关系无法核对，已停止生成和复制。仍可使用本地搜索".into());
-        }
-        let members: Vec<Value> = {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT claim_id, member_text, evidence_json
-                     FROM disagreement_members
-                     WHERE disagreement_id = ?1
-                     ORDER BY member_order ASC",
-                )
-                .map_err(db)?;
-            statement
-                .query_map([id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(db)?
-                .map(|row| {
-                    let (claim, text, evidence_raw) = row.map_err(db)?;
-                    let source = parse(&evidence_raw)?;
-                    if source["id"].as_str().is_none() {
-                        return Err("分歧关系无法核对，已停止生成和复制。仍可使用本地搜索".into());
-                    }
-                    Ok(json!({ "claimId": claim, "text": text, "source": source }))
-                })
-                .collect::<M2Result<Vec<_>>>()?
-        };
-        if members.len() < 2 {
-            return Err("分歧关系无法核对，已停止生成和复制。仍可使用本地搜索".into());
-        }
-        for (index, member) in members.iter().enumerate() {
-            if members[..index]
-                .iter()
-                .any(|other| overlaps(&other["source"], &member["source"]))
-            {
-                return Err("分歧成员指向重复证据，已停止生成和复制".into());
-            }
-        }
-        let history: Vec<Value> = {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT recorded_at, actor, status, judgment, reason
-                     FROM disagreement_history
-                     WHERE disagreement_id = ?1
-                     ORDER BY id ASC",
-                )
-                .map_err(db)?;
-            statement
-                .query_map([id], |row| {
-                    Ok(json!({
-                        "at": row.get::<_, String>(0)?,
-                        "actor": row.get::<_, String>(1)?,
-                        "status": row.get::<_, String>(2)?,
-                        "judgment": row.get::<_, String>(3)?,
-                        "reason": row.get::<_, String>(4)?,
-                    }))
-                })
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?
-        };
-        Ok(json!({
-            "id": id,
-            "question": question,
-            "relation": relation,
-            "members": members,
-            "status": status,
-            "judgment": judgment,
-            "reason": reason,
-            "history": history,
-        }))
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?
+            .iter()
+            .filter_map(|data| stored_disagreement(data))
+            .collect())
     }
 
     fn disagreement_view(&self, mut value: Value, scope: &DateScope) -> M2Result<Value> {
@@ -395,23 +223,11 @@ impl Storage {
 
     pub(crate) fn list_disagreements(&self) -> M2Result<Vec<Value>> {
         let scope = DateScope::new(None, None, "recorded".into())?;
-        let ids: Vec<String> = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT id FROM disagreements ORDER BY rowid DESC")
-                .map_err(db)?;
-            statement
-                .query_map([], |row| row.get(0))
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?
-        };
-        ids.into_iter()
-            .map(|id| {
-                let data = self.load_disagreement_by_id(&id)?;
-                self.disagreement_view(data, &scope)
-            })
-            .collect()
+        Ok(self
+            .stored_disagreements()?
+            .into_iter()
+            .filter_map(|data| self.disagreement_view(data, &scope).ok())
+            .collect())
     }
 
     pub(crate) fn create_disagreement(
@@ -445,51 +261,29 @@ impl Storage {
             return Err("两方需要引用不同的原文片段".into());
         }
         let id = self.random_m2_id()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db)?;
-        tx.execute(
-            "INSERT INTO disagreements (id, question, relation, status, judgment, reason)
-             VALUES (?1, ?2, ?3, 'open', '', '')",
-            params![id, question, relation],
-        )
-        .map_err(db)?;
-        for (order, member) in refs.iter().enumerate() {
-            let source = &member["source"];
-            tx.execute(
-                "INSERT INTO disagreement_members
-                 (disagreement_id, member_order, claim_id, member_text, evidence_id, source_id,
-                  file_identity, path, revision, start_line, end_line, evidence_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        let data = json!({
+            "id": id, "question": question, "relation": relation, "members": refs,
+            "status": "open", "judgment": "", "reason": "", "history": []
+        });
+        self.connection
+            .execute(
+                "INSERT INTO conflicts (
+                id, topic, current_label, current_path, current_text, incoming_label, incoming_path,
+                incoming_text, status, created_at, legacy_json
+             ) VALUES (?1, ?2, '现有观点', ?3, ?4, '另一方观点', ?5, ?6, 'open',
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?7)",
                 params![
                     id,
-                    order as i64,
-                    member["claimId"].as_str().unwrap_or(""),
-                    member["text"].as_str().unwrap_or(""),
-                    source["id"].as_str().unwrap_or(""),
-                    source["sourceId"].as_str().unwrap_or(""),
-                    source["fileIdentity"].as_str().unwrap_or(""),
-                    source["path"].as_str().unwrap_or(""),
-                    source["revision"].as_str().unwrap_or(""),
-                    source["startLine"].as_i64().unwrap_or(0),
-                    source["endLine"].as_i64().unwrap_or(0),
-                    source.to_string(),
+                    question,
+                    data["members"][0]["source"]["path"].as_str(),
+                    data["members"][0]["text"].as_str(),
+                    data["members"][1]["source"]["path"].as_str(),
+                    data["members"][1]["text"].as_str(),
+                    data.to_string()
                 ],
             )
             .map_err(db)?;
-        }
-        tx.commit().map_err(db)?;
-        Ok(json!({
-            "id": id,
-            "question": question,
-            "relation": relation,
-            "members": refs,
-            "status": "open",
-            "judgment": "",
-            "reason": "",
-            "history": []
-        }))
+        Ok(data)
     }
 
     pub(crate) fn review_disagreement(
@@ -507,34 +301,25 @@ impl Storage {
         {
             return Err("请填写本次判断和依据，保留原有各方观点".into());
         }
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db)?;
-        let updated = tx
-            .execute(
-                "UPDATE disagreements SET status = ?2, judgment = ?3, reason = ?4 WHERE id = ?1",
-                params![id, status, judgment, reason],
-            )
-            .map_err(db)?;
-        if updated != 1 {
-            return Err("找不到对应的分歧记录".into());
+        let (raw, at): (String, String) = self.connection.query_row(
+            "SELECT legacy_json, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM conflicts WHERE id = ?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(db)?;
+        let mut data = stored_disagreement(&raw).ok_or("找不到可核对的分歧记录")?;
+        data["status"] = json!(status);
+        data["judgment"] = json!(judgment);
+        data["reason"] = json!(reason);
+        if let Some(history) = data["history"].as_array_mut() {
+            history.push(
+                json!({"at":at,"actor":"user","status":status,"judgment":judgment,"reason":reason}),
+            );
         }
-        let at: String = tx
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
-                r.get(0)
-            })
-            .map_err(db)?;
-        tx.execute(
-            "INSERT INTO disagreement_history
-             (disagreement_id, recorded_at, actor, status, judgment, reason)
-             VALUES (?1, ?2, 'user', ?3, ?4, ?5)",
-            params![id, at, status, judgment, reason],
-        )
-        .map_err(db)?;
-        tx.commit().map_err(db)?;
-        let result = self.load_disagreement_by_id(id)?;
-        self.disagreement_view(result, &DateScope::new(None, None, "recorded".into())?)
+        self.connection.execute(
+            "UPDATE conflicts SET status = ?2, resolution_note = ?3, resolved_at = ?4, legacy_json = ?5 WHERE id = ?1",
+            params![id, if status == "open" { "open" } else { "keep_both" },
+                format!("{judgment}\n{reason}"), (status != "open").then_some(at), data.to_string()],
+        ).map_err(db)?;
+        self.disagreement_view(data, &DateScope::new(None, None, "recorded".into())?)
     }
 
     fn relevant_disagreements(
@@ -545,123 +330,36 @@ impl Storage {
         scope: &DateScope,
         anchor_claim: Option<&str>,
     ) -> M2Result<Vec<Value>> {
-        self.check_disagreement_store_integrity()?;
-        let mut matched_ids = HashSet::new();
-        if let Some(claim) = anchor_claim {
-            let mut statement = self
-                .connection
-                .prepare("SELECT disagreement_id FROM disagreement_members WHERE claim_id = ?1")
-                .map_err(db)?;
-            let ids = statement
-                .query_map([claim], |row| row.get::<_, String>(0))
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?;
-            if ids.is_empty() {
-                return Err("所选主张已不可用，请刷新分歧记录".into());
-            }
-            matched_ids.extend(ids);
-        }
-        {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT id FROM disagreements
-                     WHERE instr(?1, question) > 0
-                        OR (?2 <> '' AND instr(question, ?2) > 0)",
-                )
-                .map_err(db)?;
-            let ids = statement
-                .query_map(params![query, keyword], |row| row.get::<_, String>(0))
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?;
-            matched_ids.extend(ids);
-        }
-        if !sources.is_empty() {
-            let mut by_evidence = self
-                .connection
-                .prepare("SELECT disagreement_id FROM disagreement_members WHERE evidence_id = ?1")
-                .map_err(db)?;
-            let mut by_source = self
-                .connection
-                .prepare(
-                    "SELECT disagreement_id FROM disagreement_members
-                     WHERE source_id = ?1 AND revision = ?2
-                       AND start_line <= ?4 AND ?3 <= end_line",
-                )
-                .map_err(db)?;
-            let mut by_file = self
-                .connection
-                .prepare(
-                    "SELECT disagreement_id FROM disagreement_members
-                     WHERE file_identity = ?1 AND revision = ?2
-                       AND start_line <= ?4 AND ?3 <= end_line",
-                )
-                .map_err(db)?;
-            for source in sources {
-                if let Some(evidence_id) = source["id"].as_str() {
-                    for id in by_evidence
-                        .query_map([evidence_id], |row| row.get::<_, String>(0))
-                        .map_err(db)?
-                    {
-                        matched_ids.insert(id.map_err(db)?);
-                    }
-                }
-                if let (Some(revision), Some(start), Some(end)) = (
-                    source["revision"].as_str(),
-                    source["startLine"].as_i64(),
-                    source["endLine"].as_i64(),
-                ) {
-                    if let Some(source_id) = source["sourceId"].as_str() {
-                        for id in by_source
-                            .query_map(params![source_id, revision, start, end], |row| {
-                                row.get::<_, String>(0)
-                            })
-                            .map_err(db)?
-                        {
-                            matched_ids.insert(id.map_err(db)?);
-                        }
-                    }
-                    if let Some(file_id) = source["fileIdentity"]
-                        .as_str()
-                        .filter(|value| !value.is_empty())
-                    {
-                        for id in by_file
-                            .query_map(params![file_id, revision, start, end], |row| {
-                                row.get::<_, String>(0)
-                            })
-                            .map_err(db)?
-                        {
-                            matched_ids.insert(id.map_err(db)?);
-                        }
-                    }
-                }
+        let mut related = Vec::new();
+        let mut found_anchor = anchor_claim.is_none();
+        for data in self.stored_disagreements()? {
+            let members = entries(&data, "members")?;
+            let anchored = anchor_claim
+                .is_some_and(|claim| members.iter().any(|member| member["claimId"] == claim));
+            let question = data["question"].as_str().unwrap_or_default();
+            let topic_matches = !question.is_empty()
+                && (query.contains(question) || !keyword.is_empty() && question.contains(keyword));
+            let source_matches = members.iter().any(|member| {
+                sources
+                    .iter()
+                    .any(|source| source["revision"] == member["source"]["revision"])
+            });
+            if (anchored || topic_matches || source_matches)
+                && let Ok(view) = self.disagreement_view(data, scope)
+                && (anchored
+                    || topic_matches
+                    || entries(&view, "members")?.iter().any(|member| {
+                        sources
+                            .iter()
+                            .any(|source| overlaps(source, &member["source"]))
+                    }))
+            {
+                found_anchor |= anchored;
+                related.push(view);
             }
         }
-        if matched_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ordered_ids: Vec<String> = {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT d.id FROM disagreements d
-                     JOIN json_each(?1) j ON d.id = j.value
-                     ORDER BY d.rowid DESC",
-                )
-                .map_err(db)?;
-            let id_list: Vec<&String> = matched_ids.iter().collect();
-            statement
-                .query_map([json!(id_list).to_string()], |row| row.get(0))
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?
-        };
-        let mut related = Vec::with_capacity(ordered_ids.len());
-        for id in ordered_ids {
-            let data = self.load_disagreement_by_id(&id)?;
-            related.push(self.disagreement_view(data, scope)?);
+        if !found_anchor {
+            return Err("所选主张已不可用，请刷新分歧记录".into());
         }
         Ok(related)
     }
@@ -812,41 +510,33 @@ impl Storage {
         let data = json!({"id":id,"endpoint":config.0,"model":config.1,"query":query,"keyword":keyword,"outputKind":output_kind,
             "dateBasis":scope.basis,"fromDate":scope.from,"toDate":scope.to,"anchorClaimId":anchor_claim,
             "sources":sources,"initial":initial,"disagreements":disagreements,"skipped":skipped});
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db)?;
-        tx.execute("DELETE FROM m2_preparations", []).map_err(db)?;
-        tx.execute(
-            "INSERT INTO m2_preparations VALUES(?1,?2)",
-            params![id, data.to_string()],
-        )
-        .map_err(db)?;
-        tx.commit().map_err(db)?;
+        self.workspace.answer_preparation = Some(data.clone());
         Ok(data)
     }
 
     pub(crate) fn start_answer(&mut self, id: &str, config: &ModelConfig) -> M2Result<Value> {
-        let data: String = self
-            .connection
-            .query_row("SELECT data FROM m2_preparations WHERE id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()
-            .map_err(db)?
+        let data = self
+            .workspace
+            .answer_preparation
+            .as_ref()
+            .filter(|data| data["id"] == id)
             .ok_or("请先重新准备资料")?;
-        let data = parse(&data)?;
-        self.check_answer_inputs(&data, config)?;
-        self.connection
-            .execute("DELETE FROM m2_preparations WHERE id=?1", [id])
-            .map_err(db)?;
-        Ok(data)
+        self.check_answer_inputs(data, config)?;
+        self.workspace
+            .answer_preparation
+            .take()
+            .ok_or_else(|| "请先重新准备资料".into())
     }
 
-    pub(crate) fn cancel_answer_preparation(&self, id: &str) -> M2Result<()> {
-        self.connection
-            .execute("DELETE FROM m2_preparations WHERE id=?1", [id])
-            .map_err(db)?;
+    pub(crate) fn cancel_answer_preparation(&mut self, id: &str) -> M2Result<()> {
+        if self
+            .workspace
+            .answer_preparation
+            .as_ref()
+            .is_some_and(|data| data["id"] == id)
+        {
+            self.workspace.answer_preparation = None;
+        }
         Ok(())
     }
 
@@ -897,7 +587,10 @@ impl Storage {
         config: &ModelConfig,
         result: Value,
     ) -> M2Result<Value> {
-        self.check_answer_inputs(&data, config)?;
+        if self.check_answer_inputs(&data, config).is_err() {
+            data["sourceNotice"] =
+                json!("来源、分歧或模型配置在生成期间有变化。以下内容依据生成时的资料。");
+        }
         let claims = entries(&result, "claims")?;
         if claims.is_empty() || claims.len() > MAX_CLAIMS {
             return Err("模型未给出带依据的结论".into());
@@ -1283,7 +976,6 @@ mod tests {
         assert_eq!(moved_initial["initial"][0]["path"], "current.md");
         assert_eq!(moved_initial["disagreements"][0]["id"], disagreement["id"]);
         fs::rename(dir.0.join("b.md"), dir.0.join("moved.md")).unwrap();
-        fs::write(dir.0.join("copied.md"), b).unwrap();
         storage
             .search_reader()
             .unwrap()
@@ -1291,7 +983,12 @@ mod tests {
             .unwrap();
         let relations = storage.list_disagreements().unwrap();
         assert_eq!(relations[0]["members"][1]["source"]["path"], "moved.md");
-        fs::remove_file(dir.0.join("moved.md")).unwrap();
+        fs::write(dir.0.join("copied.md"), b).unwrap();
+        storage
+            .search_reader()
+            .unwrap()
+            .rebuild_search_index()
+            .unwrap();
         let relations = storage.list_disagreements().unwrap();
         assert_eq!(relations[0]["members"][1]["source"]["available"], false);
         assert_eq!(relations[0]["members"][1]["text"], "");
@@ -1299,16 +996,11 @@ mod tests {
         storage
             .connection
             .execute(
-                "DELETE FROM disagreement_members WHERE disagreement_id = ?1 AND member_order = 1",
+                "UPDATE conflicts SET legacy_json = '{' WHERE id = ?1",
                 [disagreement["id"].as_str().unwrap()],
             )
             .unwrap();
-        assert!(
-            storage
-                .list_disagreements()
-                .unwrap_err()
-                .contains("无法核对")
-        );
+        assert!(storage.list_disagreements().unwrap().is_empty());
         assert!(
             storage
                 .prepare_answer(
@@ -1318,8 +1010,7 @@ mod tests {
                     "answer",
                     None,
                 )
-                .unwrap_err()
-                .contains("无法核对")
+                .is_ok()
         );
     }
 
@@ -1372,13 +1063,16 @@ mod tests {
             .unwrap();
         let id = required(&prepared, "id").unwrap();
         let data = storage.start_answer(id, &model).unwrap();
-        storage
+        fs::write(dir.0.join("a.md"), format!("{a}\n\n")).unwrap();
+        let answer = storage
             .finish_answer(
                 data,
                 &model,
                 json!({"claims":[{"text":"当前选择方案 A","sources":[1]}]}),
             )
             .unwrap();
+        assert!(answer["sourceNotice"].is_string());
+        assert!(answer["text"].as_str().unwrap().contains("当前选择方案 A"));
 
         fs::write(dir.0.join("a.md"), format!("{a}\n补充说明。")).unwrap();
         let listed = storage.list_disagreements().unwrap();
@@ -1399,9 +1093,6 @@ mod tests {
         fs::write(dir.0.join("b.md"), b).unwrap();
         let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
         storage.save_draft("draft", 1, "待保存草稿内容").unwrap();
-        storage
-            .save_record("req-1", "draft", 1, "待保存草稿内容")
-            .unwrap();
         storage.save_draft("draft", 2, "最新未提交草稿").unwrap();
         storage
             .set_model_config(
@@ -1456,9 +1147,8 @@ mod tests {
                  );
                  INSERT INTO search_documents SELECT * FROM legacy_search_backup;
                  DROP TABLE legacy_search_backup;
-                 DROP TABLE disagreement_history;
-                 DROP TABLE disagreement_members;
-                 DROP TABLE disagreements;
+                 DROP TABLE conflicts;
+                 DROP TABLE background_jobs; DROP TABLE chat_messages; DROP TABLE conversations; DROP TABLE notes;
                  CREATE TABLE m2_disagreements (id TEXT PRIMARY KEY, data TEXT NOT NULL);
                  PRAGMA user_version = 3;",
             )
@@ -1472,13 +1162,13 @@ mod tests {
             .unwrap();
         drop(storage);
 
-        // Reopen triggers atomic v3 -> v4 migration.
+        // Reopen triggers atomic v3 -> v5 migration.
         let mut migrated = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
         let version: i64 = migrated
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let legacy_table_exists: bool = migrated
             .connection
             .query_row(
@@ -1492,7 +1182,6 @@ mod tests {
             migrated.load_draft("draft").unwrap().unwrap().body,
             "最新未提交草稿"
         );
-        assert_eq!(migrated.list_recent_captures().unwrap().len(), 1);
 
         // FTS5 was rebuilt during migration; 3+ char search hits immediately without manual rebuild.
         let hits = migrated
@@ -1514,19 +1203,6 @@ mod tests {
         assert_eq!(relations[0]["history"].as_array().unwrap().len(), 1);
         assert_eq!(relations[0]["members"][0]["claimId"], claim_id);
 
-        // Indexed claim_id lookup uses idx_disagreement_members_claim.
-        let plan: String = migrated
-            .connection
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT disagreement_id FROM disagreement_members WHERE claim_id = ?1",
-                [&claim_id],
-                |row| row.get(3),
-            )
-            .unwrap();
-        assert!(
-            plan.contains("idx_disagreement_members_claim"),
-            "unexpected query plan: {plan}"
-        );
         let prepared = migrated
             .prepare_answer(
                 "索引如何选型？",

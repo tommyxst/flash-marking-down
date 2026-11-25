@@ -1,18 +1,17 @@
 use super::*;
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS wiki_targets (path TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('wiki','tasks')));
 CREATE UNIQUE INDEX IF NOT EXISTS one_task_list ON wiki_targets(kind) WHERE kind='tasks';
-CREATE TABLE IF NOT EXISTS wiki_changes (
+CREATE TABLE IF NOT EXISTS wiki_suggestions (
  id TEXT PRIMARY KEY, operation_key TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
  phase TEXT NOT NULL, base_hash TEXT NOT NULL, after_hash TEXT NOT NULL, before_text TEXT NOT NULL,
  after_text TEXT NOT NULL, source_path TEXT NOT NULL, source_revision TEXT NOT NULL,
  start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, source_excerpt TEXT NOT NULL, entry_text TEXT NOT NULL,
- task_id TEXT, dependency TEXT REFERENCES wiki_changes(id), undoes TEXT REFERENCES wiki_changes(id)
+ task_id TEXT, dependency TEXT REFERENCES wiki_suggestions(id), undoes TEXT REFERENCES wiki_suggestions(id)
 );
-CREATE INDEX IF NOT EXISTS wiki_change_key ON wiki_changes(operation_key);";
+CREATE INDEX IF NOT EXISTS wiki_change_key ON wiki_suggestions(operation_key);";
 
 // id, target, kind, phase, approved base, before, after, source, source version, inclusive source lines.
 pub(crate) type WikiChange = (
@@ -30,7 +29,7 @@ pub(crate) type WikiChange = (
     String,
 );
 pub(crate) type WikiResult = (String, String, String);
-pub(crate) type WikiTask = (String, String, String, String);
+pub(crate) type WikiTask = (String, String, String, String, String);
 pub(crate) type WikiTaskList = (String, String, Vec<WikiTask>, Vec<String>);
 
 fn db(e: rusqlite::Error) -> StorageError {
@@ -64,7 +63,7 @@ struct Change {
 fn load_change(conn: &Connection, id: &str) -> Result<Change, StorageError> {
     conn.query_row(
         "SELECT id,target,kind,phase,base_hash,before_text,after_text,source_path,source_revision,
-        start_line,end_line,source_excerpt,task_id,dependency,undoes FROM wiki_changes WHERE id=?1",
+        start_line,end_line,source_excerpt,task_id,dependency,undoes FROM wiki_suggestions WHERE id=?1",
         [id],
         |r| {
             Ok(Change {
@@ -117,14 +116,14 @@ fn write_preview(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db)?;
     let previous: Option<String> = tx.query_row(
-        "SELECT id FROM wiki_changes WHERE operation_key=?1 AND
+        "SELECT id FROM wiki_suggestions WHERE operation_key=?1 AND
           (phase IN ('rejected','applied','reverted','prepared') OR (base_hash=?2 AND phase IN ('pending','deferred')))
          ORDER BY rowid DESC LIMIT 1", params![key,base], |r| r.get(0)).optional().map_err(db)?;
     if let Some(id) = previous {
         return Ok(load_change(&tx, &id)?.view);
     }
-    tx.execute("UPDATE wiki_changes SET phase='superseded' WHERE operation_key=?1 AND phase IN ('pending','deferred','conflict')",[key]).map_err(db)?;
-    let id: String = tx.query_row("INSERT INTO wiki_changes (id,operation_key,target,kind,phase,base_hash,after_hash,
+    tx.execute("UPDATE wiki_suggestions SET phase='superseded' WHERE operation_key=?1 AND phase IN ('pending','deferred','conflict')",[key]).map_err(db)?;
+    let id: String = tx.query_row("INSERT INTO wiki_suggestions (id,operation_key,target,kind,phase,base_hash,after_hash,
       before_text,after_text,source_path,source_revision,start_line,end_line,source_excerpt,entry_text,task_id,dependency,undoes)
       VALUES (lower(hex(randomblob(16))),?1,?2,?3,'pending',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) RETURNING id",
       params![key,target,kind,base,revision_hash(after.as_bytes()),before,after,source,version,start,end,excerpt,entry,change.task_id,change.dependency,change.undoes], |r|r.get(0)).map_err(db)?;
@@ -134,27 +133,29 @@ fn write_preview(
 
 impl Storage {
     pub(crate) fn create_wiki_target(&mut self, path: &str) -> Result<(), StorageError> {
-        let target = self.files.new_markdown(path).map_err(file_error)?;
+        let (key, target) = self
+            .workspace
+            .files
+            .markdown_target(path)
+            .map_err(file_error)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
         tx.execute(
             "INSERT INTO wiki_targets(path,kind) VALUES (?1,'wiki') ON CONFLICT(path) DO NOTHING",
-            [&target.key],
+            [&key],
         )
         .map_err(db)?;
         let role: String = tx
-            .query_row(
-                "SELECT kind FROM wiki_targets WHERE path=?1",
-                [&target.key],
-                |r| r.get(0),
-            )
+            .query_row("SELECT kind FROM wiki_targets WHERE path=?1", [&key], |r| {
+                r.get(0)
+            })
             .map_err(db)?;
         if role != "wiki" {
             return Err(invalid("此路径已映射为任务清单"));
         }
-        let _file = target.create().map_err(|e| {
+        replace_markdown(&target, None, &[]).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 conflict("同名文件已存在，请使用关联已有页")
             } else {
@@ -178,22 +179,19 @@ impl Storage {
         if !matches!(kind, "tasks" | "wiki") {
             return Err(invalid("请选择 Wiki 或任务清单"));
         }
-        let target = self.files.markdown_key(path).map_err(file_error)?;
-        utf8(self.files.read_markdown(&target).map_err(file_error)?)?;
-        let name = target.rsplit('/').next().expect("relative Markdown path");
-        let captured: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT relative_path FROM capture_intents WHERE file_name = ?1 COLLATE NOCASE",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        if let Some(path) = captured {
-            if self.files.markdown_key(&path).map_err(file_error)? == target {
-                return Err(invalid("原始捕获笔记不能映射为写入目标"));
-            }
+        let target = self
+            .workspace
+            .files
+            .markdown_key(path)
+            .map_err(file_error)?;
+        utf8(
+            self.workspace
+                .files
+                .read_markdown(path)
+                .map_err(file_error)?,
+        )?;
+        if self.is_capture_path(&target) {
+            return Err(invalid("原始捕获笔记不能映射为写入目标"));
         }
         let tx = self
             .connection
@@ -298,7 +296,13 @@ impl Storage {
         if excerpt.trim().is_empty() {
             return Err(invalid("所选来源片段为空"));
         }
-        if self.files.markdown_key(source_path).map_err(file_error)? == target {
+        if self
+            .workspace
+            .files
+            .markdown_key(physical_path(source_path))
+            .map_err(file_error)?
+            == target
+        {
             return Err(invalid("来源原文不能同时作为本次写入目标"));
         }
         if let Some(id) = depends_on {
@@ -307,7 +311,7 @@ impl Storage {
         let reviewed: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM wiki_changes WHERE kind=?1 AND target=?2 AND source_path=?3
+                "SELECT id FROM wiki_suggestions WHERE kind=?1 AND target=?2 AND source_path=?3
              AND source_excerpt=?4 AND dependency IS ?5 AND entry_text=?6
              AND phase IN ('rejected','applied','reverted')
              ORDER BY rowid DESC LIMIT 1",
@@ -319,7 +323,12 @@ impl Storage {
         if let Some(id) = reviewed {
             return Ok(load_change(&self.connection, &id)?.view);
         }
-        let before = utf8(self.files.read_markdown(target).map_err(file_error)?)?;
+        let before = utf8(
+            self.workspace
+                .files
+                .read_markdown(target)
+                .map_err(file_error)?,
+        )?;
         let key = operation_key(&[
             kind,
             target,
@@ -380,7 +389,9 @@ impl Storage {
     pub(crate) fn wiki_changes(&self) -> Result<Vec<WikiChange>, StorageError> {
         let mut q = self
             .connection
-            .prepare("SELECT id FROM wiki_changes WHERE phase <> 'superseded' ORDER BY rowid DESC")
+            .prepare(
+                "SELECT id FROM wiki_suggestions WHERE phase <> 'superseded' ORDER BY rowid DESC",
+            )
             .map_err(db)?;
         let ids = q
             .query_map([], |r| r.get::<_, String>(0))
@@ -400,7 +411,7 @@ impl Storage {
         let entry: String = self
             .connection
             .query_row(
-                "SELECT entry_text FROM wiki_changes WHERE id=?1",
+                "SELECT entry_text FROM wiki_suggestions WHERE id=?1",
                 [id],
                 |row| row.get(0),
             )
@@ -409,15 +420,7 @@ impl Storage {
         let next = if let Some(original) = change.undoes {
             self.preview_wiki_undo(&original)?
         } else if view.2 == "status" {
-            let hash = revision_hash(&self.files.read_markdown(&view.1).map_err(file_error)?);
-            self.prepare_task_status(
-                change
-                    .task_id
-                    .as_deref()
-                    .ok_or_else(|| invalid("找不到任务锚点"))?,
-                &hash,
-                &entry,
-            )?
+            return Err(invalid("请在任务清单中刷新并勾选当前状态"));
         } else {
             self.prepare_wiki_change(
                 &view.2,
@@ -433,7 +436,7 @@ impl Storage {
         if next.0 != id {
             self.connection
                 .execute(
-                    "UPDATE wiki_changes SET phase='superseded' WHERE id=?1",
+                    "UPDATE wiki_suggestions SET phase='superseded' WHERE id=?1",
                     [id],
                 )
                 .map_err(db)?;
@@ -452,7 +455,7 @@ impl Storage {
         if self
             .connection
             .execute(
-                "UPDATE wiki_changes SET phase=?2 WHERE id=?1 AND phase IN ('pending','deferred')",
+                "UPDATE wiki_suggestions SET phase=?2 WHERE id=?1 AND phase IN ('pending','deferred')",
                 params![id, decision],
             )
             .map_err(db)?
@@ -478,20 +481,6 @@ impl Storage {
         Ok(outcomes)
     }
 
-    pub(crate) fn recover_wiki_changes(&mut self) -> Result<Vec<WikiResult>, StorageError> {
-        let ids = {
-            let mut q = self
-                .connection
-                .prepare("SELECT id FROM wiki_changes WHERE phase='prepared' ORDER BY rowid")
-                .map_err(db)?;
-            q.query_map([], |r| r.get(0))
-                .map_err(db)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db)?
-        };
-        self.apply_wiki_changes(&ids)
-    }
-
     fn apply_wiki_change(&mut self, id: &str) -> Result<String, StorageError> {
         let change = load_change(&self.connection, id)?;
         let (_, target, kind, phase, _, before, after, source_path, source_revision, _, _, _) =
@@ -499,7 +488,7 @@ impl Storage {
         if phase == "applied" {
             return Ok(phase);
         }
-        if !matches!(phase.as_str(), "pending" | "deferred" | "prepared") {
+        if !matches!(phase.as_str(), "pending" | "deferred") {
             return Err(invalid("该版本无法采用，请重新比较或查看历史"));
         }
         if let Some(dep) = &change.dependency {
@@ -513,7 +502,7 @@ impl Storage {
             "tasks"
         };
         self.check_wiki_target(&target, role)?;
-        if matches!(kind.as_str(), "wiki" | "task") && phase != "prepared" {
+        if matches!(kind.as_str(), "wiki" | "task") {
             if self
                 .search_reader()?
                 .read_record_source(&source_path, &source_revision)?
@@ -523,58 +512,47 @@ impl Storage {
                 return Err(conflict("来源版本已改变，请重新比较"));
             }
         }
-        let mut locked = self.files.lock_markdown(&target).map_err(file_error)?;
-        let file = &mut locked.file;
-        let mut current = Vec::new();
-        file.read_to_end(&mut current).map_err(file_error)?;
-        if !(phase == "prepared" && current == after.as_bytes()) {
-            if current != before.as_bytes() {
+        let target_path = self
+            .workspace
+            .files
+            .markdown_full_path(&target)
+            .map_err(file_error)?;
+        let current = fs::read(&target_path).map_err(file_error)?;
+        if current != before.as_bytes() {
+            self.connection
+                .execute(
+                    "UPDATE wiki_suggestions SET phase='conflict' WHERE id=?1",
+                    [id],
+                )
+                .map_err(db)?;
+            return Err(conflict("目标文件已有新版本，请重新比较"));
+        }
+        #[cfg(test)]
+        tests::at_write_boundary();
+        if let Err(e) = replace_markdown(&target_path, Some(&current), after.as_bytes()) {
+            if e.kind() == io::ErrorKind::AlreadyExists {
                 self.connection
-                    .execute("UPDATE wiki_changes SET phase='conflict' WHERE id=?1", [id])
+                    .execute(
+                        "UPDATE wiki_suggestions SET phase='conflict' WHERE id=?1",
+                        [id],
+                    )
                     .map_err(db)?;
                 return Err(conflict("目标文件已有新版本，请重新比较"));
             }
-            self.connection
-                .execute("UPDATE wiki_changes SET phase='prepared' WHERE id=?1", [id])
-                .map_err(db)?;
-            #[cfg(test)]
-            tests::at_write_boundary();
-            let mut write_locked = |bytes: &[u8]| {
-                file.seek(SeekFrom::Start(0))?;
-                file.write_all(bytes)?;
-                file.set_len(bytes.len() as u64)?;
-                file.sync_all()
-            };
-            if let Err(detail) = write_locked(after.as_bytes()) {
-                if let Err(rollback) = write_locked(before.as_bytes()) {
-                    return Err(error(
-                        "WRITE_FAILED",
-                        "wiki",
-                        Some(id),
-                        true,
-                        "写入失败且无法恢复原文件，已保留前后版本，请手工核对",
-                        format!("{detail}; {rollback}"),
-                    ));
-                }
-                return Err(file_error(detail));
-            }
-            current.clear();
-            file.seek(SeekFrom::Start(0))
-                .and_then(|_| file.read_to_end(&mut current))
-                .map_err(file_error)?;
-            if current != after.as_bytes() {
-                return Err(conflict("写入后核对失败，已保留变更前后版本"));
-            }
+            return Err(file_error(e));
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
-        tx.execute("UPDATE wiki_changes SET phase='applied' WHERE id=?1", [id])
-            .map_err(db)?;
+        tx.execute(
+            "UPDATE wiki_suggestions SET phase='applied' WHERE id=?1",
+            [id],
+        )
+        .map_err(db)?;
         if let Some(original) = change.undoes {
             tx.execute(
-                "UPDATE wiki_changes SET phase='reverted' WHERE id=?1",
+                "UPDATE wiki_suggestions SET phase='reverted' WHERE id=?1",
                 [original],
             )
             .map_err(db)?;
@@ -594,13 +572,18 @@ impl Storage {
             .optional()
             .map_err(db)?
             .ok_or_else(|| invalid("请先映射 Markdown 任务清单"))?;
-        let body = utf8(self.files.read_markdown(&target).map_err(file_error)?)?;
+        let body = utf8(
+            self.workspace
+                .files
+                .read_markdown(&target)
+                .map_err(file_error)?,
+        )?;
         let (mut parsed, manual, mut notices) = parse_tasks(&body);
         let mut tasks = Vec::new();
         let mut q = self
             .connection
             .prepare(
-                "SELECT task_id,entry_text,source_path FROM wiki_changes
+                "SELECT task_id,entry_text,source_path FROM wiki_suggestions
             WHERE target=?1 AND kind='task' AND phase='applied' ORDER BY rowid",
             )
             .map_err(db)?;
@@ -609,83 +592,90 @@ impl Storage {
             let id: String = row.get(0).map_err(db)?;
             let title: String = row.get(1).map_err(db)?;
             let source: String = row.get(2).map_err(db)?;
-            let (text, state) = match parsed.remove(&id) {
+            let (text, state, expected_line) = match parsed.remove(&id) {
                 Some(mut entries) if entries.len() == 1 => {
                     let entry = entries.pop().unwrap();
-                    (entry.text, entry.state.to_owned())
+                    (entry.text, entry.state.to_owned(), entry.line)
                 }
                 _ => {
                     notices.push(format!("任务 {title} 的锚点缺失或重复，请核对清单"));
-                    (title, "invalid".into())
+                    (title, "invalid".into(), String::new())
                 }
             };
-            tasks.push((id, text, state, source));
+            tasks.push((id, text, state, source, expected_line));
         }
-        for entries in parsed.into_values() {
+        for (id, entries) in parsed {
+            let unique = entries.len() == 1;
+            if !unique {
+                notices.push("清单含重复的任务锚点，请核对对应行".into());
+            }
             for entry in entries {
-                tasks.push((String::new(), entry.text, "invalid".into(), String::new()));
-                notices.push("清单含未登记来源的任务，请先核对其锚点".into());
+                tasks.push((
+                    if unique { id.clone() } else { String::new() },
+                    entry.text,
+                    if unique { entry.state } else { "invalid" }.into(),
+                    String::new(),
+                    entry.line,
+                ));
             }
         }
-        for (title, state) in manual {
-            tasks.push((String::new(), title, state.to_owned(), String::new()));
+        for (id, task) in manual {
+            tasks.push((
+                id,
+                task.text,
+                task.state.to_owned(),
+                String::new(),
+                task.line,
+            ));
         }
         Ok((target, revision_hash(body.as_bytes()), tasks, notices))
     }
 
-    pub(crate) fn prepare_task_status(
-        &mut self,
+    pub(crate) fn toggle_task(
+        &self,
+        target: &str,
         task_id: &str,
-        base_hash: &str,
-        state: &str,
-    ) -> Result<WikiChange, StorageError> {
-        let original: String = self
-            .connection
-            .query_row(
-                "SELECT c.id FROM wiki_changes c JOIN wiki_targets t ON t.path=c.target
-            WHERE c.kind='task' AND c.phase='applied' AND c.task_id=?1 AND t.kind='tasks'",
-                [task_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?
-            .ok_or_else(|| invalid("任务没有有效的清单锚点"))?;
-        let original = load_change(&self.connection, &original)?.view;
-        let before = utf8(self.files.read_markdown(&original.1).map_err(file_error)?)?;
-        if revision_hash(before.as_bytes()) != base_hash {
-            return Err(conflict("任务清单已被修改，请刷新状态"));
+        expected_line: &str,
+        done: bool,
+    ) -> Result<(), StorageError> {
+        self.check_wiki_target(target, "tasks")?;
+        let path = self
+            .workspace
+            .files
+            .markdown_full_path(target)
+            .map_err(file_error)?;
+        let before = utf8(std::fs::read(&path).map_err(file_error)?)?;
+        let (mut anchored, manual, _) = parse_tasks(&before);
+        let task = if task_id.starts_with("line:") {
+            manual
+                .into_iter()
+                .find(|(id, _)| id == task_id)
+                .map(|(_, task)| task)
+        } else {
+            anchored
+                .remove(task_id)
+                .and_then(|mut tasks| (tasks.len() == 1).then(|| tasks.pop().unwrap()))
         }
-        let after = set_task_state(&before, task_id, state)?;
-        let generation:i64=self.connection.query_row("SELECT max(rowid) FROM wiki_changes WHERE target=?1 AND phase IN ('applied','reverted')",
-            [&original.1],|r|r.get(0)).map_err(db)?;
-        let key = operation_key(&[
-            "status",
-            &original.1,
-            task_id,
-            base_hash,
-            state,
-            &generation.to_string(),
-        ]);
-        let change = Change {
-            view: (
-                String::new(),
-                original.1,
-                "status".into(),
-                String::new(),
-                base_hash.into(),
-                before,
-                after,
-                original.7,
-                original.8,
-                original.9,
-                original.10,
-                original.11,
-            ),
-            task_id: Some(task_id.into()),
-            dependency: None,
-            undoes: None,
-        };
-        write_preview(&mut self.connection, &key, change, state)
+        .ok_or_else(|| conflict("任务行已移动或锚点变动，请刷新清单"))?;
+        if task.line != expected_line || !matches!(task.state, "open" | "done") {
+            return Err(conflict("任务行已被修改，请刷新清单后重新勾选"));
+        }
+        if (task.state == "done") == done {
+            return Ok(());
+        }
+        let mut after = before.clone();
+        after.replace_range(
+            task.checkbox..task.checkbox + 1,
+            if done { "x" } else { " " },
+        );
+        crate::workspace::replace_markdown(&path, Some(before.as_bytes()), after.as_bytes())
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    conflict("任务清单刚被修改，请刷新后重新勾选")
+                } else {
+                    file_error(error)
+                }
+            })
     }
 
     pub(crate) fn preview_wiki_undo(&mut self, id: &str) -> Result<WikiChange, StorageError> {
@@ -696,7 +686,12 @@ impl Storage {
             return Err(invalid("只能撤销已采用的原始变更"));
         }
         self.check_wiki_target(&target, if kind == "wiki" { "wiki" } else { "tasks" })?;
-        let current = utf8(self.files.read_markdown(&target).map_err(file_error)?)?;
+        let current = utf8(
+            self.workspace
+                .files
+                .read_markdown(&target)
+                .map_err(file_error)?,
+        )?;
         let inverse = if current == after {
             before
         } else if kind == "status" {
@@ -768,27 +763,25 @@ struct ParsedTask {
     text: String,
     state: &'static str,
     checkbox: usize,
+    line: String,
 }
 
-type ManualTask = (String, &'static str);
-
-fn parse_manual_task(content: &str) -> Option<ManualTask> {
-    let trimmed = content.trim_start();
-    let (state, rest) = match trimmed.as_bytes().get(..6) {
-        Some(b"- [ ] " | b"* [ ] ") => ("open", &trimmed[6..]),
-        Some(b"- [x] " | b"- [X] " | b"* [x] " | b"* [X] ") => ("done", &trimmed[6..]),
-        Some(b"- [-] " | b"* [-] ") => ("cancelled", &trimmed[6..]),
+fn parse_manual_task(content: &str) -> Option<(&str, &'static str)> {
+    let state = match content.as_bytes().get(..6) {
+        Some(b"- [ ] " | b"* [ ] ") => "open",
+        Some(b"- [x] " | b"- [X] " | b"* [x] " | b"* [X] ") => "done",
+        Some(b"- [-] " | b"* [-] ") => "cancelled",
         _ => return None,
     };
-    let title = rest.trim();
-    (!title.is_empty()).then(|| (title.to_owned(), state))
+    let title = content[6..].trim();
+    (!title.is_empty()).then_some((title, state))
 }
 
 fn parse_tasks(
     body: &str,
 ) -> (
     HashMap<String, Vec<ParsedTask>>,
-    Vec<ManualTask>,
+    Vec<(String, ParsedTask)>,
     Vec<String>,
 ) {
     let mut found: HashMap<String, Vec<ParsedTask>> = HashMap::new();
@@ -801,11 +794,11 @@ fn parse_tasks(
     for (number, raw) in body.split_inclusive('\n').enumerate() {
         let line_start = offset;
         offset += raw.len();
-        let line = raw.trim_end_matches(['\r', '\n']);
+        let original = raw.trim_end_matches(['\r', '\n']);
         let line = if number == 0 {
-            line.trim_start_matches('\u{feff}')
+            original.trim_start_matches('\u{feff}')
         } else {
-            line
+            original
         };
         if number == 0 && line == "---" {
             frontmatter = true;
@@ -857,6 +850,7 @@ fn parse_tasks(
         if in_comment || content.starts_with("<!--") {
             continue;
         }
+        let checkbox = line_start + original.len() - content.len() + 3;
         let parsed = (line.len() - content.len() <= 3 && !content.starts_with('\t'))
             .then_some(content)
             .and_then(|content| {
@@ -880,11 +874,23 @@ fn parse_tasks(
                             text: content.into(),
                             state: "invalid",
                             checkbox: 0,
+                            line: original.to_owned(),
                         });
                     }
                 }
-            } else if let Some(task) = parse_manual_task(content) {
-                manual.push(task);
+            } else if line.len() - content.len() <= 3
+                && !content.starts_with('\t')
+                && let Some((title, state)) = parse_manual_task(content)
+            {
+                manual.push((
+                    format!("line:{}", number + 1),
+                    ParsedTask {
+                        text: title.to_owned(),
+                        state,
+                        checkbox,
+                        line: original.to_owned(),
+                    },
+                ));
             }
             continue;
         };
@@ -902,14 +908,11 @@ fn parse_tasks(
                 .rsplit_once(" · 来源：")
                 .map_or(&head[6..], |(title, _)| title)
         };
-        let checkbox = line_start + raw.len() - raw.trim_start_matches('\u{feff}').len()
-            + line.len()
-            - content.len()
-            + 3;
         found.entry(id.into()).or_default().push(ParsedTask {
             text: text.into(),
             state,
             checkbox,
+            line: original.to_owned(),
         });
     }
     (found, manual, issues)
@@ -946,12 +949,7 @@ fn set_task_state(body: &str, id: &str, state: &str) -> Result<String, StorageEr
 mod tests {
     use super::super::tests::TestDir;
     use super::*;
-    use std::{
-        cell::RefCell,
-        fs,
-        process::Command,
-        time::{Duration, Instant},
-    };
+    use std::{cell::RefCell, fs, process::Command};
 
     thread_local! {
         static BEFORE_WRITE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -970,9 +968,13 @@ mod tests {
         storage
             .save_draft("draft", 1, "会议讨论\n- [ ] 请复核报价")
             .unwrap();
-        let saved = storage
+        let mut saved = storage
             .save_record("example", "draft", 1, "会议讨论\n- [ ] 请复核报价")
             .unwrap();
+        let captures = storage.list_recent_captures().unwrap();
+        let marker = captures[0].4.as_ref().unwrap();
+        saved.relative_path.push_str(NOTE_ANCHOR);
+        saved.relative_path.push_str(marker);
         (dir, storage, saved)
     }
     fn preview(
@@ -1009,7 +1011,7 @@ mod tests {
         assert!(storage.create_wiki_target("../outside.md").is_err());
         assert!(
             storage
-                .map_wiki_target("wiki", &source.relative_path)
+                .map_wiki_target("wiki", physical_path(&source.relative_path))
                 .is_err()
         );
         let a = preview(&mut storage, &source, "wiki", "a.md", "采用的意见", None);
@@ -1049,18 +1051,9 @@ mod tests {
         fs::write(dir.0.join("a.md"), format!("{}另一项手工补充\n", a.6)).unwrap();
         let undo = storage.preview_wiki_undo(&a.0).unwrap();
         assert_eq!(undo.6, "\u{feff}人工原稿\n另一项手工补充\n");
-        storage
-            .connection
-            .execute(
-                "UPDATE wiki_changes SET phase='prepared' WHERE id=?1",
-                [&undo.0],
-            )
-            .unwrap();
-        // Simulate termination after writing the after-image but before acknowledging the transaction.
-        fs::write(dir.0.join("a.md"), &undo.6).unwrap();
+        storage.apply_wiki_change(&undo.0).unwrap();
         drop(storage);
-        let mut reopened = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
-        assert_eq!(reopened.recover_wiki_changes().unwrap()[0].1, "applied");
+        let reopened = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
         assert_eq!(
             load_change(&reopened.connection, &a.0).unwrap().view.3,
             "reverted"
@@ -1083,22 +1076,27 @@ mod tests {
             None,
         );
         storage.apply_wiki_change(&item.0).unwrap();
-        let (_, base, tasks, issues) = storage.wiki_tasks().unwrap();
+        let (target, _, tasks, issues) = storage.wiki_tasks().unwrap();
         assert!(issues.is_empty());
-        let (id, title, state, origin) = &tasks[0];
+        let (id, title, state, origin, expected_line) = &tasks[0];
         assert_eq!(
             (title.as_str(), state.as_str(), origin.as_str()),
             ("请复核报价", "open", source.relative_path.as_str())
         );
-        let edit = storage.prepare_task_status(id, &base, "done").unwrap();
-        storage.apply_wiki_change(&edit.0).unwrap();
+        let changes = storage.wiki_changes().unwrap().len();
+        storage
+            .toggle_task(&target, id, expected_line, true)
+            .unwrap();
         let done = fs::read_to_string(&path).unwrap();
         assert_eq!(done, item.6.replacen("- [ ]", "- [x]", 1));
-        assert!(storage.prepare_task_status(id, &base, "open").is_err());
+        assert_eq!(storage.wiki_changes().unwrap().len(), changes);
+        assert!(
+            storage
+                .toggle_task(&target, id, expected_line, false)
+                .is_err()
+        );
         fs::write(&path, done.replace("- [x]", "- [-]")).unwrap();
         assert_eq!(storage.wiki_tasks().unwrap().2[0].2, "cancelled");
-        let undo = storage.preview_wiki_undo(&edit.0);
-        assert!(undo.is_err());
         let checking = done.lines().find(|line| line.starts_with("- [x]")).unwrap();
         for broken in [
             format!("{}{}", done, done),
@@ -1108,14 +1106,32 @@ mod tests {
             done.replace(checking, &format!("注释 <!--\n{checking}\n-->")),
         ] {
             fs::write(&path, &broken).unwrap();
-            let (_, hash, tasks, notices) = storage.wiki_tasks().unwrap();
+            let (_, _, tasks, notices) = storage.wiki_tasks().unwrap();
             assert_eq!(tasks[0].2, "invalid");
             assert!(!notices.is_empty());
-            assert!(storage.prepare_task_status(id, &hash, "open").is_err());
+            assert!(
+                storage
+                    .toggle_task(&target, id, expected_line, false)
+                    .is_err()
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), broken);
         }
         fs::write(&path, &done).unwrap();
-        let undo = storage.preview_wiki_undo(&edit.0).unwrap();
+        let (_, _, tasks, _) = storage.wiki_tasks().unwrap();
+        storage
+            .toggle_task(&target, id, &tasks[0].4, false)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), item.6);
+
+        // An applied status change from v4 can still be undone in the historical review.
+        let mut legacy = load_change(&storage.connection, &item.0).unwrap();
+        legacy.view.2 = "status".into();
+        legacy.view.4 = revision_hash(item.6.as_bytes());
+        legacy.view.5 = item.6.clone();
+        legacy.view.6 = done.clone();
+        let old = write_preview(&mut storage.connection, "v4-status", legacy, "done").unwrap();
+        storage.apply_wiki_change(&old.0).unwrap();
+        let undo = storage.preview_wiki_undo(&old.0).unwrap();
         storage.apply_wiki_change(&undo.0).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), item.6);
         fs::write(&path, format!("{done}尚未结束的注释 <!--")).unwrap();
@@ -1141,7 +1157,7 @@ mod tests {
         let path = dir.0.join("Tasks.md");
         fs::write(
             &path,
-            "# 待办\n- [ ] 手工待办\n- [x] 已完成手工任务\n- [参考文档](ref.md)\n",
+            "\u{feff}# 待办\r\n  * [ ] 手工待办\r\n- [X] 已完成手工任务\r\n- [参考文档](ref.md)\r\n",
         )
         .unwrap();
         storage.map_wiki_target("tasks", "Tasks.md").unwrap();
@@ -1154,7 +1170,7 @@ mod tests {
             None,
         );
         storage.apply_wiki_change(&item.0).unwrap();
-        let (_, _, tasks, notices) = storage.wiki_tasks().unwrap();
+        let (target, _, tasks, notices) = storage.wiki_tasks().unwrap();
         assert!(notices.is_empty());
         assert_eq!(tasks.len(), 3);
         assert_eq!(tasks[0].1, "应用内采用任务");
@@ -1165,7 +1181,7 @@ mod tests {
                 tasks[1].1.as_str(),
                 tasks[1].2.as_str()
             ),
-            ("", "手工待办", "open")
+            ("line:2", "手工待办", "open")
         );
         assert_eq!(
             (
@@ -1173,16 +1189,49 @@ mod tests {
                 tasks[2].1.as_str(),
                 tasks[2].2.as_str()
             ),
-            ("", "已完成手工任务", "done")
+            ("line:3", "已完成手工任务", "done")
         );
-    }
+        let before = fs::read_to_string(&path)
+            .unwrap()
+            .replace("# 待办", "# 人工标题");
+        fs::write(&path, &before).unwrap();
+        storage
+            .toggle_task(&target, &tasks[1].0, &tasks[1].4, true)
+            .unwrap();
+        storage
+            .toggle_task(&target, &tasks[2].0, &tasks[2].4, false)
+            .unwrap();
+        let updated = before
+            .replace("  * [ ]", "  * [x]")
+            .replace("- [X]", "- [ ]");
+        assert_eq!(fs::read_to_string(&path).unwrap(), updated);
+        let (_, _, refreshed, _) = storage.wiki_tasks().unwrap();
+        let edited = updated.replace("手工待办", "手工已改");
+        fs::write(&path, &edited).unwrap();
+        assert_eq!(
+            storage
+                .toggle_task(&target, &refreshed[1].0, &refreshed[1].4, false)
+                .unwrap_err()
+                .code,
+            "VERSION_CONFLICT"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(storage.wiki_changes().unwrap().len(), 1);
 
-    fn wait_file(path: &Path) {
-        let start = Instant::now();
-        while !path.exists() && start.elapsed() < Duration::from_secs(12) {
-            std::thread::sleep(Duration::from_millis(15));
-        }
-        assert!(path.exists(), "editor did not signal {}", path.display());
+        let copy = TestDir::new();
+        fs::copy(&path, copy.0.join("Tasks.md")).unwrap();
+        let mut restored = Storage::open(&copy.0, Path::new("."), ".flash-test").unwrap();
+        restored.map_wiki_target("tasks", "Tasks.md").unwrap();
+        let (target, _, tasks, notices) = restored.wiki_tasks().unwrap();
+        assert!(notices.is_empty());
+        let anchored = tasks
+            .iter()
+            .find(|task| task.1 == "应用内采用任务")
+            .unwrap();
+        restored
+            .toggle_task(&target, &anchored.0, &anchored.4, true)
+            .unwrap();
+        assert!(restored.wiki_changes().unwrap().is_empty());
     }
 
     #[test]
@@ -1191,63 +1240,46 @@ mod tests {
         let vim = std::env::var_os("FMD_TEST_VIM").expect("FMD_TEST_VIM is required");
         let (dir, mut storage, source) = example();
         storage.create_wiki_target("editor.md").unwrap();
-        for round in 0..3 {
-            let entry = format!("应用改动 {round}");
-            let change = preview(&mut storage, &source, "wiki", "editor.md", &entry, None);
-            let backup = if round % 2 == 0 {
-                "set writebackup backupcopy=no"
-            } else {
-                "set nowritebackup nobackup"
-            };
-            let script = format!(
-                "set nomodeline noswapfile\n{backup}\nedit editor.md\ncall append('$','human-{round}')\ncall writefile(['ready'],'ready{round}')\nlet n=0\nwhile !filereadable('go{round}') && n<600\n sleep 20m\n let n+=1\nendwhile\nlet v:errmsg=''\nsilent! write\ncall writefile([v:errmsg,string(&modified)],'attempt{round}')\nlet n=0\nwhile !filereadable('retry{round}') && n<600\n sleep 20m\n let n+=1\nendwhile\nlet human_edit=getline('$')\nedit!\ncall append('$',human_edit)\nwrite\ncall writefile([string(&modified)],'result{round}')\nqa!\n"
-            );
-            fs::write(dir.0.join("race.vim"), script).unwrap();
-            let mut child = Command::new(&vim)
-                .current_dir(&dir.0)
-                .args([
-                    "-Nu",
-                    "NONE",
-                    "-i",
-                    "NONE",
-                    "-n",
-                    "-es",
-                    "--noplugin",
-                    "-S",
-                    "race.vim",
-                ])
-                .spawn()
-                .unwrap();
-            wait_file(&dir.0.join(format!("ready{round}")));
-            let root = dir.0.clone();
-            BEFORE_WRITE.with_borrow_mut(|hook| {
-                *hook = Some(Box::new(move || {
-                    fs::write(root.join(format!("go{round}")), b"1").unwrap();
-                    wait_file(&root.join(format!("attempt{round}")));
-                }))
-            });
-            let phase = storage.apply_wiki_change(&change.0);
-            fs::write(dir.0.join(format!("retry{round}")), b"1").unwrap();
-            assert!(child.wait().unwrap().success());
-            assert_eq!(phase.unwrap(), "applied");
-            let attempt = fs::read_to_string(dir.0.join(format!("attempt{round}"))).unwrap();
-            assert!(attempt.lines().next().is_some_and(|s| !s.is_empty()));
-            assert_eq!(
-                attempt.lines().nth(1),
-                Some("1"),
-                "Vim must retain the unsaved buffer"
-            );
-            assert_eq!(
-                fs::read_to_string(dir.0.join(format!("result{round}")))
-                    .unwrap()
-                    .trim(),
-                "0"
-            );
-            let final_text = fs::read_to_string(dir.0.join("editor.md")).unwrap();
-            for i in 0..=round {
-                assert!(final_text.contains(&format!("human-{i}")));
-                assert!(final_text.contains(&format!("应用改动 {i}")));
-            }
-        }
+        let change = preview(&mut storage, &source, "wiki", "editor.md", "应用改动", None);
+        let root = dir.0.clone();
+        BEFORE_WRITE.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let output = Command::new(vim)
+                    .current_dir(root)
+                    .args([
+                        "-Nu",
+                        "NONE",
+                        "-i",
+                        "NONE",
+                        "-n",
+                        "-es",
+                        "--noplugin",
+                        "editor.md",
+                        "-c",
+                        "call setline(1, 'human-edit')",
+                        "-c",
+                        "wq",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "Vim write failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }));
+        });
+        assert_eq!(
+            storage.apply_wiki_change(&change.0).unwrap_err().code,
+            "VERSION_CONFLICT"
+        );
+        let path = dir.0.join("editor.md");
+        assert_eq!(fs::read_to_string(&path).unwrap().trim_end(), "human-edit");
+        let revised = storage.rebase_wiki_change(&change.0).unwrap();
+        storage.apply_wiki_change(&revised.0).unwrap();
+        let result = fs::read_to_string(path).unwrap();
+        assert_eq!(result, revised.6);
+        assert!(result.starts_with("human-edit"));
+        assert!(result.contains("应用改动"));
     }
 }

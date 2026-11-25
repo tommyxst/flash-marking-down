@@ -3,9 +3,7 @@ use serde_json::{Value, json};
 use super::*;
 
 pub(super) const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS m2_model (id INTEGER PRIMARY KEY CHECK(id=1), endpoint TEXT NOT NULL, model TEXT NOT NULL, enabled INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS m2_analyses (id TEXT PRIMARY KEY REFERENCES jobs(id), error TEXT, items TEXT NOT NULL DEFAULT '[]');
-CREATE TABLE IF NOT EXISTS m2_preparations (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS m2_answers (id TEXT PRIMARY KEY, data TEXT NOT NULL);";
 
 pub(crate) type ModelConfig = (String, String, bool);
@@ -14,8 +12,6 @@ const ANALYSIS_RULE: &str = "m2-analysis-v1";
 pub(crate) const SOURCE_LIMIT: usize = 48 * 1024;
 const EXCERPT_LIMIT: usize = 4800;
 const ITEM_LIMIT: usize = 30;
-const MODEL_LIMIT: usize = 200;
-
 pub(crate) struct Document {
     pub(crate) id: String,
     identity: String,
@@ -110,36 +106,79 @@ impl Document {
 }
 
 impl Storage {
-    pub(crate) fn model_config(&self) -> M2Result<Option<ModelConfig>> {
-        self.connection
+    pub(crate) fn service_config<T: serde::de::DeserializeOwned>(
+        &self,
+        slot: &str,
+    ) -> M2Result<Option<T>> {
+        let serialized: Option<String> = self
+            .connection
             .query_row(
-                "SELECT endpoint,model,enabled FROM m2_model WHERE id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                "SELECT value FROM workspace_settings WHERE key=?1",
+                [format!("{slot}_config")],
+                |row| row.get(0),
             )
             .optional()
-            .map_err(db)
+            .map_err(db)?;
+        serialized
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| "无法读取服务配置".into())
     }
 
+    pub(crate) fn model_config(&self) -> M2Result<Option<ModelConfig>> {
+        Ok(self
+            .service_config::<crate::model::ModelSettings>("model")?
+            .map(|c| (c.endpoint, c.model, c.enabled)))
+    }
+
+    pub(crate) fn save_service_config(
+        &self,
+        slot: &str,
+        config: &impl serde::Serialize,
+        secret: &str,
+    ) -> Result<(), crate::dto::AppError> {
+        use crate::dto::AppError;
+        let key = crate::credential_commands::config_key(self, slot, secret)?;
+        let value = serde_json::to_string(config)
+            .map_err(|_| AppError::invalid("settings", "无法编码服务配置"))?;
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|e| database_error("settings", None, e))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO workspace_settings(key,value) VALUES (?1,?2)",
+            params![format!("{slot}_config"), value],
+        )
+        .map_err(|e| database_error("settings", None, e))?;
+        if let Some((target, token)) = key {
+            self.set_credential_reference(slot, Some(&target))?;
+            crate::platform::write_credential(&target, token).map_err(|e| {
+                AppError::new(
+                    "AUTH_FAILED",
+                    "credential",
+                    true,
+                    "无法写入 Windows 凭据管理器",
+                    Some(e.to_string()),
+                )
+            })?;
+        }
+        tx.commit()
+            .map_err(|e| database_error("settings", None, e))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_model_config(
-        &mut self,
+        &self,
         endpoint: String,
         model: String,
         enabled: bool,
     ) -> M2Result<ModelConfig> {
-        let endpoint = crate::model::endpoint(&endpoint)?.to_string();
-        let model = model.trim().to_owned();
-        if model.is_empty() || model.len() > MODEL_LIMIT || model.chars().any(char::is_control) {
-            return Err("请填写有效的模型名称".into());
-        }
-        self.connection
-            .execute(
-                "INSERT INTO m2_model VALUES (1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET
-            endpoint=excluded.endpoint, model=excluded.model, enabled=excluded.enabled",
-                params![endpoint, model, enabled],
-            )
-            .map_err(db)?;
-        Ok((endpoint, model, enabled))
+        let config = crate::model::ModelSettings::new(&endpoint, &model, enabled)?;
+        self.save_service_config("model", &config, "")
+            .map_err(|e| e.safe_message)?;
+        Ok((config.endpoint, config.model, config.enabled))
     }
 
     pub(crate) fn approved_model(&self, approved_endpoint: &str) -> M2Result<ModelConfig> {
@@ -154,44 +193,55 @@ impl Storage {
     }
 
     pub(crate) fn load_document(&mut self, path: &str, expected: &str) -> M2Result<Document> {
-        let (bytes, identity) = self
-            .files
-            .read_markdown_with_identity(path)
+        let bytes = read_source_bytes(&self.workspace.files, path)
             .map_err(|_| "原文无法读取，可能已移动、删除或被占用")?;
         let revision = revision_hash(&bytes);
         if expected != revision {
             return Err("原文版本已改变，请刷新后重试".into());
         }
         let content = std::str::from_utf8(&bytes).map_err(|_| "原文不是有效的 UTF-8 Markdown")?;
-        let mut body = content;
+        let (file_path, marker) = path
+            .split_once(NOTE_ANCHOR)
+            .map_or((path, None), |(file, marker)| (file, Some(marker)));
         let capture: Option<(String, String, String)> = self.connection.query_row(
-            "SELECT r.id,r.source_id,r.captured_at FROM records r JOIN capture_intents i ON i.request_id=r.capture_request_id
-             WHERE i.relative_path=?1 AND r.lifecycle='active'", [path], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
-            .optional().map_err(db)?;
-        let is_capture = capture.is_some();
-        let date = if let Some((record, source, date)) = capture {
-            body = content
-                .strip_prefix(&capture_header(&record, &source))
-                .unwrap_or(content);
-            Some(date)
+            "SELECT id,source_id,captured_at FROM notes WHERE relative_path=?1 AND block_id IS ?2",
+            params![file_path, marker], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(db)?;
+        let mut body = content;
+        let date = if let Some((id, source, date)) = &capture {
+            if marker.is_none() {
+                body = content
+                    .strip_prefix(&capture_header(id, source))
+                    .unwrap_or(content);
+            }
+            Some(date.clone())
         } else {
-            None
+            self.connection
+                .query_row(
+                    "SELECT captured_at FROM search_documents WHERE relative_path=?1",
+                    [file_path],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(db)?
+                .flatten()
         };
+        let is_capture = capture.is_some() || date.is_some();
         let event_date = event_date(&self.connection, body)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db)?;
         let id: String = tx.query_row(
-            "INSERT INTO sources VALUES (lower(hex(randomblob(16))),?1,?2,'available')
+            "INSERT INTO sources VALUES (coalesce(?3, lower(hex(randomblob(16)))),?1,?2,'available')
              ON CONFLICT(location) DO UPDATE SET current_revision=excluded.current_revision,availability='available' RETURNING id",
-            params![path,revision], |row| row.get(0)).map_err(db)?;
+            params![path,revision,capture.as_ref().map(|(_, source, _)| source)], |row| row.get(0)).map_err(db)?;
         tx.execute("INSERT OR IGNORE INTO source_revisions VALUES (?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?3,'utf-8',?4)",
             params![id,revision,bytes,newline(&bytes)]).map_err(db)?;
         tx.commit().map_err(db)?;
         Ok(Document {
             id,
-            identity,
+            identity: path.to_owned(),
             path: path.to_owned(),
             revision,
             date,
@@ -202,8 +252,7 @@ impl Storage {
     }
 
     pub(crate) fn source_is_current(&self, path: &str, expected: &str) -> bool {
-        self.files
-            .read_markdown(path)
+        read_source_bytes(&self.workspace.files, path)
             .is_ok_and(|bytes| revision_hash(&bytes) == expected)
     }
 
@@ -313,23 +362,16 @@ impl Storage {
         result: M2Result<Value>,
     ) -> M2Result<Value> {
         let current = self.model_config()?.as_ref() == Some(config)
-            && self
-                .files
-                .read_markdown_with_identity(&document.path)
-                .is_ok_and(|(bytes, identity)| {
-                    document.identity == identity && revision_hash(&bytes) == document.revision
-                });
-        let (state, error, items) = if current {
-            match result.and_then(|data| analysis_items(document, id, data)) {
-                Ok(items) => ("succeeded", None, items),
-                Err(detail) => ("failed", Some(detail), vec![]),
-            }
-        } else {
-            (
+            && self.source_is_current(&document.path, &document.revision);
+        let (state, error, items) = match result.and_then(|data| analysis_items(document, id, data))
+        {
+            Ok(items) if current => ("succeeded", None, items),
+            Ok(items) => (
                 "stale",
-                Some("原文或模型配置已改变，旧结果未采用".into()),
-                vec![],
-            )
+                Some("原文或模型配置已改变，已保留整理结果供核对".into()),
+                items,
+            ),
+            Err(detail) => ("failed", Some(detail), vec![]),
         };
         let tx = self
             .connection
@@ -369,27 +411,23 @@ impl Storage {
         if result["isCapture"].is_null() {
             result["isCapture"] = json!(self.is_capture_path(path));
         }
-        let identity = required(evidence, "fileIdentity")?;
-        match self.files.read_markdown_with_identity(path) {
-            Ok((bytes, current_identity)) => {
+        match read_source_bytes(&self.workspace.files, path) {
+            Ok(bytes) => {
                 result["available"] = json!(true);
-                result["changed"] =
-                    json!(revision_hash(&bytes) != revision || current_identity != identity);
+                result["changed"] = json!(revision_hash(&bytes) != revision);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && physical_path(path) == path =>
+            {
                 let mut statement = self.connection.prepare(
-                    "SELECT relative_path FROM search_documents WHERE revision=?1 AND relative_path<>?2").map_err(db)?;
+                    "SELECT relative_path FROM search_documents WHERE revision=?1 AND relative_path<>?2 LIMIT 2").map_err(db)?;
                 let matches = statement
                     .query_map(params![revision, path], |row| row.get::<_, String>(0))
                     .map_err(db)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(db)?;
-                if let Some(moved) =
-                    matches.into_iter().find(|candidate| {
-                        self.files.read_markdown_with_identity(candidate).is_ok_and(
-                            |(bytes, id)| id == identity && revision_hash(&bytes) == revision,
-                        )
-                    })
+                if let [moved] = matches.as_slice()
+                    && self.source_is_current(moved, revision)
                 {
                     result["movedFrom"] = json!(path);
                     result["path"] = json!(moved);

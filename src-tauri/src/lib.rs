@@ -12,6 +12,8 @@ mod m2_commands;
 mod model;
 mod platform;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 pub mod storage;
 #[cfg(windows)]
 mod workspace;
@@ -50,11 +52,13 @@ pub fn run() {
             desktop_commands::open_workspace_file,
             desktop_commands::pick_workspace_markdown,
             desktop_commands::list_workspace_markdown_files,
-            credential_commands::list_credentials,
             credential_commands::set_credential,
-            credential_commands::save_credential,
             m2_commands::get_model_config,
-            m2_commands::set_model_config,
+            m2_commands::get_integrations_config,
+            m2_commands::save_model_config,
+            m2_commands::save_memory_config,
+            m2_commands::test_model_connection,
+            m2_commands::test_memory_connection,
             m2_commands::list_analyses,
             m2_commands::analyze_source,
             m2_commands::prepare_analysis_change,
@@ -73,8 +77,10 @@ pub fn run() {
             m2_commands::apply_wiki_changes,
             m2_commands::preview_wiki_undo,
             m2_commands::rebase_wiki_change,
-            m2_commands::wiki_tasks,
-            m2_commands::prepare_task_status,
+            m2_commands::list_tasks,
+            m2_commands::toggle_task,
+            settings::get_app_settings,
+            settings::save_app_settings,
             hotkeys::get_hotkey,
             hotkeys::set_hotkey,
         ]);

@@ -106,6 +106,7 @@ pub struct OpenedWorkspaceDto {
 #[serde(rename_all = "camelCase")]
 pub struct RecentCaptureDto {
     pub path: String,
+    pub block_id: Option<String>,
     pub captured_at: String,
     pub body: String,
     pub content_hash: String,
@@ -218,6 +219,7 @@ pub struct WikiApplyOutcomeDto {
 #[serde(rename_all = "camelCase")]
 pub struct TaskEntryDto {
     pub id: String,
+    pub expected_line: String,
     pub text: String,
     pub state: String,
     pub source_path: String,

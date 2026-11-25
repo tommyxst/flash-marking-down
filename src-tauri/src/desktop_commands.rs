@@ -6,10 +6,11 @@ use tauri_plugin_dialog::DialogExt;
 use crate::capture_commands::with_workspace;
 use crate::dto::AppError;
 use crate::platform::{display_local_path, open_file_default, reveal_file_in_explorer};
-use crate::workspace::{capture_picker_path, picked_capture_directory, pin_workspace_root};
+use crate::storage::physical_path;
+use crate::workspace::{capture_picker_path, picked_capture_directory, workspace_root};
 
-const INVALID_ROOT: &str = "请选择本机磁盘上可访问的普通文件夹";
-const INVALID_CAPTURE: &str = "请选择工作区内可访问的普通文件夹，应用状态目录不可用";
+const INVALID_ROOT: &str = "请选择可访问的工作区文件夹";
+const INVALID_CAPTURE: &str = "请选择工作区内可访问的文件夹，应用状态目录不可用";
 const INVALID_MARKDOWN: &str =
     "请选择工作区内可访问的 UTF-8 Markdown 文件（不可选原始随手记或状态目录）";
 
@@ -31,12 +32,13 @@ pub(crate) async fn pick_workspace_folder(
 
     async_runtime::spawn_blocking(move || {
         let root_path = Path::new(&root);
-        let start = match (capture, pin_workspace_root(root_path)) {
-            (false, Ok((root, _))) => Some(root),
+        let checked_root = workspace_root(root_path);
+        let start = match (capture, &checked_root) {
+            (false, Ok(root)) => Some(root.clone()),
             (false, Err(_)) => None,
-            (true, Ok((root, _pins))) => {
-                Some(capture_picker_path(&root, Path::new(&capture_dir)).unwrap_or(root))
-            }
+            (true, Ok(root)) => Some(
+                capture_picker_path(root, Path::new(&capture_dir)).unwrap_or_else(|_| root.clone()),
+            ),
             (true, Err(_)) => {
                 return Err(AppError::invalid("workspace", "请先选择有效的工作区目录"));
             }
@@ -52,7 +54,8 @@ pub(crate) async fn pick_workspace_folder(
             .as_path()
             .ok_or_else(|| AppError::invalid("workspace", INVALID_ROOT))?;
         if capture {
-            return picked_capture_directory(root_path, &capture_dir, path)
+            let checked_root = checked_root.expect("capture branch requires valid root");
+            return picked_capture_directory(&checked_root, &capture_dir, path)
                 .map(Some)
                 .map_err(|e| {
                     AppError::new(
@@ -65,7 +68,7 @@ pub(crate) async fn pick_workspace_folder(
                 });
         }
 
-        let (selected_root, _pins) = pin_workspace_root(path).map_err(|e| {
+        let selected_root = workspace_root(path).map_err(|e| {
             AppError::new(
                 "OUT_OF_SCOPE",
                 "workspace",
@@ -74,7 +77,7 @@ pub(crate) async fn pick_workspace_folder(
                 Some(e.to_string()),
             )
         })?;
-        if pin_workspace_root(root_path).is_ok_and(|(root, _)| root == selected_root) {
+        if checked_root.is_ok_and(|root| root == selected_root) {
             return Ok(Some(root));
         }
         Ok(Some(
@@ -146,7 +149,7 @@ pub(crate) async fn open_workspace_file(
     let full = with_workspace(window, session, move |storage| {
         storage
             .workspace_files()
-            .markdown_full_path(&relative_path)
+            .markdown_full_path(physical_path(&relative_path))
             .map_err(|error| {
                 AppError::new(
                     "SOURCE_UNAVAILABLE",
@@ -189,13 +192,11 @@ pub(crate) async fn pick_workspace_markdown(
         "tasks" => "选择任务清单 Markdown 文件",
         _ => return Err(AppError::invalid("wiki", "无效的文件用途")),
     };
-    let (files, capture_names) = with_workspace(window.clone(), session, |storage| {
-        let names = storage
-            .capture_file_names()?
-            .into_iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        Ok((storage.workspace_files(), names))
+    let (files, captured) = with_workspace(window.clone(), session, |storage| {
+        Ok((
+            storage.workspace_files(),
+            storage.capture_paths()?.into_iter().collect::<HashSet<_>>(),
+        ))
     })
     .await?;
 
@@ -214,20 +215,11 @@ pub(crate) async fn pick_workspace_markdown(
         };
         let invalid = || AppError::invalid("wiki", INVALID_MARKDOWN);
         let path = selected.as_path().ok_or_else(invalid)?;
-        let canonical = path.canonicalize().map_err(|_| invalid())?;
-        let relative = canonical
-            .strip_prefix(files.root_path())
-            .map_err(|_| invalid())?
-            .to_str()
-            .ok_or_else(invalid)?
-            .replace('\\', "/");
-        let key = files.markdown_key(&relative).map_err(|_| invalid())?;
-        let file_name = key.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-        if capture_names.contains(&file_name) {
+        let (key, full) = files.picked_markdown(path).map_err(|_| invalid())?;
+        if captured.contains(&key) {
             return Err(AppError::invalid("wiki", "原始随手记文件不能作为写入目标"));
         }
-        let bytes = files.read_markdown(&key).map_err(|_| invalid())?;
-        std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        std::fs::read_to_string(full).map_err(|_| invalid())?;
         Ok(Some(key))
     })
     .await
@@ -239,13 +231,11 @@ pub(crate) async fn list_workspace_markdown_files(
     window: WebviewWindow,
     session: String,
 ) -> Result<Vec<String>, AppError> {
-    let (files, capture_names) = with_workspace(window, session, |storage| {
-        let names = storage
-            .capture_file_names()?
-            .into_iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        Ok((storage.workspace_files(), names))
+    let (files, captured) = with_workspace(window, session, |storage| {
+        Ok((
+            storage.workspace_files(),
+            storage.capture_paths()?.into_iter().collect::<HashSet<_>>(),
+        ))
     })
     .await?;
     async_runtime::spawn_blocking(move || {
@@ -260,10 +250,7 @@ pub(crate) async fn list_workspace_markdown_files(
         })?;
         let mut result: Vec<String> = paths
             .into_iter()
-            .filter(|path| {
-                let name = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-                !capture_names.contains(&name)
-            })
+            .filter(|path| !captured.contains(path))
             .collect();
         result.sort();
         Ok(result)

@@ -4,25 +4,11 @@ use tauri::WebviewWindow;
 
 use crate::capture_commands::with_workspace;
 use crate::dto::{AppError, CredentialStatusDto};
-use crate::platform::{credential_exists, read_credential, write_credential, zero_string};
+use crate::platform::{credential_exists, read_credential};
 use crate::storage::Storage;
 
-const SECRET_LIMIT: usize = 4096;
+const CRED_MAX_CREDENTIAL_BLOB_SIZE: usize = 5 * 512;
 const SLOTS: [&str; 2] = ["model", "memory"];
-
-#[tauri::command]
-pub(crate) async fn list_credentials(
-    window: WebviewWindow,
-    session: String,
-) -> Result<Vec<CredentialStatusDto>, AppError> {
-    with_workspace(window, session, |storage| {
-        SLOTS
-            .into_iter()
-            .map(|slot| status(storage, slot))
-            .collect()
-    })
-    .await
-}
 
 #[tauri::command]
 pub(crate) async fn set_credential(
@@ -55,42 +41,16 @@ pub(crate) async fn set_credential(
     .await
 }
 
-#[tauri::command]
-pub(crate) async fn save_credential(
-    window: WebviewWindow,
-    session: String,
-    slot: String,
-    mut secret: String,
-) -> Result<CredentialStatusDto, AppError> {
-    let slot = SLOTS
-        .into_iter()
-        .find(|name| *name == slot)
-        .ok_or_else(|| AppError::invalid("credential", "凭据用途无效"))?;
-    let mut trimmed = validate_secret(&secret)
-        .map_err(|msg| AppError::invalid("credential", msg))?
-        .to_owned();
-    zero_string(&mut secret);
-    with_workspace(window, session, move |storage| {
-        let target = target_name(storage.workspace_id(), slot)?;
-        let write_result = write_credential(&target, &trimmed);
-        zero_string(&mut trimmed);
-        write_result.map_err(|error| {
-            AppError::new(
-                "AUTH_FAILED",
-                "credential",
-                true,
-                "无法写入 Windows 凭据管理器",
-                Some(error.to_string()),
-            )
-        })?;
-        storage.set_credential_reference(slot, Some(target.as_str()))?;
-        Ok(CredentialStatusDto {
-            slot: slot.to_owned(),
-            target,
-            state: "linked".to_owned(),
-        })
-    })
-    .await
+pub(crate) fn config_key<'a>(
+    storage: &Storage,
+    slot: &str,
+    secret: &'a str,
+) -> Result<Option<(String, &'a str)>, AppError> {
+    if secret.trim().is_empty() {
+        return Ok(None);
+    }
+    let token = validate_secret(secret).map_err(|msg| AppError::invalid("credential", msg))?;
+    Ok(Some((target_name(storage.workspace_id(), slot)?, token)))
 }
 
 pub(crate) fn model_credential_state(storage: &Storage) -> Result<String, AppError> {
@@ -99,16 +59,19 @@ pub(crate) fn model_credential_state(storage: &Storage) -> Result<String, AppErr
 
 fn validate_secret(secret: &str) -> Result<&str, String> {
     let token = secret.trim();
-    if token.is_empty()
-        || token.len() > SECRET_LIMIT
-        || !token.bytes().all(|b| b.is_ascii_graphic())
-    {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err("密钥不能为空，且仅允许可见 ASCII 字符（不能含内部空格或换行）".into());
+    }
+    if token.encode_utf16().count() * size_of::<u16>() > CRED_MAX_CREDENTIAL_BLOB_SIZE {
+        return Err("密钥超过 Windows 凭据管理器的 UTF-16 上限（2560 字节）".into());
     }
     Ok(token)
 }
 
-fn status(storage: &Storage, slot: &'static str) -> Result<CredentialStatusDto, AppError> {
+pub(crate) fn status(
+    storage: &Storage,
+    slot: &'static str,
+) -> Result<CredentialStatusDto, AppError> {
     let target = target_name(storage.workspace_id(), slot)?;
     let reference = storage.credential_reference(slot)?;
     let state = match reference.as_deref() {
@@ -151,8 +114,16 @@ pub(crate) fn model_token(
     storage: &Storage,
     allow_anonymous: bool,
 ) -> Result<Option<String>, AppError> {
-    let target = target_name(storage.workspace_id(), "model")?;
-    let linked = storage.credential_reference("model")?;
+    service_token(storage, "model", allow_anonymous)
+}
+
+pub(crate) fn service_token(
+    storage: &Storage,
+    slot: &str,
+    allow_anonymous: bool,
+) -> Result<Option<String>, AppError> {
+    let target = target_name(storage.workspace_id(), slot)?;
+    let linked = storage.credential_reference(slot)?;
     if allow_anonymous && linked.is_none() {
         return Ok(None);
     }
@@ -161,7 +132,7 @@ pub(crate) fn model_token(
             "AUTH_FAILED",
             "credential",
             false,
-            "请先在工作区设置关联模型凭据",
+            "请先在工作区设置录入或关联此服务的 API Key",
         ));
     }
     let token = read_credential(&target).map_err(credential_error)?;
@@ -170,7 +141,7 @@ pub(crate) fn model_token(
             "AUTH_FAILED",
             "credential",
             false,
-            "模型凭据为空或格式无效，请在工作区设置或 Windows 凭据管理器中更新",
+            "凭据为空或格式无效，请在工作区设置或 Windows 凭据管理器中更新",
         )
     })
 }
@@ -193,6 +164,12 @@ mod tests {
 
     #[test]
     fn validates_and_trims_credential_secrets() {
+        assert!(validate_secret(&"x".repeat(1280)).is_ok());
+        assert!(
+            validate_secret(&"x".repeat(1281))
+                .unwrap_err()
+                .contains("UTF-16")
+        );
         assert_eq!(validate_secret("  sk-test-123\r\n").unwrap(), "sk-test-123");
         assert!(validate_secret("   ").is_err());
         assert!(validate_secret("sk test").is_err());

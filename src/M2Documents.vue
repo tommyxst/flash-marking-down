@@ -92,7 +92,7 @@ watch(() => props.mode, (mode) => {
 watch(() => [props.mode, taskTarget.value] as const, ([mode, target], previous) => {
   if (target !== previous?.[1]) taskList.value = undefined
   if (mode === 'tasks' && target) void loadTasks()
-})
+}, { immediate: true })
 
 onMounted(() => window.addEventListener('focus', refreshFromDisk))
 onUnmounted(() => window.removeEventListener('focus', refreshFromDisk))
@@ -183,7 +183,7 @@ async function loadTasks() {
   if (!target || taskLoading.value) return
   taskLoading.value = true
   try {
-    const list = await api.wikiTasks(props.session)
+    const list = await api.listTasks(props.session)
     if (taskTarget.value === target) taskList.value = list
   } catch (failure) {
     if (taskTarget.value === target) {
@@ -205,16 +205,13 @@ async function toggleTask(task: TaskEntry, event: Event) {
   const checkbox = event.currentTarget as HTMLInputElement
   checkbox.checked = task.state === 'done'
   const list = taskList.value
-  if (!list || busy.value || taskLoading.value || task.manual || !task.id || (task.state !== 'open' && task.state !== 'done')) return
-  const state = task.state === 'open' ? 'done' : 'open'
+  if (!list || busy.value || taskLoading.value || !task.id || (task.state !== 'open' && task.state !== 'done')) return
   busy.value = true
   error.value = null
   feedback.value = ''
   try {
-    const prepared = await api.prepareTaskStatus(props.session, task.id, list.revision, state)
-    const [result] = await api.applyWikiChanges(props.session, [prepared.id])
-    if (result?.outcome !== 'applied') error.value = { safeMessage: result?.message || '任务状态未写入，请刷新清单。' }
-    else feedback.value = '已保存任务状态。'
+    await api.toggleTask(props.session, list.path, task.id, task.expectedLine, task.state === 'open')
+    feedback.value = '已保存任务状态。'
   } catch (failure) {
     error.value = parseAppError(failure)
   } finally {
@@ -287,7 +284,8 @@ function targetFor(id: string) {
           <label class="m2-check"><input v-model="chosen" type="checkbox" :value="selected.id" :disabled="busy || changesLoading">加入本次批量采用</label>
         </template>
         <div v-else-if="selected.phase === 'conflict'" class="actions">
-          <button type="button" :disabled="busy || changesLoading" @click="generatePreview(selected.id, 'rebase_wiki_change')">读取当前版本并重新比较</button>
+          <p v-if="selected.kind === 'status'" class="hint">请在任务清单中勾选最新状态。</p>
+          <button v-else type="button" :disabled="busy || changesLoading" @click="generatePreview(selected.id, 'rebase_wiki_change')">读取当前版本并重新比较</button>
         </div>
         <div v-else-if="selected.phase === 'applied' && !selected.kind.startsWith('undo_')" class="actions">
           <button type="button" :disabled="busy || changesLoading" @click="generatePreview(selected.id, 'preview_wiki_undo')">查看撤销预览</button>
@@ -314,13 +312,12 @@ function targetFor(id: string) {
       </ul>
       <p v-if="!taskList.entries.length && !taskLoading" class="empty-panel compact">任务清单为空。</p>
       <ul class="m2-list">
-        <li v-for="(task, index) in taskList.entries" :key="task.id || `manual-${index}`" class="detail-card m2-task" :class="{ 'm2-task-done': task.state === 'done' }">
+        <li v-for="(task, index) in taskList.entries" :key="task.id || index" class="detail-card m2-task" :class="{ 'm2-task-done': task.state === 'done' }">
           <label class="m2-check">
             <input
               type="checkbox"
               :checked="task.state === 'done'"
-              :disabled="busy || taskLoading || task.manual || !task.id || task.state === 'invalid' || task.state === 'cancelled'"
-              :title="task.manual && task.state !== 'invalid' ? '手工任务请在原 Markdown 文件中编辑' : undefined"
+              :disabled="busy || taskLoading || !task.id || task.state === 'invalid' || task.state === 'cancelled'"
               @change="toggleTask(task, $event)"
             >
             <strong>{{ task.text }}</strong>

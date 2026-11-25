@@ -244,19 +244,20 @@ async function refreshRecords(afterCapture = false) {
   try {
     const recent = await api.listRecentCaptures(session)
     if (isCurrent()) {
-      const latest = recent[0]?.path
-      if (afterCapture && latest && recentRecords.value[0]?.path !== latest) {
-        savedPath.value = latest
-        void refreshSearch()
-      }
-      recentRecords.value = recent.map((item) => ({
-        path: item.path,
+      const records = recent.map((item) => ({
+        path: item.blockId ? item.path + '#fmd-note:' + item.blockId : item.path,
         capturedAt: item.capturedAt,
         text: item.body,
         contentHash: item.contentHash,
         titleText: item.body,
         isCapture: item.isCapture,
       }))
+      const latest = records[0]?.path
+      if (afterCapture && latest && recentRecords.value[0]?.path !== latest) {
+        savedPath.value = latest
+        void refreshSearch()
+      }
+      recentRecords.value = records
     }
   } catch (error) {
     if (isCurrent()) recordsError.value = parseAppError(error)

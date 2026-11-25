@@ -226,10 +226,10 @@ async function decideInlineChange(decision: 'rejected' | 'deferred') {
           </label>
         </div>
         <p v-if="record.contentHash !== current.revision" class="notice">此结果基于先前版本。点击上方「重新整理当前版本」即可刷新。</p>
-        <p v-if="current.error" class="notice error" role="alert">{{ current.error }}</p>
-        <p v-if="current.status === 'succeeded' && !current.items.length" class="empty-panel compact">这次整理没有生成新的纪要或变更建议。</p>
+        <p v-if="current.error" :class="current.status === 'stale' ? 'notice' : 'notice error'" :role="current.status === 'stale' ? 'status' : 'alert'">{{ current.error }}</p>
+        <p v-if="(current.status === 'succeeded' || current.status === 'stale') && !current.items.length" class="empty-panel compact">这次整理没有生成新的纪要或变更建议。</p>
         <ErrorNotice :error="previewError" />
-        <template v-if="current.status === 'succeeded'">
+        <template v-if="current.status === 'succeeded' || current.status === 'stale'">
           <section v-for="group in groups" :key="group.kind" class="m2-stack">
             <template v-if="group.items.length || group.kind === 'decision' && current.items.length">
               <h3>{{ group.label }}</h3>

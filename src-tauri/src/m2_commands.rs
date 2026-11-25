@@ -76,21 +76,116 @@ pub(crate) async fn get_model_config(
     .await
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct IntegrationsConfig {
+    model: Option<ModelConfigDto>,
+    memory: Option<crate::model::MemoryConfig>,
+    credentials: [crate::dto::CredentialStatusDto; 2],
+}
+
 #[tauri::command]
-pub(crate) async fn set_model_config(
+pub(crate) async fn get_integrations_config(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<IntegrationsConfig> {
+    with_workspace(window, session, |storage| {
+        let model = storage
+            .model_config()
+            .map_err(|msg| m2_err("model_config", msg))?
+            .map(|config| model_dto(storage, config))
+            .transpose()?;
+        Ok(IntegrationsConfig {
+            model,
+            memory: storage
+                .service_config("memory")
+                .map_err(|msg| m2_err("memory_config", msg))?,
+            credentials: [
+                crate::credential_commands::status(storage, "model")?,
+                crate::credential_commands::status(storage, "memory")?,
+            ],
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn save_model_config(
     window: WebviewWindow,
     session: String,
     endpoint: String,
     model: String,
     enabled: bool,
-) -> CommandResult<ModelConfigDto> {
+    secret: Option<String>,
+) -> CommandResult<()> {
+    let config = crate::model::ModelSettings::new(&endpoint, &model, enabled)
+        .map_err(|msg| AppError::invalid("model_config", msg))?;
     with_workspace(window, session, move |storage| {
-        let config = storage
-            .set_model_config(endpoint, model, enabled)
-            .map_err(|msg| AppError::invalid("model_config", msg))?;
-        model_dto(storage, config)
+        storage.save_service_config("model", &config, secret.as_deref().unwrap_or(""))
     })
     .await
+}
+
+#[tauri::command]
+pub(crate) async fn save_memory_config(
+    window: WebviewWindow,
+    session: String,
+    base_url: String,
+    namespace: String,
+    enabled: bool,
+    secret: Option<String>,
+) -> CommandResult<()> {
+    let config = crate::model::MemoryConfig::new(&base_url, &namespace, enabled)
+        .map_err(|msg| AppError::invalid("memory_config", msg))?;
+    with_workspace(window, session, move |storage| {
+        storage.save_service_config("memory", &config, secret.as_deref().unwrap_or(""))
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn test_model_connection(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<String> {
+    let (url, model, token) = with_workspace(window, session, |storage| {
+        let (endpoint, model, _) = storage
+            .model_config()
+            .map_err(|msg| m2_err("model_config", msg))?
+            .ok_or_else(|| AppError::invalid("model_config", "请先保存模型配置"))?;
+        let url = crate::model::endpoint(&endpoint)
+            .map_err(|msg| AppError::invalid("model_config", msg))?;
+        let token = model_token(storage, crate::model::is_local_or_lan(&url))?;
+        Ok((url, model, token))
+    })
+    .await?;
+    async_runtime::spawn_blocking(move || crate::model::probe_model(&url, &model, token.as_deref()))
+        .await
+        .map_err(|_| m2_err("connection", "连接测试已中断".into()))?
+}
+
+#[tauri::command]
+pub(crate) async fn test_memory_connection(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<String> {
+    let (url, token) = with_workspace(window, session, |storage| {
+        let config = storage
+            .service_config::<crate::model::MemoryConfig>("memory")
+            .map_err(|msg| m2_err("memory_config", msg))?
+            .ok_or_else(|| AppError::invalid("memory_config", "请先保存 OpenViking 配置"))?;
+        let url = crate::model::endpoint(&config.base_url)
+            .map_err(|msg| AppError::invalid("memory_config", msg))?;
+        let token = crate::credential_commands::service_token(
+            storage,
+            "memory",
+            crate::model::is_local_or_lan(&url),
+        )?;
+        Ok((url, token))
+    })
+    .await?;
+    async_runtime::spawn_blocking(move || crate::model::probe_memory(&url, token.as_deref()))
+        .await
+        .map_err(|_| m2_err("connection", "连接测试已中断".into()))?
 }
 
 #[tauri::command]
@@ -496,7 +591,7 @@ pub(crate) async fn rebase_wiki_change(
 }
 
 #[tauri::command]
-pub(crate) async fn wiki_tasks(
+pub(crate) async fn list_tasks(
     window: WebviewWindow,
     session: String,
 ) -> CommandResult<TaskListDto> {
@@ -504,12 +599,13 @@ pub(crate) async fn wiki_tasks(
         let (path, revision, entries, repair_messages) = storage.wiki_tasks()?;
         let entries = entries
             .into_iter()
-            .map(|(id, text, state, source_path)| {
-                let manual = id.is_empty() && state != "invalid";
+            .map(|(id, text, state, source_path, expected_line)| {
+                let manual = id.starts_with("line:");
                 let source_is_capture =
                     !source_path.is_empty() && storage.is_capture_path(&source_path);
                 TaskEntryDto {
                     id,
+                    expected_line,
                     text,
                     state,
                     source_path,
@@ -529,16 +625,16 @@ pub(crate) async fn wiki_tasks(
 }
 
 #[tauri::command]
-pub(crate) async fn prepare_task_status(
+pub(crate) async fn toggle_task(
     window: WebviewWindow,
     session: String,
+    path: String,
     task_id: String,
-    base_hash: String,
-    state: String,
-) -> CommandResult<WikiChangeDto> {
+    expected_line: String,
+    done: bool,
+) -> CommandResult<()> {
     with_workspace(window, session, move |storage| {
-        let change = storage.prepare_task_status(&task_id, &base_hash, &state)?;
-        Ok(change_dto(storage, change))
+        Ok(storage.toggle_task(&path, &task_id, &expected_line, done)?)
     })
     .await
 }

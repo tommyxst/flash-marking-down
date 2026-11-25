@@ -1,26 +1,162 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::Url;
 
-use crate::platform::{HttpTransport, default_http_transport};
+use crate::dto::AppError;
+use crate::platform::{Auth, HttpTransport, default_http_transport, request_json};
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ModelSettings {
+    pub endpoint: String,
+    pub model: String,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryConfig {
+    pub base_url: String,
+    pub namespace: String,
+    pub enabled: bool,
+}
 
 const JSON_RETRY_LIMIT: usize = 1;
 const JSON_RETRY_NOTICE: &str = "上次回复不是合法的单个 JSON 对象。请仅返回一个符合要求的纯 JSON 对象，不要附加任何说明文字或代码块标记。";
 
 pub(crate) fn endpoint(value: &str) -> Result<Url, String> {
-    let url = Url::parse(value.trim()).map_err(|_| "模型端点必须是完整 URL")?;
+    let url = Url::parse(value.trim()).map_err(|_| "服务地址必须是完整 URL")?;
     let local_or_lan = is_local_or_lan(&url);
     if !(url.scheme() == "https" || url.scheme() == "http" && local_or_lan)
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
+        || url.query_pairs().any(|(key, _)| {
+            let key = key.to_ascii_lowercase().replace(['-', '_'], "");
+            key.ends_with("key")
+                || key.ends_with("token")
+                || key.ends_with("secret")
+                || key.ends_with("signature")
+                || matches!(
+                    key.as_str(),
+                    "sig" | "password" | "credential" | "authorization"
+                )
+        })
         || url.path().is_empty()
     {
         return Err(
-            "请填写完整的模型 HTTP(S) URL；公网端点须使用 HTTPS，地址中不能包含凭据或片段".into(),
+            "请填写完整的 HTTP(S) URL。公网端点须使用 HTTPS，地址中不能包含凭据或片段".into(),
         );
     }
     Ok(url)
+}
+
+impl ModelSettings {
+    pub(crate) fn new(url: &str, model: &str, enabled: bool) -> Result<Self, String> {
+        let model = model.trim();
+        if model.is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
+            return Err("请填写有效的模型名称".into());
+        }
+        Ok(Self {
+            endpoint: endpoint(url)?.to_string(),
+            model: model.into(),
+            enabled,
+        })
+    }
+}
+
+impl MemoryConfig {
+    pub(crate) fn new(base_url: &str, namespace: &str, enabled: bool) -> Result<Self, String> {
+        let url = endpoint(base_url)?;
+        if url.query().is_some() {
+            return Err("OpenViking 服务地址不能包含查询参数".into());
+        }
+        let name = namespace.trim();
+        if name.is_empty()
+            || matches!(name, "." | "..")
+            || !name
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err("命名空间可使用中英文、数字、点、连字符和下划线".into());
+        }
+        Ok(Self {
+            base_url: url.as_str().trim_end_matches('/').to_owned(),
+            namespace: name.into(),
+            enabled,
+        })
+    }
+}
+
+pub(crate) fn probe_model(url: &Url, model: &str, token: Option<&str>) -> Result<String, AppError> {
+    let request = json!({"model": model, "stream": false, "messages": [{"role":"user","content":"Reply with OK."}]}).to_string();
+    let response = request_json(
+        url,
+        token.map_or(Auth::None, Auth::Bearer),
+        Some(request.as_bytes()),
+    )?;
+    let result: Value = serde_json::from_slice(&response)
+        .map_err(|_| AppError::invalid("connection", "端点未返回有效的 Chat Completions JSON"))?;
+    if result["choices"][0]["message"]["content"]
+        .as_str()
+        .is_none_or(|v| v.trim().is_empty())
+    {
+        return Err(AppError::invalid(
+            "connection",
+            "服务已响应，但没有返回模型回复，请核对 Chat Completions 地址与模型名",
+        ));
+    }
+    let actual = result["model"].as_str().unwrap_or(model);
+    Ok(format!("连接成功，模型 {actual} 已响应。"))
+}
+
+pub(crate) fn probe_memory(base_url: &Url, token: Option<&str>) -> Result<String, AppError> {
+    let mut url = base_url.clone();
+    url.path_segments_mut()
+        .map_err(|_| AppError::invalid("connection", "OpenViking 服务地址无效"))?
+        .pop_if_empty()
+        .push("health");
+    let response = request_json(&url, token.map_or(Auth::None, Auth::ApiKey), None)?;
+    let health: Value = serde_json::from_slice(&response).map_err(|_| {
+        AppError::invalid("connection", "未收到 OpenViking 健康状态，请核对服务地址")
+    })?;
+    if health["status"] != "ok" {
+        return Err(AppError::invalid(
+            "connection",
+            "OpenViking 未报告就绪，请检查服务状态",
+        ));
+    }
+    let version = health["version"].as_str().filter(|v| !v.is_empty());
+    if health["auth_mode"] == "dev" {
+        return Ok(match version {
+            Some(version) => format!("连接成功（OpenViking {version}，免密开发模式）。"),
+            None => "连接成功，服务处于免密开发模式。".into(),
+        });
+    }
+    if health["role"] == "root" {
+        return Err(AppError::from_message(
+            "AUTH_FAILED",
+            "connection",
+            false,
+            "当前为 OpenViking root 管理密钥，无法读写笔记与记忆，请改用用户或管理员 API Key",
+        ));
+    }
+    match (health["account_id"].as_str(), health["user_id"].as_str()) {
+        (Some(account), Some(user)) if !account.is_empty() && !user.is_empty() => {
+            Ok(match version {
+                Some(version) => {
+                    format!("连接成功（OpenViking {version}），账户 {account}，用户 {user}。")
+                }
+                None => format!("连接成功，账户 {account}，用户 {user}。"),
+            })
+        }
+        _ => Err(AppError::from_message(
+            "AUTH_FAILED",
+            "connection",
+            false,
+            "OpenViking 可达，但未确认认证身份，请检查 API Key",
+        )),
+    }
 }
 
 pub(crate) fn loopback(url: &Url) -> bool {
@@ -200,6 +336,161 @@ mod tests {
         seen_tokens: Mutex<Vec<Option<String>>>,
     }
 
+    fn reply_once(
+        expected_request: &'static str,
+        auth: &'static str,
+        status: &'static str,
+        body: &'static str,
+    ) -> (Url, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = endpoint(&format!("http://{}/proxy", listener.local_addr().unwrap())).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            assert_eq!(first.trim_end(), expected_request);
+            let mut headers = Vec::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                let lower = line.trim().to_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push(lower);
+            }
+            if auth.is_empty() {
+                assert!(
+                    !headers
+                        .iter()
+                        .any(|h| h.starts_with("authorization:") || h.starts_with("x-api-key:"))
+                );
+            } else {
+                assert!(headers.iter().any(|h| h == auth));
+            }
+            let mut data = vec![0; length];
+            reader.read_exact(&mut data).unwrap();
+            if first.starts_with("POST") {
+                let request: Value = serde_json::from_slice(&data).unwrap();
+                if auth.is_empty() || auth.starts_with("authorization:") {
+                    assert_eq!(request["model"], "fixture");
+                    assert_eq!(request["stream"], false);
+                    if !auth.is_empty() {
+                        assert_eq!(request["messages"][0]["content"], "Reply with OK.");
+                    }
+                }
+            }
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (url, peer)
+    }
+
+    #[test]
+    fn probes_confirm_model_and_authenticated_memory_identity() {
+        let (url, peer) = reply_once(
+            "POST /proxy HTTP/1.1",
+            "authorization: bearer synthetic",
+            "200 OK",
+            r#"{"model":"fixture-v1","choices":[{"message":{"content":"OK"}}]}"#,
+        );
+        assert!(
+            probe_model(&url, "fixture", Some("synthetic"))
+                .unwrap()
+                .contains("fixture-v1")
+        );
+        peer.join().unwrap();
+        let (url, peer) = reply_once(
+            "GET /proxy/health HTTP/1.1",
+            "x-api-key: synthetic",
+            "200 OK",
+            r#"{"status":"ok","account_id":"demo","user_id":"reader"}"#,
+        );
+        assert!(
+            probe_memory(&url, Some("synthetic"))
+                .unwrap()
+                .contains("账户 demo，用户 reader")
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn probes_distinguish_authentication_and_network_errors() {
+        for (status, body) in [
+            ("401 Unauthorized", "{}"),
+            ("403 Forbidden", "{}"),
+            ("200 OK", r#"{"status":"ok","auth_mode":"api_key"}"#),
+            (
+                "200 OK",
+                r#"{"status":"ok","auth_mode":"api_key","account_id":"default","user_id":"default","role":"root"}"#,
+            ),
+        ] {
+            let (url, peer) = reply_once(
+                "GET /proxy/health HTTP/1.1",
+                "x-api-key: synthetic",
+                status,
+                body,
+            );
+            let error = probe_memory(&url, Some("synthetic")).unwrap_err();
+            assert_eq!(error.code, "AUTH_FAILED");
+            if body.contains("\"root\"") {
+                assert!(error.safe_message.contains("root"));
+            }
+            peer.join().unwrap();
+        }
+        for token in [None, Some("synthetic")] {
+            let auth = if token.is_some() {
+                "x-api-key: synthetic"
+            } else {
+                ""
+            };
+            let (url, peer) = reply_once(
+                "GET /proxy/health HTTP/1.1",
+                auth,
+                "200 OK",
+                r#"{"status":"ok","version":"0.5.2","auth_mode":"dev"}"#,
+            );
+            let message = probe_memory(&url, token).unwrap();
+            assert!(message.contains("0.5.2") && message.contains("免密开发模式"));
+            peer.join().unwrap();
+        }
+        let (url, peer) = reply_once(
+            "POST /proxy HTTP/1.1",
+            "x-api-key: synthetic",
+            "200 OK",
+            r#"{"ok":true}"#,
+        );
+        assert_eq!(
+            request_json(
+                &url,
+                Auth::ApiKey("synthetic"),
+                Some(br#"{"uri":"viking://a"}"#)
+            )
+            .unwrap(),
+            br#"{"ok":true}"#
+        );
+        peer.join().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = endpoint(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        drop(listener);
+        assert_eq!(
+            probe_model(&url, "fixture", None).unwrap_err().code,
+            "NETWORK_ERROR"
+        );
+    }
+
     impl HttpTransport for StubTransport {
         fn post_json(
             &self,
@@ -250,6 +541,19 @@ mod tests {
     #[test]
     fn request_uses_the_approved_endpoint_and_does_not_follow_redirects() {
         assert!(endpoint("http://example.com/v1/chat/completions").is_err());
+        for key in [
+            "api%2Dkey",
+            "accessToken",
+            "subscription-key",
+            "X-Amz-Signature",
+        ] {
+            assert!(
+                endpoint(&format!(
+                    "https://example.org/v1/chat/completions?{key}=fixture"
+                ))
+                .is_err()
+            );
+        }
         assert!(endpoint("https://user:pass@example.com/v1/chat/completions").is_err());
         assert!(endpoint("http://localhost:11434/v1/chat/completions").is_ok());
         assert!(endpoint("http://192.168.1.20:8000/v1/chat/completions").is_ok());
@@ -265,47 +569,17 @@ mod tests {
         assert!(!is_local_or_lan(
             &endpoint("https://api.example.com/v1/chat/completions").unwrap()
         ));
-        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = server.local_addr().unwrap();
-        let expected = endpoint(&format!(
-            "http://{address}/v1/chat/completions?api-version=1"
-        ))
-        .unwrap();
-        let peer = std::thread::spawn(move || {
-            let (mut connection, _) = server.accept().unwrap();
-            connection
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut connection);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(
-                line.trim_end(),
-                "POST /v1/chat/completions?api-version=1 HTTP/1.1"
-            );
-            let mut content_length = None;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-                assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
-                let (key, value) = line.split_once(':').unwrap();
-                if key.eq_ignore_ascii_case("content-length") {
-                    content_length = Some(value.trim().parse::<usize>().unwrap());
-                }
-            }
-            let mut bytes = vec![0; content_length.unwrap()];
-            reader.read_exact(&mut bytes).unwrap();
-            let request: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(request["model"], "fixture");
-            assert_eq!(request["stream"], false);
-            connection.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-        });
+        let (mut url, peer) = reply_once(
+            "POST /v1/chat/completions?api-version=1 HTTP/1.1",
+            "",
+            "307 Temporary Redirect\r\nLocation: /elsewhere",
+            "",
+        );
+        url.set_path("/v1/chat/completions");
+        url.set_query(Some("api-version=1"));
         assert!(
             generate(
-                &expected,
+                &url,
                 "fixture",
                 None,
                 "fixture",

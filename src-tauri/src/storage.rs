@@ -1,11 +1,12 @@
-use std::io;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Component, Path, Prefix};
 use std::sync::{Arc, Mutex};
+use std::{fs, io};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use crate::workspace::WorkspaceFiles;
+use crate::workspace::{WorkspaceFiles, replace_markdown};
 
 mod search;
 pub(crate) use search::SearchReader;
@@ -15,7 +16,8 @@ pub(crate) mod wiki;
 
 const RECENT_CAPTURE_LIMIT: i64 = 50;
 
-pub(crate) type RecentCapture = (String, String, String, String);
+pub(crate) type RecentCapture = (String, String, String, String, Option<String>);
+pub(crate) const NOTE_ANCHOR: &str = "#fmd-note:";
 
 #[derive(Debug)]
 pub struct StorageError {
@@ -86,34 +88,75 @@ pub struct SavedRecord {
     pub saved_at: String,
 }
 
-#[derive(Debug)]
-pub struct RecoveryOutcome {
-    pub request_id: String,
-    pub result: Result<SavedRecord, StorageError>,
-}
-
-struct Intent {
-    draft_id: String,
-    draft_revision: i64,
-    body_hash: String,
-    record_id: String,
-    source_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    file_name: String,
-    relative_path: String,
-    bytes: Option<Vec<u8>>,
-    revision: String,
-    captured_at: String,
-    state: String,
-    saved_at: Option<String>,
-}
-
 pub struct Storage {
     connection: Connection,
+    workspace: WorkspaceStorage,
+}
+
+pub(crate) struct WorkspaceStorage {
     files: Arc<WorkspaceFiles>,
     search_build: Arc<Mutex<()>>,
     capture_dir: String,
     workspace_id: String,
+    answer_preparation: Option<serde_json::Value>,
+}
+
+impl WorkspaceStorage {
+    pub(crate) fn with_storage<T, E: From<StorageError>>(
+        &mut self,
+        action: impl FnOnce(&mut Storage) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let connection = self.connect()?;
+        let mut storage = Storage {
+            connection,
+            workspace: Self {
+                files: self.files.clone(),
+                search_build: self.search_build.clone(),
+                capture_dir: self.capture_dir.clone(),
+                workspace_id: self.workspace_id.clone(),
+                answer_preparation: self.answer_preparation.take(),
+            },
+        };
+        let result = action(&mut storage);
+        self.answer_preparation = storage.workspace.answer_preparation;
+        result
+    }
+
+    fn connect(&self) -> Result<Connection, StorageError> {
+        let path = self.files.existing_database_path().map_err(|e| {
+            error(
+                "WRITE_FAILED",
+                "workspace",
+                None,
+                true,
+                "无法访问工作区状态库，请重新打开工作区",
+                e,
+            )
+        })?;
+        connect(path, false)
+    }
+}
+
+fn connect(path: &Path, create: bool) -> Result<Connection, StorageError> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    if create {
+        flags |= OpenFlags::SQLITE_OPEN_CREATE;
+    }
+    let connection =
+        Connection::open_with_flags(path, flags).map_err(|e| database_error("open", None, e))?;
+    connection
+        .execute_batch(
+            "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;",
+        )
+        .map_err(|e| database_error("open", None, e))?;
+    Ok(connection)
+}
+
+fn is_unc_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
 }
 
 impl Storage {
@@ -122,94 +165,86 @@ impl Storage {
         capture_dir: &Path,
         state_dir_name: &str,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(root, capture_dir, state_dir_name, None)
-    }
+        let open_error = |e| error("WRITE_FAILED", "workspace", None, true, "无法打开工作区", e);
+        let files = WorkspaceFiles::open(root, state_dir_name).map_err(open_error)?;
+        let capture_dir = files.capture_key(capture_dir).map_err(open_error)?;
+        let mut connection = connect(files.database_path(), true)?;
 
-    pub(crate) fn reopen(
-        root: &Path,
-        capture_dir: &Path,
-        state_dir_name: &str,
-        workspace_id: &str,
-        file_identity: &str,
-    ) -> Result<Self, StorageError> {
-        Self::open_inner(
-            root,
-            capture_dir,
-            state_dir_name,
-            Some((workspace_id, file_identity)),
-        )
-    }
-
-    fn open_inner(
-        root: &Path,
-        capture_dir: &Path,
-        state_dir_name: &str,
-        expected: Option<(&str, &str)>,
-    ) -> Result<Self, StorageError> {
-        let relative_capture = capture_directory(capture_dir)?;
-        let files =
-            WorkspaceFiles::open(root, capture_dir, state_dir_name, expected.map(|ids| ids.1))
-                .map_err(|e| error("WRITE_FAILED", "workspace", None, true, "无法打开工作区", e))?;
-        let connection = Connection::open_with_flags(
-            files.database_path(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|e| database_error("open", None, e))?;
-        connection
-            .execute_batch(
-                "PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;",
-            )
-            .map_err(|e| database_error("open", None, e))?;
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|e| database_error("migration", None, e))?;
+            .map_err(migration_error)?;
         let application_id: i64 = connection
             .pragma_query_value(None, "application_id", |row| row.get(0))
-            .map_err(|e| database_error("migration", None, e))?;
+            .map_err(migration_error)?;
+        let empty_schema = connection
+            .query_row("SELECT count(*) = 0 FROM sqlite_schema", [], |row| {
+                row.get::<_, bool>(0)
+            })
+            .map_err(migration_error)?;
+        let is_new = version == 0 && application_id == 0 && empty_schema;
+        let is_existing =
+            (1..=SCHEMA_VERSION).contains(&version) && application_id == APPLICATION_ID;
+        if !is_new && !is_existing {
+            return Err(error(
+                "CAPABILITY_UNSUPPORTED",
+                "migration",
+                None,
+                false,
+                "工作区状态库版本不受支持",
+                version,
+            ));
+        }
+
+        // Switch journal_mode before starting any write transaction (especially for WAL-on-SMB).
+        connection
+            .pragma_update(
+                None,
+                "journal_mode",
+                if is_unc_path(files.database_path()) {
+                    "DELETE"
+                } else {
+                    "WAL"
+                },
+            )
+            .map_err(|e| database_error("open", None, e))?;
+
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(migration_error)?;
+        let version: i64 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(migration_error)?;
+        let application_id: i64 = tx
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .map_err(migration_error)?;
         match version {
-            0 if application_id == 0 && expected.is_none() => {
-                let count: i64 = connection
-                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
-                    .map_err(|e| database_error("migration", None, e))?;
-                if count != 0 {
-                    return Err(error(
-                        "CAPABILITY_UNSUPPORTED",
-                        "migration",
-                        None,
-                        false,
-                        "状态库不是空库",
-                        "unrecognized SQLite schema",
-                    ));
-                }
-                connection
-                    .execute_batch(SCHEMA)
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .execute_batch(search::SCHEMA)
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .execute_batch(m2::SCHEMA)
-                    .and_then(|_| connection.execute_batch(m2_answer::SCHEMA))
-                    .and_then(|_| connection.execute_batch(wiki::SCHEMA))
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .execute(
-                        "INSERT INTO workspace_settings (key, value)
-                         VALUES ('capture_dir', ?1), ('id', lower(hex(randomblob(16))))",
-                        [&relative_capture],
-                    )
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .pragma_update(None, "application_id", APPLICATION_ID)
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .pragma_update(None, "user_version", SCHEMA_VERSION)
-                    .map_err(|e| database_error("migration", None, e))?;
-                connection
-                    .execute_batch("COMMIT;")
-                    .map_err(|e| database_error("migration", None, e))?;
+            0 if application_id == 0
+                && tx
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(migration_error)?
+                    == 0 =>
+            {
+                tx.execute_batch(SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(search::SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(m2::SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(wiki::SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(m2_answer::SCHEMA)
+                    .map_err(migration_error)?;
+                tx.pragma_update(None, "application_id", APPLICATION_ID)
+                    .map_err(migration_error)?;
+                tx.execute(
+                    "INSERT INTO workspace_settings VALUES ('id', lower(hex(randomblob(16))))",
+                    [],
+                )
+                .map_err(migration_error)?;
             }
-            1..=SCHEMA_VERSION if application_id == APPLICATION_ID => (),
+            1..=SCHEMA_VERSION if application_id == APPLICATION_ID => {
+                if version < SCHEMA_VERSION {
+                    migrate_workspace(&tx, version)?;
+                }
+            }
             _ => {
                 return Err(error(
                     "CAPABILITY_UNSUPPORTED",
@@ -221,152 +256,57 @@ impl Storage {
                 ));
             }
         }
-        let persisted_dir: String = connection
-            .query_row(
-                "SELECT value FROM workspace_settings WHERE key = 'capture_dir'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| database_error("open", None, e))?;
-        if expected.is_some() {
-            verify_capture_directory(&relative_capture, &persisted_dir)?;
+        if version < SCHEMA_VERSION {
+            tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
+            if version != 0 {
+                migrate_captures(&tx)?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(migration_error)?;
         }
-        let workspace_id = connection
+        tx.execute(
+            "INSERT INTO workspace_settings VALUES ('capture_dir', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value",
+            [&capture_dir],
+        )
+        .map_err(migration_error)?;
+        let workspace_id = tx
             .query_row(
                 "SELECT value FROM workspace_settings WHERE key = 'id'",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| database_error("open", None, e))?;
-        let mut storage = Self {
-            connection,
-            files: Arc::new(files),
-            search_build: Arc::default(),
-            capture_dir: relative_capture,
-            workspace_id,
-        };
-        if let Some((workspace_id, file_identity)) = expected {
-            storage.verify_identity(workspace_id, file_identity)?;
-        }
-        storage
-            .connection
-            .execute_batch("PRAGMA journal_mode = WAL;")
-            .map_err(|e| database_error("open", None, e))?;
-        if expected.is_none() && storage.capture_dir != persisted_dir {
-            storage
-                .connection
-                .execute(
-                    "UPDATE workspace_settings SET value = ?1 WHERE key = 'capture_dir'",
-                    [&storage.capture_dir],
-                )
-                .map_err(|e| database_error("open", None, e))?;
-        }
-        if version > 0 && version < SCHEMA_VERSION {
-            let tx = storage
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| database_error("migration", None, e))?;
-            if version == 1 {
-                tx.execute_batch(search::SCHEMA)
-                    .map_err(|e| database_error("migration", None, e))?;
-            } else if version < 4 {
-                tx.execute_batch(search::MIGRATE_V4)
-                    .map_err(|e| database_error("migration", None, e))?;
-            }
-            tx.execute_batch(m2::SCHEMA)
-                .and_then(|_| tx.execute_batch(m2_answer::SCHEMA))
-                .and_then(|_| tx.execute_batch(wiki::SCHEMA))
-                .map_err(|e| database_error("migration", None, e))?;
-            if version < 4 {
-                m2_answer::migrate_legacy_disagreements(&tx).map_err(|detail| {
-                    error(
-                        "WRITE_FAILED",
-                        "migration",
-                        None,
-                        false,
-                        "迁移分歧数据失败",
-                        detail,
-                    )
-                })?;
-            }
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .map_err(|e| database_error("migration", None, e))?;
-            tx.commit()
-                .map_err(|e| database_error("migration", None, e))?;
-        }
-        storage.connection.execute(
+            .map_err(migration_error)?;
+        tx.commit().map_err(migration_error)?;
+        connection.execute(
             "UPDATE jobs SET state='failed' WHERE state='running' AND id IN (SELECT id FROM m2_analyses)", [],
         ).map_err(|e| database_error("recover_analysis", None, e))?;
-        Ok(storage)
+        Ok(Self {
+            connection,
+            workspace: WorkspaceStorage {
+                files: Arc::new(files),
+                search_build: Arc::default(),
+                capture_dir,
+                workspace_id,
+                answer_preparation: None,
+            },
+        })
+    }
+
+    pub(crate) fn into_workspace(self) -> WorkspaceStorage {
+        self.workspace
     }
 
     pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
-    }
-
-    pub(crate) fn file_identity(&self) -> &str {
-        self.files.file_identity()
-    }
-
-    pub(crate) fn matches_root(&self, root: &Path) -> Result<bool, StorageError> {
-        self.files
-            .matches_root(root)
-            .map_err(|e| error("WRITE_FAILED", "workspace", None, true, "无法打开工作区", e))
+        &self.workspace.workspace_id
     }
 
     pub(crate) fn capture_dir(&self) -> &str {
-        &self.capture_dir
-    }
-
-    pub(crate) fn verify_capture_dir(&self, requested: &Path) -> Result<(), StorageError> {
-        verify_capture_directory(&capture_directory(requested)?, &self.capture_dir)
-    }
-
-    pub(crate) fn update_capture_dir(&mut self, requested: &Path) -> Result<(), StorageError> {
-        let relative = capture_directory(requested)?;
-        if relative == self.capture_dir {
-            return Ok(());
-        }
-        self.files.update_capture_dir(requested).map_err(|e| {
-            error(
-                "WRITE_FAILED",
-                "workspace",
-                None,
-                true,
-                "无法使用该保存目录",
-                e,
-            )
-        })?;
-        self.connection
-            .execute(
-                "UPDATE workspace_settings SET value = ?1 WHERE key = 'capture_dir'",
-                [&relative],
-            )
-            .map_err(|e| database_error("workspace", None, e))?;
-        self.capture_dir = relative;
-        Ok(())
+        &self.workspace.capture_dir
     }
 
     pub(crate) fn workspace_files(&self) -> Arc<WorkspaceFiles> {
-        self.files.clone()
-    }
-
-    pub(crate) fn verify_identity(
-        &self,
-        workspace_id: &str,
-        file_identity: &str,
-    ) -> Result<(), StorageError> {
-        if self.workspace_id() != workspace_id || self.file_identity() != file_identity {
-            return Err(error(
-                "VERSION_CONFLICT",
-                "workspace",
-                None,
-                false,
-                "工作区已变更，请重新选择",
-                "workspace identity differs from the saved selection",
-            ));
-        }
-        Ok(())
+        self.workspace.files.clone()
     }
 
     pub(crate) fn credential_reference(&self, key: &str) -> Result<Option<String>, StorageError> {
@@ -479,41 +419,33 @@ impl Storage {
             .unwrap_or((0, None)))
     }
 
-    pub(crate) fn current_draft_intent(
+    pub(crate) fn committed_draft(
         &self,
         draft_id: &str,
-    ) -> Result<Option<(String, String, bool)>, StorageError> {
+    ) -> Result<Option<(String, String)>, StorageError> {
         self.connection
             .query_row(
-                "SELECT i.request_id, i.relative_path, i.state = 'committed' FROM capture_intents i
-                 JOIN drafts d ON i.draft_id = d.id AND i.draft_revision = d.persisted_revision
-                 WHERE d.id = ?1 AND d.body IS NOT NULL
-                 ORDER BY (i.state = 'committed') DESC, i.rowid LIMIT 1",
+                "SELECT n.request_id, n.relative_path FROM notes n JOIN drafts d
+                ON n.draft_id = d.id AND n.draft_revision = d.persisted_revision
+             WHERE d.id = ?1 AND d.body IS NOT NULL ORDER BY n.rowid DESC LIMIT 1",
                 [draft_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| database_error("recovery", None, e))
+            .map_err(|e| database_error("draft_confirmation", None, e))
     }
 
     pub(crate) fn is_capture_path(&self, relative_path: &str) -> bool {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM capture_intents WHERE relative_path = ?1 AND state = 'committed')",
-                [relative_path],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
+        is_capture(&self.connection, relative_path)
     }
 
-    pub(crate) fn capture_file_names(&self) -> Result<Vec<String>, StorageError> {
-        let read_error = |error| database_error("capture_file_names", None, error);
-        let mut statement = self
+    pub(crate) fn capture_paths(&self) -> Result<Vec<String>, StorageError> {
+        let read_error = |error| database_error("capture_paths", None, error);
+        let mut q = self
             .connection
-            .prepare("SELECT file_name FROM capture_intents WHERE state = 'committed'")
+            .prepare("SELECT DISTINCT relative_path FROM notes")
             .map_err(read_error)?;
-        statement
-            .query_map([], |row| row.get(0))
+        q.query_map([], |row| row.get(0))
             .map_err(read_error)?
             .collect::<Result<_, _>>()
             .map_err(read_error)
@@ -521,41 +453,48 @@ impl Storage {
 
     pub(crate) fn list_recent_captures(&self) -> Result<Vec<RecentCapture>, StorageError> {
         let read_error = |error| database_error("recent_captures", None, error);
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT i.relative_path, r.captured_at, r.id, r.source_id, CAST(s.snapshot AS TEXT), i.revision
-                 FROM records r JOIN capture_intents i ON i.request_id = r.capture_request_id
-                 LEFT JOIN source_revisions s ON s.source_id = r.source_id AND s.revision = i.revision
-                 WHERE i.state = 'committed' AND r.lifecycle = 'active'
-                 ORDER BY r.captured_at DESC, i.rowid DESC LIMIT ?1",
-            )
-            .map_err(read_error)?;
+        let mut statement = self.connection.prepare(
+            "SELECT n.relative_path, n.captured_at, n.id, n.source_id, n.block_id, n.content_hash, CAST(s.snapshot AS TEXT)
+             FROM notes n LEFT JOIN source_revisions s ON n.block_id IS NULL
+                 AND s.source_id = n.source_id AND s.revision = n.content_hash
+             ORDER BY n.captured_at DESC, n.rowid DESC LIMIT ?1",
+        ).map_err(read_error)?;
         let mut rows = statement
             .query([RECENT_CAPTURE_LIMIT])
             .map_err(read_error)?;
+        let mut files = HashMap::new();
         let mut captures = Vec::new();
         while let Some(row) = rows.next().map_err(read_error)? {
-            let record_id: String = row.get(2).map_err(read_error)?;
-            let source_id: String = row.get(3).map_err(read_error)?;
-            let snapshot: String = row.get(4).map_err(read_error)?;
-            let body = snapshot
-                .strip_prefix(&capture_header(&record_id, &source_id))
-                .ok_or_else(|| {
-                    error(
-                        "WRITE_FAILED",
-                        "recent_captures",
-                        None,
-                        false,
-                        "捕获快照格式无效",
-                        "original snapshot lacks its capture header",
-                    )
-                })?;
+            let path: String = row.get(0).map_err(read_error)?;
+            let block_id: Option<String> = row.get(4).map_err(read_error)?;
+            let (body, revision) = if let Some(id) = &block_id {
+                let body = files.entry(path.clone()).or_insert_with(|| {
+                    self.workspace
+                        .files
+                        .read_markdown(&path)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                });
+                let Some(body) = body.as_deref().and_then(|text| block_body(text, id)) else {
+                    continue;
+                };
+                (body.to_owned(), revision_hash(body.as_bytes()))
+            } else {
+                let record: String = row.get(2).map_err(read_error)?;
+                let source: String = row.get(3).map_err(read_error)?;
+                let snapshot: Option<String> = row.get(6).map_err(read_error)?;
+                let Some(snapshot) = snapshot else { continue };
+                let body = snapshot
+                    .strip_prefix(&capture_header(&record, &source))
+                    .unwrap_or(&snapshot);
+                (body.to_owned(), row.get(5).map_err(read_error)?)
+            };
             captures.push((
-                row.get(0).map_err(read_error)?,
+                path,
                 row.get(1).map_err(read_error)?,
-                body.to_owned(),
-                row.get(5).map_err(read_error)?,
+                body,
+                revision,
+                block_id,
             ));
         }
         Ok(captures)
@@ -568,324 +507,284 @@ impl Storage {
         draft_revision: i64,
         body: &str,
     ) -> Result<SavedRecord, StorageError> {
-        if request_id.is_empty() || draft_id.is_empty() || draft_revision < 0 {
+        if request_id.is_empty()
+            || draft_id.is_empty()
+            || draft_revision < 0
+            || body.trim().is_empty()
+        {
             return Err(error(
                 "INVALID_INPUT",
-                "prepare",
+                "capture",
                 Some(request_id),
                 false,
-                "保存请求无效",
-                "empty ID or negative revision",
+                "保存请求或正文无效",
+                "invalid capture input",
             ));
         }
+        let db_error = |e| database_error("capture", Some(request_id), e);
+        let file_error = |e: io::Error| {
+            let changed = e.kind() == io::ErrorKind::AlreadyExists;
+            error(
+                if changed {
+                    "VERSION_CONFLICT"
+                } else {
+                    "WRITE_FAILED"
+                },
+                "capture",
+                Some(request_id),
+                true,
+                if changed {
+                    "每日文件已有新版本，请重试"
+                } else {
+                    "每日文件写入失败"
+                },
+                e,
+            )
+        };
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| database_error("prepare", Some(request_id), e))?;
-        let existing = read_intent(&tx, request_id)
-            .map_err(|e| database_error("prepare", Some(request_id), e))?;
+            .map_err(db_error)?;
         let body_hash = revision_hash(body.as_bytes());
-        if let Some(intent) = existing {
-            if intent.draft_id != draft_id
-                || intent.draft_revision != draft_revision
-                || intent.body_hash != body_hash
-            {
+        let existing = tx.query_row(
+            "SELECT id, source_id, content_hash, relative_path, saved_at, draft_id, draft_revision, body_hash
+             FROM notes WHERE request_id = ?1", [request_id], |row| {
+                Ok((SavedRecord {
+                    record_id: row.get(0)?, source_id: row.get(1)?, source_revision: row.get(2)?,
+                    relative_path: row.get(3)?, saved_at: row.get(4)?,
+                }, row.get::<_, String>(5)?, row.get::<_, i64>(6)?, row.get::<_, String>(7)?))
+            },
+        ).optional().map_err(db_error)?;
+        if let Some((saved, id, revision, hash)) = existing {
+            if id != draft_id || revision != draft_revision || hash != body_hash {
                 return Err(error(
                     "VERSION_CONFLICT",
-                    "prepare",
+                    "capture",
                     Some(request_id),
                     false,
                     "同一保存请求的内容不一致",
                     "request ID reused with different input",
                 ));
             }
+            return Ok(saved);
+        }
+        let persisted: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT persisted_revision, body FROM drafts WHERE id = ?1 AND body IS NOT NULL",
+                [draft_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if persisted.as_ref().map(|(rev, text)| (*rev, text.as_str()))
+            != Some((draft_revision, body))
+        {
+            return Err(error(
+                "VERSION_CONFLICT",
+                "capture",
+                Some(request_id),
+                false,
+                "请先保存当前草稿",
+                "persisted draft does not match capture",
+            ));
+        }
+
+        let (date, time, captured_at, saved_at): (String, String, String, String) = tx
+            .query_row(
+                "SELECT strftime('%Y-%m-%d', t, 'unixepoch', 'localtime'),
+                    strftime('%H:%M:%S', t, 'unixepoch', 'localtime'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', t, 'unixepoch'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             FROM (SELECT coalesce(?1 / 1000.0, unixepoch('subsec')) AS t)",
+                [request_time(request_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(db_error)?;
+        let filename = format!("{date}.md");
+        let relative_path = if self.workspace.capture_dir.is_empty() {
+            filename
         } else {
-            let persisted: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT persisted_revision, body FROM drafts WHERE id = ?1 AND body IS NOT NULL",
-                    [draft_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| database_error("prepare", Some(request_id), e))?;
-            if persisted
-                .as_ref()
-                .map(|(revision, text)| (*revision, text.as_str()))
-                != Some((draft_revision, body))
-            {
+            format!("{}/{filename}", self.workspace.capture_dir)
+        };
+        let (relative_path, path) = self
+            .workspace
+            .files
+            .markdown_target(&relative_path)
+            .map_err(file_error)?;
+        let before = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(file_error(e)),
+        };
+        let id = revision_hash(request_id.as_bytes());
+        let (record_id, marker) = (&id[..32], &id[..16]);
+        let block = body.trim_end_matches(['\r', '\n']);
+        let revision = revision_hash(block.as_bytes());
+        let mut after = before.clone().unwrap_or_else(|| format!("# {date}\n"));
+        let appended = match block_body(&after, marker) {
+            Some(existing) if existing == block => false,
+            Some(_) => {
                 return Err(error(
                     "VERSION_CONFLICT",
-                    "prepare",
+                    "capture",
                     Some(request_id),
                     false,
-                    "请先保存当前草稿",
-                    "persisted draft does not match capture",
+                    "该条记录已写入且原文已修改",
+                    "capture block changed on disk",
                 ));
             }
-            let (record_id, source_id): (String, String) = tx
-                .query_row(
-                    "SELECT lower(hex(randomblob(16))), lower(hex(randomblob(16)))",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|e| database_error("prepare", Some(request_id), e))?;
-            let file_name = format!("{record_id}.md");
-            let relative_path = if self.capture_dir.is_empty() {
-                file_name.clone()
-            } else {
-                format!("{}/{file_name}", self.capture_dir)
-            };
-            let mut snapshot = capture_header(&record_id, &source_id);
-            snapshot.push_str(body);
-            let bytes = snapshot.into_bytes();
-            let revision = revision_hash(&bytes);
-            tx.execute(
-                "INSERT INTO capture_intents (request_id, draft_id, draft_revision, body_hash, record_id, source_id, file_name, relative_path, file_bytes, revision, captured_at, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'prepared')",
-                params![request_id, draft_id, draft_revision, body_hash, record_id, source_id, file_name, relative_path, bytes, revision],
-            ).map_err(|e| database_error("prepare", Some(request_id), e))?;
-        }
-        tx.commit()
-            .map_err(|e| database_error("prepare", Some(request_id), e))?;
-        #[cfg(test)]
-        crash_at("prepared");
-        self.complete_intent(request_id)
-    }
-
-    pub fn recover_pending(&mut self) -> Result<Vec<RecoveryOutcome>, StorageError> {
-        let requests = {
-            let mut statement = self.connection.prepare("SELECT request_id FROM capture_intents WHERE state != 'committed' ORDER BY rowid")
-                .map_err(|e| database_error("recovery", None, e))?;
-            let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| database_error("recovery", None, e))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| database_error("recovery", None, e))?
+            None => {
+                let line_break = if newline(after.as_bytes()) == "crlf" {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                if !after.is_empty() {
+                    if !after.ends_with(line_break) {
+                        after.push_str(line_break);
+                    }
+                    if !after
+                        .strip_suffix(line_break)
+                        .is_some_and(|text| text.ends_with('\n'))
+                    {
+                        after.push_str(line_break);
+                    }
+                }
+                after.push_str(&format!(
+                    "## {time} <!-- fmd-note:{marker} -->{line_break}{line_break}{body}"
+                ));
+                after.push_str(line_break);
+                true
+            }
         };
-        Ok(requests
-            .into_iter()
-            .map(|request_id| {
-                let result = self.complete_intent(&request_id);
-                RecoveryOutcome { request_id, result }
-            })
-            .collect())
+        let title = block
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let title: String = title
+            .trim()
+            .trim_start_matches('#')
+            .trim()
+            .chars()
+            .take(120)
+            .collect();
+        let preview: String = block.chars().take(180).collect();
+        tx.execute(
+            "INSERT INTO notes (id, request_id, source_id, relative_path, block_id, captured_at, title, body_preview,
+                content_hash, draft_id, draft_revision, body_hash, saved_at, updated_at)
+             VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![record_id, request_id, relative_path, marker, captured_at, title, preview,
+                revision, draft_id, draft_revision, body_hash, saved_at],
+        ).map_err(db_error)?;
+        search::upsert_document(
+            &tx,
+            &relative_path,
+            Some(&captured_at),
+            &revision_hash(after.as_bytes()),
+            &after,
+        )
+        .map_err(db_error)?;
+        if appended {
+            replace_markdown(
+                &path,
+                before.as_deref().map(str::as_bytes),
+                after.as_bytes(),
+            )
+            .map_err(file_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(SavedRecord {
+            record_id: record_id.into(),
+            source_id: record_id.into(),
+            source_revision: revision,
+            relative_path,
+            saved_at,
+        })
     }
 
     pub fn clear_committed_draft(&mut self, request_id: &str) -> Result<bool, StorageError> {
         let count = self
             .connection
             .execute(
-                "UPDATE drafts SET body = NULL WHERE body IS NOT NULL AND EXISTS
-             (SELECT 1 FROM capture_intents i WHERE i.request_id = ?1 AND i.state = 'committed'
-              AND i.draft_id = drafts.id AND i.draft_revision = drafts.persisted_revision)",
+                "UPDATE drafts SET body = NULL WHERE body IS NOT NULL AND EXISTS (
+                SELECT 1 FROM notes n WHERE n.request_id = ?1 AND n.draft_id = drafts.id
+                AND n.draft_revision = drafts.persisted_revision)",
                 [request_id],
             )
             .map_err(|e| database_error("draft_confirmation", Some(request_id), e))?;
         Ok(count == 1)
     }
+}
 
-    fn complete_intent(&mut self, request_id: &str) -> Result<SavedRecord, StorageError> {
-        let intent = read_intent(&self.connection, request_id)
-            .map_err(|e| database_error("recovery", Some(request_id), e))?
-            .ok_or_else(|| {
-                error(
-                    "INVALID_INPUT",
-                    "recovery",
-                    Some(request_id),
-                    false,
-                    "保存请求不存在",
-                    "capture intent missing",
-                )
-            })?;
-        if intent.state == "committed" {
-            return Ok(saved_record(&intent));
-        }
-        let bytes = intent
-            .bytes
-            .as_deref()
-            .filter(|bytes| revision_hash(bytes) == intent.revision)
-            .ok_or_else(|| {
-                error(
-                    "VERSION_CONFLICT",
-                    "recovery",
-                    Some(request_id),
-                    false,
-                    "恢复内容与保存版本不一致",
-                    "capture intent bytes do not match the recorded revision",
-                )
-            })?;
-        let file = match self.files.publish_record(&intent.relative_path, bytes) {
-            Ok(file) => file,
-            Err(e) => {
-                let conflict = e.kind() == io::ErrorKind::AlreadyExists;
-                let detail = match self.connection.execute(
-                    "UPDATE capture_intents SET state = ?2 WHERE request_id = ?1",
-                    params![request_id, if conflict { "conflict" } else { "failed" }],
-                ) {
-                    Ok(_) => e.to_string(),
-                    Err(database_error) => {
-                        format!("{e}. Failed to record status: {database_error}")
-                    }
-                };
-                return Err(error(
-                    if conflict {
-                        "VERSION_CONFLICT"
-                    } else {
-                        "WRITE_FAILED"
-                    },
-                    "publish",
-                    Some(request_id),
-                    !conflict,
-                    if conflict {
-                        "目标文件与保存请求冲突"
-                    } else {
-                        "记录文件写入失败"
-                    },
-                    detail,
-                ));
+fn request_time(id: &str) -> Option<i64> {
+    let (stamp, _) = id.split_once('-')?;
+    if stamp.len() == 13 {
+        stamp.parse().ok()
+    } else {
+        None
+    }
+}
+
+pub(crate) fn physical_path(path: &str) -> &str {
+    path.split_once(NOTE_ANCHOR).map_or(path, |(path, _)| path)
+}
+
+fn is_capture(conn: &Connection, path: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE relative_path = ?1)",
+        [physical_path(path)],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn block_body<'a>(text: &'a str, id: &str) -> Option<&'a str> {
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let plain = line.trim_end_matches(['\r', '\n']);
+        if let Some((time, marker)) = plain
+            .strip_prefix("## ")
+            .and_then(|line| line.split_once(" <!-- fmd-note:"))
+            && time.len() == 8
+            && let Some(marker) = marker.strip_suffix(" -->")
+            && (8..=16).contains(&marker.len())
+            && marker.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            if let Some(start) = start {
+                return Some(text[start..offset].trim_end_matches(['\r', '\n']));
             }
-        };
-        #[cfg(test)]
-        crash_at("published");
-        self.connection
-            .execute(
-                "UPDATE capture_intents SET state = 'file_written' WHERE request_id = ?1",
-                [request_id],
-            )
-            .map_err(|e| database_error("file_written", Some(request_id), e))?;
-        #[cfg(test)]
-        crash_at("file_written");
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| database_error("commit", Some(request_id), e))?;
-        let saved_at: String = tx
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.execute("INSERT INTO sources (id, location, current_revision, availability) VALUES (?1, ?2, ?3, 'available')",
-            params![intent.source_id, intent.relative_path, intent.revision]).map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.execute("INSERT INTO source_revisions (source_id, revision, observed_at, snapshot, encoding, newline) VALUES (?1, ?2, ?3, ?4, 'utf-8', ?5)",
-            params![intent.source_id, intent.revision, saved_at, bytes, newline(bytes)])
-            .map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.execute("INSERT INTO records (id, capture_request_id, source_id, kind, captured_at, lifecycle, origin) VALUES (?1, ?2, ?3, 'note', ?4, 'active', 'fresh_capture')",
-            params![intent.record_id, request_id, intent.source_id, intent.captured_at]).map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.execute(
-            "INSERT INTO jobs (id, operation_key, kind, source_id, source_revision, state, attempts, deletion_epoch)
-             VALUES (lower(hex(randomblob(16))), ?1, 'index', ?2, ?3, 'queued', 0, 0)",
-            params![
-                format!("{}:{}:index", intent.source_id, intent.revision),
-                intent.source_id,
-                intent.revision
-            ],
-        )
-        .map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.execute(
-            "UPDATE capture_intents SET state = 'committed', saved_at = ?2, file_bytes = NULL WHERE request_id = ?1",
-            params![request_id, saved_at],
-        )
-        .map_err(|e| database_error("commit", Some(request_id), e))?;
-        tx.commit()
-            .map_err(|e| database_error("commit", Some(request_id), e))?;
-        #[cfg(test)]
-        crash_at("committed");
-        drop(file);
-        Ok(SavedRecord {
-            record_id: intent.record_id,
-            source_id: intent.source_id,
-            source_revision: intent.revision,
-            relative_path: intent.relative_path,
-            saved_at,
-        })
+            if marker == id {
+                let content = offset + line.len();
+                let remainder = &text[content..];
+                start = Some(
+                    content
+                        + if remainder.starts_with("\r\n") {
+                            2
+                        } else {
+                            usize::from(remainder.starts_with('\n'))
+                        },
+                );
+            }
+        }
+        offset += line.len();
+    }
+    start.map(|start| text[start..].trim_end_matches(['\r', '\n']))
+}
+
+fn read_source_bytes(files: &WorkspaceFiles, path: &str) -> io::Result<Vec<u8>> {
+    if let Some((path, marker)) = path.split_once(NOTE_ANCHOR) {
+        let text = String::from_utf8(files.read_markdown(path)?).map_err(io::Error::other)?;
+        let body = block_body(&text, marker)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "capture block is missing"))?;
+        Ok(body.as_bytes().to_vec())
+    } else {
+        files.read_markdown(path)
     }
 }
 
 fn capture_header(record_id: &str, source_id: &str) -> String {
     format!("---\nrecord_id: {record_id}\nsource_id: {source_id}\n---\n")
-}
-
-fn saved_record(intent: &Intent) -> SavedRecord {
-    SavedRecord {
-        record_id: intent.record_id.clone(),
-        source_id: intent.source_id.clone(),
-        source_revision: intent.revision.clone(),
-        relative_path: intent.relative_path.clone(),
-        saved_at: intent
-            .saved_at
-            .clone()
-            .expect("committed intent has saved_at"),
-    }
-}
-
-fn read_intent(connection: &Connection, request_id: &str) -> rusqlite::Result<Option<Intent>> {
-    connection.query_row("SELECT draft_id, draft_revision, body_hash, record_id, source_id, file_name, relative_path, file_bytes, revision, captured_at, state, saved_at
-        FROM capture_intents WHERE request_id = ?1", [request_id], |row| Ok(Intent {
-        draft_id: row.get(0)?, draft_revision: row.get(1)?, body_hash: row.get(2)?,
-        record_id: row.get(3)?, source_id: row.get(4)?, file_name: row.get(5)?, relative_path: row.get(6)?,
-        bytes: row.get(7)?, revision: row.get(8)?, captured_at: row.get(9)?, state: row.get(10)?, saved_at: row.get(11)?,
-    })).optional()
-}
-
-fn capture_directory(path: &Path) -> Result<String, StorageError> {
-    if path.as_os_str().is_empty() {
-        return Err(error(
-            "INVALID_INPUT",
-            "open",
-            None,
-            false,
-            "请选择保存目录",
-            "capture path is empty",
-        ));
-    }
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => (),
-            std::path::Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
-                error(
-                    "INVALID_INPUT",
-                    "open",
-                    None,
-                    false,
-                    "保存目录无法保存",
-                    "capture path is not UTF-8",
-                )
-            })?),
-            _ => {
-                return Err(error(
-                    "OUT_OF_SCOPE",
-                    "open",
-                    None,
-                    false,
-                    "保存目录必须位于工作区内",
-                    "capture directory is not a relative path",
-                ));
-            }
-        }
-    }
-    Ok(parts.join("/"))
-}
-
-fn verify_capture_directory(requested: &str, persisted: &str) -> Result<(), StorageError> {
-    if requested != persisted {
-        return Err(error(
-            "VERSION_CONFLICT",
-            "open",
-            None,
-            false,
-            "保存目录与现有工作区不一致",
-            "capture directory differs from persisted setting",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn crash_at(stage: &str) {
-    if std::env::var("FLASH_STORAGE_TEST_CRASH").as_deref() == Ok(stage) {
-        std::process::exit(86);
-    }
 }
 
 fn newline(bytes: &[u8]) -> &'static str {
@@ -908,24 +807,122 @@ fn revision_hash(bytes: &[u8]) -> String {
 }
 
 const APPLICATION_ID: i64 = i64::from_be_bytes(*b"\0\0\0\0FMD1");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = "
-BEGIN IMMEDIATE;
 CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE drafts (id TEXT PRIMARY KEY, body TEXT, edit_revision INTEGER NOT NULL CHECK(edit_revision >= 0), persisted_revision INTEGER NOT NULL CHECK(persisted_revision = edit_revision), updated_at TEXT NOT NULL);
-CREATE TABLE capture_intents (request_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, draft_revision INTEGER NOT NULL, body_hash TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL UNIQUE, file_name TEXT NOT NULL UNIQUE, relative_path TEXT NOT NULL UNIQUE, file_bytes BLOB, revision TEXT NOT NULL, captured_at TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','file_written','committed','failed','conflict')), saved_at TEXT, CHECK((state = 'committed') = (saved_at IS NOT NULL)), CHECK((state = 'committed') = (file_bytes IS NULL)));
 CREATE TABLE sources (id TEXT PRIMARY KEY, location TEXT NOT NULL UNIQUE, current_revision TEXT NOT NULL, availability TEXT NOT NULL);
 CREATE TABLE source_revisions (source_id TEXT NOT NULL REFERENCES sources(id), revision TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot BLOB NOT NULL, encoding TEXT NOT NULL, newline TEXT NOT NULL, PRIMARY KEY(source_id, revision));
-CREATE TABLE records (id TEXT PRIMARY KEY, capture_request_id TEXT NOT NULL UNIQUE REFERENCES capture_intents(request_id), source_id TEXT NOT NULL UNIQUE REFERENCES sources(id), kind TEXT NOT NULL, captured_at TEXT NOT NULL, lifecycle TEXT NOT NULL, origin TEXT NOT NULL);
 CREATE TABLE jobs (id TEXT PRIMARY KEY, operation_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, source_id TEXT NOT NULL, source_revision TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, deletion_epoch INTEGER NOT NULL, FOREIGN KEY(source_id, source_revision) REFERENCES source_revisions(source_id, revision));";
+const NOTES_SCHEMA: &str = "
+CREATE TABLE notes (
+    id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL, block_id TEXT, captured_at TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '', body_preview TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
+    organize_status TEXT NOT NULL DEFAULT 'pending', organize_json TEXT,
+    ov_resource_status TEXT NOT NULL DEFAULT 'pending', ov_resource_uri TEXT,
+    ov_memory_status TEXT NOT NULL DEFAULT 'pending', ov_task_id TEXT,
+    draft_id TEXT NOT NULL, draft_revision INTEGER NOT NULL, body_hash TEXT NOT NULL,
+    saved_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX notes_file_block ON notes(relative_path, block_id);
+CREATE INDEX notes_recent ON notes(captured_at);
+CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE chat_messages (
+    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL, content TEXT NOT NULL, citations_json TEXT, conflict_ids_json TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE background_jobs (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id),
+    payload_json TEXT, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL
+);";
+
+fn migration_error(detail: rusqlite::Error) -> StorageError {
+    database_error("migration", None, detail)
+}
+
+fn table_exists(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+}
+
+fn migrate_workspace(tx: &Connection, version: i64) -> Result<(), StorageError> {
+    if version == 1 {
+        tx.execute_batch(search::SCHEMA).map_err(migration_error)?;
+    } else if version < 4 {
+        tx.execute_batch(search::MIGRATE_V4)
+            .map_err(migration_error)?;
+    }
+    tx.execute_batch(m2::SCHEMA).map_err(migration_error)?;
+    if table_exists(tx, "wiki_changes").map_err(migration_error)? {
+        tx.execute_batch("ALTER TABLE wiki_changes RENAME TO wiki_suggestions;")
+            .map_err(migration_error)?;
+    }
+    tx.execute_batch(wiki::SCHEMA).map_err(migration_error)?;
+    tx.execute_batch("UPDATE wiki_suggestions SET phase = 'pending' WHERE phase = 'prepared';")
+        .map_err(migration_error)?;
+    if table_exists(tx, "m2_model").map_err(migration_error)? {
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO workspace_settings (key, value)
+             SELECT 'model_config', json_object('endpoint', endpoint, 'model', model,
+                    'enabled', json(CASE WHEN enabled THEN 'true' ELSE 'false' END))
+             FROM m2_model WHERE id = 1;
+             DROP TABLE m2_model;",
+        )
+        .map_err(migration_error)?;
+    }
+    tx.execute_batch("DROP TABLE IF EXISTS m2_preparations;")
+        .map_err(migration_error)?;
+    m2_answer::migrate_conflicts(tx).map_err(migration_error)?;
+    Ok(())
+}
+
+fn migrate_captures(tx: &Connection) -> Result<(), StorageError> {
+    if !table_exists(tx, "capture_intents").map_err(migration_error)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "INSERT INTO notes (id, request_id, source_id, relative_path, captured_at, content_hash,
+            draft_id, draft_revision, body_hash, saved_at, updated_at)
+         SELECT r.id, r.capture_request_id, r.source_id, i.relative_path, r.captured_at, i.revision,
+            i.draft_id, i.draft_revision, i.body_hash, i.saved_at, i.saved_at
+         FROM records r JOIN capture_intents i ON r.capture_request_id = i.request_id
+         WHERE i.state = 'committed' AND r.lifecycle = 'active' ORDER BY i.rowid;
+         WITH unfinished AS (
+            SELECT draft_id, draft_revision, body_hash,
+                CAST(substr(file_bytes, length(CAST(
+                    '---' || char(10) || 'record_id: ' || record_id || char(10)
+                    || 'source_id: ' || source_id || char(10) || '---' || char(10) AS BLOB)) + 1) AS TEXT) AS body
+            FROM capture_intents WHERE state <> 'committed' AND file_bytes IS NOT NULL ORDER BY rowid
+         )
+         INSERT INTO drafts (id, body, edit_revision, persisted_revision, updated_at)
+         SELECT draft_id, group_concat(body, char(10,10)), max(draft_revision) + 1, max(draft_revision) + 1,
+             strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         FROM unfinished u
+         WHERE NOT EXISTS(SELECT 1 FROM drafts d WHERE d.id = u.draft_id AND d.body = u.body)
+           AND NOT EXISTS(SELECT 1 FROM notes n WHERE n.draft_id = u.draft_id
+                AND n.draft_revision = u.draft_revision AND n.body_hash = u.body_hash)
+         GROUP BY draft_id
+         ON CONFLICT(id) DO UPDATE SET
+            body = CASE WHEN drafts.body IS NULL THEN excluded.body ELSE
+                drafts.body || char(10,10) || '## 从旧版恢复的未完成记录' || char(10,10) || excluded.body END,
+            edit_revision = max(drafts.edit_revision + 1, excluded.edit_revision),
+            persisted_revision = max(drafts.edit_revision + 1, excluded.edit_revision),
+            updated_at = excluded.updated_at;
+         DROP TABLE records;
+         DROP TABLE capture_intents;",
+    )
+    .map_err(migration_error)
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::fs;
-    use std::os::windows::fs::OpenOptionsExt;
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -960,314 +957,259 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn crash_child() {
-        let Some(root) = std::env::var_os("FLASH_STORAGE_TEST_ROOT") else {
-            return;
-        };
-        let mut storage = Storage::open(Path::new(&root), Path::new("."), ".flash-test").unwrap();
-        storage.save_draft("draft", 1, "正文\r\n原样保留").unwrap();
-        storage
-            .save_record("request", "draft", 1, "正文\r\n原样保留")
-            .unwrap();
-        panic!("crash point was not reached");
-    }
-
-    fn crash_save(root: &Path, stage: &str) {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "storage::tests::crash_child", "--nocapture"])
-            .env("FLASH_STORAGE_TEST_ROOT", root)
-            .env("FLASH_STORAGE_TEST_CRASH", stage)
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(86));
-    }
-
-    #[test]
-    fn recovers_after_process_exit_at_each_boundary() {
-        for stage in ["prepared", "published", "file_written", "committed"] {
-            let dir = TestDir::new();
-            crash_save(&dir.0, stage);
-            let mut storage = dir.open();
-            let outcomes = storage.recover_pending().unwrap();
-            if stage == "committed" {
-                assert!(outcomes.is_empty());
-            } else {
-                assert_eq!(outcomes.len(), 1);
-                assert!(outcomes.into_iter().next().unwrap().result.is_ok());
-            }
-            let saved = storage
-                .save_record("request", "draft", 1, "正文\r\n原样保留")
-                .unwrap();
-            assert_eq!(
-                saved,
-                storage
-                    .save_record("request", "draft", 1, "正文\r\n原样保留")
-                    .unwrap()
-            );
-            let bytes = fs::read(dir.0.join(&saved.relative_path)).unwrap();
-            assert!(bytes.ends_with("正文\r\n原样保留".as_bytes()));
-            assert_eq!(saved.source_revision, revision_hash(&bytes));
-            let records: i64 = storage
-                .connection
-                .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
-                .unwrap();
-            let jobs: i64 = storage
-                .connection
-                .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!((records, jobs), (1, 1));
-            assert!(storage.load_draft("draft").unwrap().is_some());
-        }
-    }
-
-    #[test]
-    fn same_body_with_distinct_requests_creates_distinct_records() {
+    fn daily_notes_append_personal_text_and_deduplicate_requests() {
         let dir = TestDir::new();
         let mut storage = dir.open();
-        storage.save_draft("draft", 1, "相同正文").unwrap();
-        let first = storage.save_record("one", "draft", 1, "相同正文").unwrap();
-        let second = storage.save_record("two", "draft", 1, "相同正文").unwrap();
-        assert_ne!(first.record_id, second.record_id);
-        assert_ne!(first.relative_path, second.relative_path);
+        let today: String = storage
+            .connection
+            .query_row("SELECT date('now','localtime')", [], |row| row.get(0))
+            .unwrap();
+        let file = dir.0.join(format!("{today}.md"));
+        fs::write(&file, "手工记录\r\n保留原文").unwrap();
+
+        storage
+            .save_draft("draft", 1, "第一条记录\r\n保留换行")
+            .unwrap();
+        let first = storage
+            .save_record("first", "draft", 1, "第一条记录\r\n保留换行")
+            .unwrap();
         assert_eq!(
             storage
-                .save_record("one", "draft", 1, "其他正文")
+                .save_record("first", "draft", 1, "第一条记录\r\n保留换行")
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            storage
+                .save_record("first", "draft", 1, "不同正文")
                 .unwrap_err()
                 .code,
             "VERSION_CONFLICT"
         );
-    }
+        storage.save_draft("draft", 2, "第二条记录").unwrap();
+        let second = storage
+            .save_record("second", "draft", 2, "第二条记录")
+            .unwrap();
+        assert_eq!(first.relative_path, second.relative_path);
+        let disk = fs::read_to_string(&file).unwrap();
+        assert!(disk.starts_with("手工记录\r\n保留原文"));
+        assert_eq!(disk.matches("<!-- fmd-note:").count(), 2);
 
-    #[test]
-    fn recent_captures_return_bounded_original_snapshots_in_capture_order() {
-        let dir = TestDir::new();
-        let mut storage = dir.open();
-        assert!(storage.list_recent_captures().unwrap().is_empty());
-        let captured_at = "2026-11-18T00:00:00.000Z";
-        let mut expected = Vec::new();
-        for revision in 1..=RECENT_CAPTURE_LIMIT {
-            let body = format!("记录 {revision}");
-            storage.save_draft("draft", revision, &body).unwrap();
-            let saved = storage
-                .save_record(&format!("capture-{revision}"), "draft", revision, &body)
-                .unwrap();
-            expected.push((
-                saved.relative_path,
-                captured_at.to_owned(),
-                body,
-                saved.source_revision,
-            ));
-        }
-        let latest_revision = RECENT_CAPTURE_LIMIT + 1;
-        let latest_body = "---\r\n标题: 笔记\r\n---\r\n记录正文";
-        storage
-            .save_draft("draft", latest_revision, latest_body)
-            .unwrap();
-        let latest = storage
-            .save_record("latest", "draft", latest_revision, latest_body)
-            .unwrap();
-        storage
-            .connection
-            .execute("UPDATE records SET captured_at = ?1", [captured_at])
-            .unwrap();
-        fs::write(dir.0.join(&latest.relative_path), "后续修改").unwrap();
-        storage.connection.execute(
-            "INSERT INTO source_revisions (source_id, revision, observed_at, snapshot, encoding, newline)
-             VALUES (?1, 'later-edit', ?2, ?3, 'utf-8', 'lf')",
-            params![latest.source_id, captured_at, "后续修改".as_bytes()],
-        ).unwrap();
-        storage
-            .connection
-            .execute(
-                "UPDATE sources SET current_revision = 'later-edit' WHERE id = ?1",
-                [&latest.source_id],
-            )
-            .unwrap();
-
-        expected.push((
-            latest.relative_path,
-            captured_at.to_owned(),
-            latest_body.to_owned(),
-            latest.source_revision,
-        ));
-        expected.reverse();
-        expected.pop();
-        assert_eq!(storage.list_recent_captures().unwrap(), expected);
-    }
-
-    #[test]
-    fn stale_drafts_and_confirmation_do_not_remove_newer_edits() {
-        let dir = TestDir::new();
-        let mut storage = dir.open();
-        storage.save_draft("draft", 1, "旧").unwrap();
-        storage.save_record("one", "draft", 1, "旧").unwrap();
-        storage.save_draft("draft", 2, "新").unwrap();
+        let captures = storage.list_recent_captures().unwrap();
         assert_eq!(
-            storage.save_draft("draft", 1, "旧").unwrap_err().code,
-            "VERSION_CONFLICT"
+            (captures[0].2.as_str(), captures[1].2.as_str()),
+            ("第二条记录", "第一条记录\r\n保留换行")
+        );
+        let first_locator = format!(
+            "{}{NOTE_ANCHOR}{}",
+            first.relative_path,
+            captures[1].4.as_deref().unwrap()
+        );
+        let mut search = storage.search_reader().unwrap();
+        assert_eq!(
+            search
+                .read_record_source(&first_locator, &first.source_revision)
+                .unwrap()
+                .2,
+            "第一条记录\r\n保留换行"
         );
         assert_eq!(
-            storage.save_draft("draft", 2, "不同").unwrap_err().code,
-            "VERSION_CONFLICT"
+            search
+                .search_records("第二条记录", None, None, 0)
+                .unwrap()
+                .0[0]
+                .0,
+            second.relative_path
         );
-        assert!(!storage.clear_committed_draft("one").unwrap());
-        assert_eq!(storage.load_draft("draft").unwrap().unwrap().body, "新");
-        storage.save_record("two", "draft", 2, "新").unwrap();
-        assert!(storage.clear_committed_draft("two").unwrap());
+        assert!(!storage.clear_committed_draft("first").unwrap());
+        assert!(storage.clear_committed_draft("second").unwrap());
         assert!(storage.load_draft("draft").unwrap().is_none());
-        assert_eq!(
-            storage.save_draft("draft", 1, "旧").unwrap_err().code,
-            "VERSION_CONFLICT"
-        );
-        assert_eq!(
-            storage.save_draft("draft", 2, "新").unwrap_err().code,
-            "VERSION_CONFLICT"
-        );
-        assert!(storage.load_draft("draft").unwrap().is_none());
-        assert_eq!(storage.save_draft("draft", 3, "更新").unwrap(), 3);
     }
 
     #[test]
-    fn conflict_preserves_file_and_draft_until_resolved() {
+    fn failed_daily_write_preserves_the_draft_and_can_retry() {
         let dir = TestDir::new();
-        crash_save(&dir.0, "prepared");
         let mut storage = dir.open();
-        let name: String = storage
+        let today: String = storage
             .connection
-            .query_row(
-                "SELECT file_name FROM capture_intents WHERE request_id = 'request'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT date('now','localtime')", [], |row| row.get(0))
             .unwrap();
-        let path = dir.0.join(name);
-        fs::write(&path, b"other file").unwrap();
-        let outcome = storage.recover_pending().unwrap().pop().unwrap();
-        assert_eq!(outcome.result.unwrap_err().code, "VERSION_CONFLICT");
-        assert_eq!(fs::read(&path).unwrap(), b"other file");
-        assert!(storage.load_draft("draft").unwrap().is_some());
-        fs::remove_file(path).unwrap();
+        let blocked = dir.0.join(format!("{today}.md"));
+        fs::create_dir(&blocked).unwrap();
+        storage.save_draft("draft", 1, "待重试版本").unwrap();
         assert!(
             storage
-                .recover_pending()
-                .unwrap()
-                .pop()
-                .unwrap()
-                .result
-                .is_ok()
+                .save_record("retry", "draft", 1, "待重试版本")
+                .is_err()
+        );
+        assert_eq!(
+            storage.load_draft("draft").unwrap().unwrap().body,
+            "待重试版本"
+        );
+        fs::remove_dir(blocked).unwrap();
+        let result = storage
+            .save_record("retry", "draft", 1, "待重试版本")
+            .unwrap();
+        assert_eq!(storage.list_recent_captures().unwrap().len(), 1);
+        assert_eq!(
+            storage.committed_draft("draft").unwrap(),
+            Some(("retry".into(), result.relative_path))
         );
     }
 
     #[test]
-    fn updates_capture_directory_and_rejects_unrecognized_database() {
+    fn workspace_can_move_and_reopen_with_a_different_save_directory() {
         let dir = TestDir::new();
-        fs::create_dir(dir.0.join("other")).unwrap();
-        {
-            let mut first = dir.open();
-            first.save_draft("draft", 1, "旧目录笔记").unwrap();
-            let saved = first
-                .save_record("first", "draft", 1, "旧目录笔记")
-                .unwrap();
-            assert!(!saved.relative_path.contains('/'));
-        }
-        let mut updated = Storage::open(&dir.0, Path::new("other"), ".flash-test").unwrap();
-        assert_eq!(updated.capture_dir(), "other");
-        updated.save_draft("draft", 2, "新目录笔记").unwrap();
-        let next = updated
-            .save_record("second", "draft", 2, "新目录笔记")
-            .unwrap();
-        assert!(next.relative_path.starts_with("other/"));
-        assert!(dir.0.join(&next.relative_path).is_file());
-        assert!(updated.update_capture_dir(Path::new("missing")).is_err());
-        assert_eq!(updated.capture_dir(), "other");
-        drop(updated);
+        let parent = dir.0.join("before");
+        let root = parent.join("notes");
+        fs::create_dir_all(root.join("journal")).unwrap();
+        let mut storage = Storage::open(&root, Path::new("."), ".flash-test").unwrap();
+        storage.save_draft("draft", 1, "迁移中").unwrap();
+        let id = storage.workspace_id().to_owned();
+        let _idle_workspace = storage.into_workspace();
+        let moved = dir.0.join("after");
+        fs::rename(&parent, &moved).unwrap();
 
-        let other = TestDir::new();
-        fs::create_dir(other.0.join(".flash-test")).unwrap();
-        let db = Connection::open(other.0.join(".flash-test").join("state.sqlite")).unwrap();
-        db.execute("CREATE TABLE unrelated (value TEXT)", [])
+        let storage =
+            Storage::open(&moved.join("notes"), Path::new("journal"), ".flash-test").unwrap();
+        assert_eq!(storage.workspace_id(), id);
+        assert_eq!(storage.capture_dir(), "journal");
+        assert_eq!(storage.load_draft("draft").unwrap().unwrap().body, "迁移中");
+    }
+
+    #[test]
+    fn migrates_v4_capture_and_model_data_without_rewriting_markdown() {
+        let dir = TestDir::new();
+        let state = dir.0.join(".flash-test");
+        fs::create_dir(&state).unwrap();
+        let db = Connection::open(state.join("state.sqlite")).unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute_batch(search::SCHEMA).unwrap();
+        db.pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute_batch(
+            "INSERT INTO workspace_settings VALUES ('id', 'old-workspace'), ('credential:model', 'reference-only');
+             INSERT INTO drafts VALUES ('quick-entry', '未提交草稿', 2, 2, '2026-11-24T06:00:00.000Z');
+             CREATE TABLE capture_intents (
+                request_id TEXT PRIMARY KEY, draft_id TEXT, draft_revision INTEGER, body_hash TEXT,
+                relative_path TEXT, revision TEXT, state TEXT, saved_at TEXT,
+                record_id TEXT, source_id TEXT, file_bytes BLOB
+             );
+             CREATE TABLE records (id TEXT, capture_request_id TEXT REFERENCES capture_intents(request_id),
+                source_id TEXT, captured_at TEXT, lifecycle TEXT);
+             CREATE TABLE m2_model (id INTEGER PRIMARY KEY, endpoint TEXT, model TEXT, enabled INTEGER);
+             INSERT INTO m2_model VALUES (1, 'https://example.test/v1/chat/completions', 'fixture', 1);
+             CREATE TABLE m2_preparations (id TEXT, data TEXT);
+             CREATE TABLE disagreements (id TEXT PRIMARY KEY, question TEXT, relation TEXT, status TEXT, judgment TEXT, reason TEXT);
+             CREATE TABLE disagreement_members (disagreement_id TEXT, member_order INTEGER, claim_id TEXT,
+                member_text TEXT, evidence_json TEXT);
+             CREATE TABLE disagreement_history (id INTEGER PRIMARY KEY, disagreement_id TEXT,
+                recorded_at TEXT, actor TEXT, status TEXT, judgment TEXT, reason TEXT);
+             INSERT INTO disagreements VALUES ('old-conflict','旧分歧','historical','decided','我选择保留','来自两条记录');
+             INSERT INTO disagreement_members VALUES ('old-conflict',0,'a','旧观点A','{\"id\":\"a\",\"path\":\"old.md\",\"revision\":\"old\"}'),
+                                                       ('old-conflict',1,'b','旧观点B','{\"id\":\"b\",\"path\":\"old.md\",\"revision\":\"old\"}');
+             INSERT INTO disagreement_history VALUES (1,'old-conflict','2026-11-24T06:00:00.000Z','user','decided','我选择保留','来自两条记录');",
+        ).unwrap();
+        let body = "一记一文档旧记录";
+        let original = format!("{}{body}", capture_header("record", "source"));
+        let revision = revision_hash(original.as_bytes());
+        let date = "2026-11-24T05:00:00.000Z";
+        fs::write(dir.0.join("old.md"), &original).unwrap();
+        db.execute("INSERT INTO capture_intents VALUES ('old-request','quick-entry',1,?1,'old.md',?2,'committed',?3,'record','source',NULL)",
+            params![revision_hash(body.as_bytes()), revision, date]).unwrap();
+        db.execute("INSERT INTO capture_intents VALUES ('old-pending','quick-entry',1,'pending','pending.md','old','failed',NULL,'pending-record','pending-source',?1)",
+            [format!("{}失败前只存在于旧保存请求的草稿", capture_header("pending-record", "pending-source")).into_bytes()]).unwrap();
+        db.execute(
+            "INSERT INTO records VALUES ('record','old-request','source',?1,'active')",
+            [date],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sources VALUES ('source','old.md',?1,'available')",
+            [&revision],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO source_revisions VALUES ('source',?1,?2,?3,'utf-8','lf')",
+            params![revision, date, original.as_bytes()],
+        )
+        .unwrap();
+        search::upsert_document(&db, "old.md", Some(date), &revision, body).unwrap();
+        db.execute("INSERT INTO search_status VALUES (1,1,0)", [])
+            .unwrap();
+        db.execute_batch(wiki::SCHEMA).unwrap();
+        db.execute_batch("ALTER TABLE wiki_suggestions RENAME TO wiki_changes;")
+            .unwrap();
+        db.execute("INSERT INTO wiki_targets VALUES ('Wiki.md','wiki')", [])
             .unwrap();
         drop(db);
+
+        let mut storage = dir.open();
         assert_eq!(
-            Storage::open(&other.0, Path::new("."), ".flash-test")
-                .err()
-                .unwrap()
-                .code,
-            "CAPABILITY_UNSUPPORTED"
+            storage
+                .connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
         );
-        let db = Connection::open(other.0.join(".flash-test").join("state.sqlite")).unwrap();
-        let count: i64 = db
+        assert!(!table_exists(&storage.connection, "capture_intents").unwrap());
+        assert!(!table_exists(&storage.connection, "m2_preparations").unwrap());
+        assert!(!table_exists(&storage.connection, "disagreements").unwrap());
+        let legacy: String = storage
+            .connection
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'unrelated'",
+                "SELECT legacy_json FROM conflicts WHERE id='old-conflict'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn workspace_lock_and_identity_are_scoped_to_the_workspace() {
-        let first = TestDir::new();
-        let second = TestDir::new();
-        let storage = first.open();
-        let other = second.open();
-        let first_id = storage.workspace_id().to_owned();
-        assert_ne!(first_id, other.workspace_id());
-        assert!(Storage::open(&first.0, Path::new("."), ".flash-test").is_err());
-        assert!(fs::rename(first.0.join(".flash-test"), first.0.join("moved-state")).is_err());
-        drop(storage);
-        assert_eq!(first.open().workspace_id(), first_id);
-        assert!(Storage::open(&first.0, Path::new(".FLASH-TEST"), ".flash-test").is_err());
-        assert!(Storage::open(&first.0, Path::new(".."), ".flash-test").is_err());
-    }
-
-    #[test]
-    fn write_failure_preserves_draft_and_resumes_partial_stage() {
-        let dir = TestDir::new();
-        crash_save(&dir.0, "prepared");
-        let mut storage = dir.open();
-        let capture_time = "2026-01-01T00:00:00Z";
-        storage
-            .connection
-            .execute(
-                "UPDATE capture_intents SET captured_at = ?1",
-                [capture_time],
-            )
-            .unwrap();
-        let intent = read_intent(&storage.connection, "request")
-            .unwrap()
-            .unwrap();
-        let bytes = intent.bytes.unwrap();
-        let stage = dir.0.join(format!(".{}.pending", intent.file_name));
-        fs::write(&stage, &bytes[..bytes.len() / 2]).unwrap();
-        let locked = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&stage)
-            .unwrap();
-        let outcome = storage.recover_pending().unwrap().pop().unwrap();
-        assert_eq!(outcome.result.unwrap_err().code, "WRITE_FAILED");
-        assert!(storage.load_draft("draft").unwrap().is_some());
-        assert!(!dir.0.join(&intent.file_name).exists());
-        drop(locked);
         assert!(
-            storage
-                .recover_pending()
-                .unwrap()
-                .pop()
-                .unwrap()
-                .result
-                .is_ok()
+            legacy.contains("我选择保留")
+                && legacy.contains("旧观点B")
+                && legacy.contains("2026-11-24T06:00:00.000Z")
         );
-        assert_eq!(fs::read(dir.0.join(&intent.file_name)).unwrap(), bytes);
-        assert!(!stage.exists());
-        let captured_at: String = storage
-            .connection
-            .query_row("SELECT captured_at FROM records", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(captured_at, capture_time);
+        assert_eq!(storage.workspace_id(), "old-workspace");
+        assert_eq!(
+            storage.wiki_targets().unwrap(),
+            [("wiki".into(), "Wiki.md".into())]
+        );
+        assert_eq!(
+            storage.credential_reference("model").unwrap().as_deref(),
+            Some("reference-only")
+        );
+        assert_eq!(storage.model_config().unwrap().unwrap().1, "fixture");
+        assert_eq!(
+            storage.load_draft("quick-entry").unwrap().unwrap().body,
+            "未提交草稿\n\n## 从旧版恢复的未完成记录\n\n失败前只存在于旧保存请求的草稿"
+        );
+        assert_eq!(
+            storage.list_recent_captures().unwrap(),
+            [(
+                "old.md".into(),
+                date.into(),
+                body.into(),
+                revision.clone(),
+                None
+            )]
+        );
+        assert_eq!(
+            storage
+                .save_record("old-request", "quick-entry", 1, body)
+                .unwrap()
+                .source_revision,
+            revision
+        );
+        let mut search = storage.search_reader().unwrap();
+        assert_eq!(
+            search
+                .search_records("一记一文档", None, None, 0)
+                .unwrap()
+                .0[0]
+                .0,
+            "old.md"
+        );
+        assert_eq!(fs::read_to_string(dir.0.join("old.md")).unwrap(), original);
     }
 
     #[test]
@@ -1301,5 +1243,23 @@ pub(crate) mod tests {
             .query_row("SELECT sqlite_version()", [], |row| row.get(0))
             .unwrap();
         println!("Bundled SQLite {version}");
+    }
+
+    #[test]
+    fn detects_unc_paths_for_rollback_journal_mode() {
+        assert!(is_unc_path(Path::new(r"\\server\share\notes\state.sqlite")));
+        assert!(is_unc_path(Path::new(
+            r"\\?\UNC\server\share\notes\state.sqlite"
+        )));
+        assert!(!is_unc_path(Path::new(r"D:\notes\state.sqlite")));
+        assert!(!is_unc_path(Path::new(r"\\?\D:\notes\state.sqlite")));
+
+        let dir = TestDir::new();
+        let storage = dir.open();
+        let mode: String = storage
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
     }
 }

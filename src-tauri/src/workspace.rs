@@ -1,45 +1,19 @@
-use std::ffi::{OsStr, c_void};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::mem::{MaybeUninit, offset_of, size_of};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::RwLock;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::os::windows::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const STATE_DIR: &str = ".flash-marking-down";
 const STATE_DB_NAME: &str = "state.sqlite";
-const LEASE_NAME: &str = "workspace.lock";
-const SHARE_READ: u32 = 0x0000_0001;
-const SHARE_WRITE: u32 = 0x0000_0002;
-const LIST_DIRECTORY: u32 = 0x0000_0001;
-const READ_ATTRIBUTES: u32 = 0x0000_0080;
-const DELETE_ACCESS: u32 = 0x0001_0000;
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const REPARSE_POINT: u32 = 0x0000_0400;
-const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-const BACKUP_SEMANTICS: u32 = 0x0200_0000;
-const FILE_RENAME_INFO: i32 = 3;
-const DRIVE_REMOVABLE: u32 = 2;
-const DRIVE_FIXED: u32 = 3;
-
-struct CaptureTarget {
-    path: PathBuf,
-    identity: [u32; 3],
-    _pins: Vec<File>,
-}
+const REPARSE_POINT: u32 = 0x0400;
 
 pub(crate) struct WorkspaceFiles {
     root: PathBuf,
-    capture: RwLock<CaptureTarget>,
+    state: PathBuf,
     database: PathBuf,
-    state_identity: [u32; 3],
-    file_identity: String,
-    _lease: File,
-    _database_pin: File,
-    _directory_pins: Vec<File>,
 }
 
 pub(crate) struct MarkdownEntry {
@@ -48,113 +22,40 @@ pub(crate) struct MarkdownEntry {
     pub(crate) file_size: i64,
 }
 
-pub(crate) struct MarkdownFile {
-    pub(crate) file: File,
-    path: PathBuf,
-    _directory_pins: Vec<File>,
-}
-
-pub(crate) struct NewMarkdown {
-    pub(crate) key: String,
-    path: PathBuf,
-    _directory_pins: Vec<File>,
-}
-
-impl NewMarkdown {
-    pub(crate) fn create(&self) -> io::Result<File> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(&self.path)?;
-        file.sync_all()?;
-        Ok(file)
-    }
-}
-
 impl WorkspaceFiles {
-    pub(crate) fn open(
-        root: &Path,
-        capture_dir: &Path,
-        state_dir_name: &str,
-        expected_identity: Option<&str>,
-    ) -> io::Result<Self> {
+    pub(crate) fn open(root: &Path, state_dir_name: &str) -> io::Result<Self> {
         validate_component(OsStr::new(state_dir_name))?;
-        let (root, mut pins) = pin_workspace_root(root)?;
-        let root_id = file_details(pins.last().expect("workspace root is pinned"))?.identity();
-        let create = expected_identity.is_none();
-
-        let mut capture_pins = Vec::new();
-        let capture = pin_capture_directory(&root, capture_dir, &mut capture_pins)?;
-        let capture_identity = file_details(
-            capture_pins
-                .last()
-                .unwrap_or_else(|| pins.last().expect("workspace root is pinned")),
-        )?
-        .identity();
+        let root = workspace_root(root)?;
         let state = root.join(state_dir_name);
-        if create {
-            match fs::create_dir(&state) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
+        match fs::create_dir(&state) {
+            Ok(()) => (),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error),
         }
-        let state_pin = pin_directory(&state)?;
-        let state_identity = file_details(&state_pin)?.identity();
-        for directory in &capture_pins {
-            if file_details(directory)?.identity() == state_identity {
+        let state = workspace_root(&state)?;
+        if state == root || !state.starts_with(&root) {
+            return Err(scope_error("state directory is outside the workspace"));
+        }
+        let mut database = state.join(STATE_DB_NAME);
+        if let Some(existing) = existing_path(&database)? {
+            if !existing.starts_with(&state) || !existing.is_file() {
+                return Err(scope_error("state database is outside the state directory"));
+            }
+            database = existing;
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            if existing_path(Path::new(&sidecar))?.is_some_and(|path| !path.starts_with(&state)) {
                 return Err(scope_error(
-                    "capture path is inside the application state folder",
+                    "state database sidecar is outside the state directory",
                 ));
             }
         }
-        pins.push(state_pin);
-
-        let lease = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .share_mode(SHARE_READ | SHARE_WRITE)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(state.join(LEASE_NAME))?;
-        validate_regular_file(&lease)?;
-        lease.try_lock().map_err(io::Error::from)?;
-
-        let database = state.join(STATE_DB_NAME);
-        let database_pin = pin_database(&database, create)?;
-        let database_id = file_details(&database_pin)?.identity();
-        let file_identity: String = root_id
-            .into_iter()
-            .chain(database_id)
-            .map(|part| format!("{part:08x}"))
-            .collect();
-        if expected_identity.is_some_and(|expected| expected != file_identity) {
-            return Err(scope_error("workspace root or database has been replaced"));
-        }
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let sidecar = state.join(format!("{STATE_DB_NAME}{suffix}"));
-            if let Some(file) = open_existing(&sidecar, READ_ATTRIBUTES, SHARE_READ | SHARE_WRITE)?
-            {
-                validate_regular_file(&file)?;
-            }
-        }
-
         Ok(Self {
             root,
-            capture: RwLock::new(CaptureTarget {
-                path: capture,
-                identity: capture_identity,
-                _pins: capture_pins,
-            }),
+            state,
             database,
-            state_identity,
-            file_identity,
-            _lease: lease,
-            _database_pin: database_pin,
-            _directory_pins: pins,
         })
     }
 
@@ -162,54 +63,30 @@ impl WorkspaceFiles {
         &self.root
     }
 
-    pub(crate) fn update_capture_dir(&self, capture_dir: &Path) -> io::Result<()> {
-        let mut capture_pins = Vec::new();
-        let capture = pin_capture_directory(&self.root, capture_dir, &mut capture_pins)?;
-        for directory in &capture_pins {
-            if file_details(directory)?.identity() == self.state_identity {
-                return Err(scope_error(
-                    "capture path is inside the application state folder",
-                ));
-            }
-        }
-        let identity = if let Some(last) = capture_pins.last() {
-            file_details(last)?.identity()
-        } else {
-            let root_pin = pin_directory(&self.root)?;
-            file_details(&root_pin)?.identity()
-        };
-        let mut guard = self
-            .capture
-            .write()
-            .map_err(|_| io::Error::other("workspace capture lock poisoned"))?;
-        *guard = CaptureTarget {
-            path: capture,
-            identity,
-            _pins: capture_pins,
-        };
-        Ok(())
-    }
-
-    pub(crate) fn markdown_full_path(&self, relative_path: &str) -> io::Result<PathBuf> {
-        let target = self.open_markdown(relative_path, GENERIC_READ, SHARE_READ)?;
-        let canonical = target.path.canonicalize()?;
-        canonical
-            .strip_prefix(&self.root)
-            .map_err(|_| scope_error("Markdown is outside the workspace"))?;
-        Ok(canonical)
-    }
-
     pub(crate) fn database_path(&self) -> &Path {
         &self.database
     }
 
-    pub(crate) fn file_identity(&self) -> &str {
-        &self.file_identity
+    pub(crate) fn existing_database_path(&self) -> io::Result<&Path> {
+        if self.database.canonicalize()? != self.database {
+            return Err(scope_error("state database path changed"));
+        }
+        Ok(&self.database)
     }
 
-    pub(crate) fn matches_root(&self, root: &Path) -> io::Result<bool> {
-        let (root, _pins) = pin_workspace_root(root)?;
-        Ok(root == self.root)
+    pub(crate) fn capture_key(&self, relative: &Path) -> io::Result<String> {
+        let capture = capture_picker_path(&self.root, relative)?;
+        self.key(&capture)
+    }
+
+    fn key(&self, resolved: &Path) -> io::Result<String> {
+        let relative = in_workspace(&self.root, resolved)?;
+        if resolved.starts_with(&self.state) {
+            return Err(scope_error(
+                "application state is outside the document scope",
+            ));
+        }
+        relative_key(relative)
     }
 
     pub(crate) fn markdown_paths(&self) -> io::Result<(Vec<String>, usize)> {
@@ -224,56 +101,47 @@ impl WorkspaceFiles {
     }
 
     pub(crate) fn markdown_entries(&self) -> io::Result<(Vec<MarkdownEntry>, usize)> {
+        if self.root.canonicalize()? != self.root {
+            return Err(scope_error("workspace path changed"));
+        }
         let mut entries = Vec::new();
+        let mut seen = HashSet::from([self.root.clone()]);
         let mut skipped = 0;
-        self.collect_markdown(Path::new(""), &mut entries, &mut skipped)?;
+        self.collect_markdown(&self.root, &mut seen, &mut entries, &mut skipped)?;
         Ok((entries, skipped))
     }
 
     fn collect_markdown(
         &self,
-        relative_dir: &Path,
+        directory: &Path,
+        seen: &mut HashSet<PathBuf>,
         entries: &mut Vec<MarkdownEntry>,
         skipped: &mut usize,
     ) -> io::Result<()> {
-        let directory = self.root.join(relative_dir);
-        let pin = pin_directory(&directory)?;
-        let identity = file_details(&pin)?.identity();
-        if identity == self.state_identity {
-            return Ok(());
-        }
-        // Use the registered capture directory spelling even for a short name or case alias.
-        let capture_relative = {
-            let guard = self
-                .capture
-                .read()
-                .map_err(|_| io::Error::other("workspace capture lock poisoned"))?;
-            (identity == guard.identity).then(|| {
-                guard
-                    .path
-                    .strip_prefix(&self.root)
-                    .expect("capture is within root")
-                    .to_path_buf()
-            })
-        };
-        let relative_dir = capture_relative.as_deref().unwrap_or(relative_dir);
-        for entry in fs::read_dir(&directory)? {
-            let result = entry.and_then(|entry| {
-                let metadata = entry.metadata()?;
-                if metadata.file_attributes() & REPARSE_POINT != 0 {
+        for result in fs::read_dir(directory)? {
+            let result = result.and_then(|entry| {
+                let name = entry.file_name();
+                if name.eq_ignore_ascii_case(STATE_DIR) {
                     return Ok(());
                 }
-                let name = entry.file_name();
-                validate_component(&name)?;
-                let path = relative_dir.join(name);
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+                let (path, metadata) = if metadata.file_attributes() & REPARSE_POINT != 0 {
+                    let resolved = path.canonicalize()?;
+                    self.key(&resolved)?;
+                    let metadata = resolved.metadata()?;
+                    (resolved, metadata)
+                } else {
+                    (path, metadata)
+                };
+                if path == self.state || !seen.insert(path.clone()) {
+                    return Ok(());
+                }
                 if metadata.is_dir() {
-                    self.collect_markdown(&path, entries, skipped)?;
+                    self.collect_markdown(&path, seen, entries, skipped)?;
                 } else if metadata.is_file() && is_markdown(&path) {
-                    let text = path
-                        .to_str()
-                        .ok_or_else(|| scope_error("path is not Unicode"))?;
                     entries.push(MarkdownEntry {
-                        relative_path: text.replace('\\', "/"),
+                        relative_path: self.key(&path)?,
                         mtime_ns: metadata.last_write_time().min(i64::MAX as u64) as i64,
                         file_size: metadata.file_size().min(i64::MAX as u64) as i64,
                     });
@@ -288,143 +156,52 @@ impl WorkspaceFiles {
     }
 
     pub(crate) fn read_markdown(&self, relative_path: &str) -> io::Result<Vec<u8>> {
-        let mut target = self.open_markdown(relative_path, GENERIC_READ, SHARE_READ)?;
-        let mut bytes = Vec::new();
-        target.file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        fs::read(self.markdown_full_path(relative_path)?)
     }
 
-    pub(crate) fn read_markdown_with_identity(
-        &self,
-        relative_path: &str,
-    ) -> io::Result<(Vec<u8>, String)> {
-        let mut target = self.open_markdown(relative_path, GENERIC_READ, SHARE_READ)?;
-        let identity = file_details(&target.file)?
-            .identity()
-            .into_iter()
-            .map(|part| format!("{part:08x}"))
-            .collect();
-        let mut bytes = Vec::new();
-        target.file.read_to_end(&mut bytes)?;
-        Ok((bytes, identity))
+    pub(crate) fn markdown_full_path(&self, relative_path: &str) -> io::Result<PathBuf> {
+        let path = self.markdown_input(relative_path)?.canonicalize()?;
+        self.checked_markdown(&path)?;
+        Ok(path)
     }
 
     pub(crate) fn markdown_key(&self, relative_path: &str) -> io::Result<String> {
-        let target = self.open_markdown(relative_path, GENERIC_READ, SHARE_READ)?;
-        let canonical = target.path.canonicalize()?;
-        let relative = canonical
-            .strip_prefix(&self.root)
-            .map_err(|_| scope_error("Markdown is outside the workspace"))?;
-        Ok(relative
-            .to_str()
-            .ok_or_else(|| scope_error("path is not Unicode"))?
-            .replace('\\', "/"))
+        let path = self.markdown_input(relative_path)?.canonicalize()?;
+        self.checked_markdown(&path)
     }
 
-    pub(crate) fn lock_markdown(&self, relative_path: &str) -> io::Result<MarkdownFile> {
-        self.open_markdown(relative_path, GENERIC_READ | GENERIC_WRITE, 0)
+    pub(crate) fn picked_markdown(&self, selected: &Path) -> io::Result<(String, PathBuf)> {
+        let path = selected.canonicalize()?;
+        Ok((self.checked_markdown(&path)?, path))
     }
 
-    pub(crate) fn new_markdown(&self, relative_path: &str) -> io::Result<NewMarkdown> {
-        let (path, pins) = self.pinned_markdown_path(relative_path)?;
-        let parent = path
-            .parent()
-            .expect("validated Markdown file has a parent")
-            .canonicalize()?;
-        let key = parent
-            .strip_prefix(&self.root)
-            .map_err(|_| scope_error("target outside workspace"))?
-            .join(
-                path.file_name()
-                    .expect("validated Markdown file has a name"),
-            );
-        let key = key
-            .to_str()
-            .ok_or_else(|| scope_error("path is not Unicode"))?
-            .replace('\\', "/");
-        Ok(NewMarkdown {
-            key,
-            path,
-            _directory_pins: pins,
-        })
+    pub(crate) fn markdown_target(&self, relative_path: &str) -> io::Result<(String, PathBuf)> {
+        let requested = self.markdown_input(relative_path)?;
+        if let Some(path) = existing_path(&requested)? {
+            return Ok((self.checked_markdown(&path)?, path));
+        }
+        let parent = requested.parent().expect("Markdown path has a parent");
+        let parent = workspace_root(parent)?;
+        let path = parent.join(requested.file_name().expect("Markdown path has a name"));
+        let key = self.key(&path)?;
+        Ok((key, path))
     }
 
-    fn open_markdown(
-        &self,
-        relative_path: &str,
-        access: u32,
-        share: u32,
-    ) -> io::Result<MarkdownFile> {
-        let (path, pins) = self.pinned_markdown_path(relative_path)?;
-        let file = open_existing(&path, access, share)?
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "Markdown file is missing"))?;
-        validate_regular_file(&file)?;
-        Ok(MarkdownFile {
-            file,
-            path,
-            _directory_pins: pins,
-        })
+    fn checked_markdown(&self, path: &Path) -> io::Result<String> {
+        let relative_path = self.key(path)?;
+        if !is_markdown(path) || !path.metadata()?.is_file() {
+            return Err(scope_error("expected a regular Markdown file"));
+        }
+        Ok(relative_path)
     }
 
-    fn pinned_markdown_path(&self, relative_path: &str) -> io::Result<(PathBuf, Vec<File>)> {
-        if !is_markdown(Path::new(relative_path)) {
+    fn markdown_input(&self, relative_path: &str) -> io::Result<PathBuf> {
+        let path = Path::new(relative_path);
+        if !is_markdown(path) {
             return Err(scope_error("expected a Markdown file"));
         }
-        let mut directory = self.root.clone();
-        let mut pins = Vec::new();
-        let mut components = relative_path.split('/').peekable();
-        while let Some(name) = components.next() {
-            validate_component(OsStr::new(name))?;
-            directory.push(name);
-            if components.peek().is_some() {
-                let pin = pin_directory(&directory)?;
-                if file_details(&pin)?.identity() == self.state_identity {
-                    return Err(scope_error(
-                        "application state is outside the document scope",
-                    ));
-                }
-                pins.push(pin);
-            }
-        }
-        Ok((directory, pins))
-    }
-
-    pub(crate) fn publish_record(&self, relative_path: &str, bytes: &[u8]) -> io::Result<File> {
-        let (target, _pins) = self.pinned_markdown_path(relative_path)?;
-        let file_name = target
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| scope_error("invalid record filename"))?;
-        if let Some(mut file) = open_existing(&target, GENERIC_READ, SHARE_READ)? {
-            verify_contents(&mut file, bytes)?;
-            return Ok(file);
-        }
-
-        let stage = target
-            .parent()
-            .expect("validated record target has parent")
-            .join(format!(".{file_name}.pending"));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
-            .share_mode(SHARE_READ)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(stage)?;
-        validate_regular_file(&file)?;
-
-        // An interrupted write may leave a prefix. Preserve the file if any byte differs.
-        let staged = read_bytes(&mut file, bytes.len())?;
-        let remaining = bytes
-            .strip_prefix(staged.as_slice())
-            .ok_or_else(|| conflict_error("staged file has different content"))?;
-        file.write_all(remaining)?;
-        file.sync_all()?;
-        rename_new_file(&file, &target)?;
-        verify_contents(&mut file, bytes)?;
-        Ok(file)
+        validate_relative(path)?;
+        Ok(self.root.join(path))
     }
 }
 
@@ -436,102 +213,69 @@ fn is_markdown(path: &Path) -> bool {
             .is_some_and(|name| name.to_string_lossy().starts_with("~$"))
 }
 
-pub(crate) fn pin_workspace_root(root: &Path) -> io::Result<(PathBuf, Vec<File>)> {
-    let mut components = root.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return Err(scope_error(
-            "workspace requires an absolute local drive path",
-        ));
-    };
-    if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        || !matches!(components.next(), Some(Component::RootDir))
-    {
-        return Err(scope_error(
-            "workspace requires an absolute local drive path",
-        ));
+pub(crate) fn workspace_root(root: &Path) -> io::Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(scope_error("workspace requires an absolute directory path"));
     }
-
-    let mut path = PathBuf::from(prefix.as_os_str());
-    path.push(Path::new(std::path::MAIN_SEPARATOR_STR));
-    let drive_path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // The buffer is NUL-terminated and lives through the system call.
-    let drive_type = unsafe { GetDriveTypeW(drive_path.as_ptr()) };
-    if !matches!(drive_type, DRIVE_FIXED | DRIVE_REMOVABLE) {
-        return Err(scope_error("workspace requires a local drive"));
+    let path = root.canonicalize()?;
+    if !path.metadata()?.is_dir() {
+        return Err(scope_error("expected a directory"));
     }
-
-    let mut pins = vec![pin_directory(&path)?];
-    for component in components {
-        let Component::Normal(name) = component else {
-            return Err(scope_error("workspace path contains a relative component"));
-        };
-        validate_component(name)?;
-        path.push(name);
-        pins.push(pin_directory(&path)?);
-    }
-    Ok((path.canonicalize()?, pins))
-}
-
-fn pin_capture_directory(
-    root: &Path,
-    relative: &Path,
-    pins: &mut Vec<File>,
-) -> io::Result<PathBuf> {
-    let mut capture = root.to_owned();
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(name) => {
-                validate_component(name)?;
-                capture.push(name);
-                pins.push(pin_directory(&capture)?);
-            }
-            _ => return Err(scope_error("capture path must stay inside the workspace")),
-        }
-    }
-    Ok(capture)
+    Ok(path)
 }
 
 pub(crate) fn capture_picker_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
-    let mut pins = Vec::new();
-    let capture = pin_capture_directory(root, relative, &mut pins)?;
-    if let Some(first_child) = pins.first() {
-        match pin_directory(&root.join(STATE_DIR)) {
-            Ok(state) => {
-                if file_details(first_child)?.identity() == file_details(&state)?.identity() {
-                    return Err(scope_error(
-                        "capture path is inside the application state folder",
-                    ));
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+    validate_relative(relative)?;
+    if relative.as_os_str().is_empty() {
+        return Ok(root.to_owned());
     }
-    capture.canonicalize()
+    let capture = workspace_root(&root.join(relative))?;
+    in_workspace(root, &capture)?;
+    Ok(capture)
 }
 
 pub(crate) fn picked_capture_directory(
-    root: &Path,
+    checked_root: &Path,
     current: &str,
     selected: &Path,
 ) -> io::Result<String> {
-    let (root, _root_pins) = pin_workspace_root(root)?;
-    let (selected, _selected_pins) = pin_workspace_root(selected)?;
-    let relative = selected
-        .strip_prefix(&root)
-        .map_err(|_| scope_error("capture path must stay inside the workspace"))?;
+    let selected = workspace_root(selected)?;
+    let relative = in_workspace(checked_root, &selected)?;
     if relative.as_os_str().is_empty() {
         return Ok(String::new());
     }
-    capture_picker_path(&root, relative)?;
-    if capture_picker_path(&root, Path::new(current)).is_ok_and(|path| path == selected) {
+    if capture_picker_path(checked_root, Path::new(current)).is_ok_and(|path| path == selected) {
         return Ok(current.to_owned());
     }
-    Ok(relative
+    relative_key(relative)
+}
+
+fn in_workspace<'a>(root: &Path, path: &'a Path) -> io::Result<&'a Path> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| scope_error("path is outside the workspace"))?;
+    validate_relative(relative)?;
+    Ok(relative)
+}
+
+fn relative_key(path: &Path) -> io::Result<String> {
+    let relative = path
         .to_str()
-        .ok_or_else(|| scope_error("capture path is not Unicode"))?
-        .replace('\\', "/"))
+        .ok_or_else(|| scope_error("path is not Unicode"))?;
+    Ok(relative.replace('\\', "/"))
+}
+
+fn validate_relative(path: &Path) -> io::Result<()> {
+    for component in path.components() {
+        match component {
+            Component::CurDir => (),
+            Component::Normal(name) if !name.eq_ignore_ascii_case(STATE_DIR) => {
+                validate_component(name)?
+            }
+            _ => return Err(scope_error("path is outside the document scope")),
+        }
+    }
+    Ok(())
 }
 
 fn validate_component(name: &OsStr) -> io::Result<()> {
@@ -549,154 +293,77 @@ fn validate_component(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn pin_directory(path: &Path) -> io::Result<File> {
-    // Denying delete-sharing keeps every checked directory name in place while the workspace is open.
-    let directory = OpenOptions::new()
-        .access_mode(LIST_DIRECTORY | READ_ATTRIBUTES)
-        .share_mode(SHARE_READ | SHARE_WRITE)
-        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & REPARSE_POINT != 0 {
-        return Err(scope_error(
-            "workspace folders must be ordinary directories",
-        ));
-    }
-    Ok(directory)
-}
-
-fn pin_database(path: &Path, create: bool) -> io::Result<File> {
-    if create {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(path)
-        {
-            Ok(file) => drop(file),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let file = open_existing(path, READ_ATTRIBUTES, SHARE_READ | SHARE_WRITE)?
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "state database disappeared"))?;
-    validate_regular_file(&file)?;
-    Ok(file)
-}
-
-fn open_existing(path: &Path, access: u32, share: u32) -> io::Result<Option<File>> {
-    match OpenOptions::new()
-        .access_mode(access)
-        .share_mode(share)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+fn existing_path(path: &Path) -> io::Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error) if error.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
+            Err(missing) if missing.kind() == ErrorKind::NotFound => Ok(None),
+            _ => Err(error),
+        },
         Err(error) => Err(error),
     }
-}
-
-fn validate_regular_file(file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & REPARSE_POINT != 0
-        || file_details(file)?.number_of_links != 1
-    {
-        return Err(scope_error("expected a regular file without links"));
-    }
-    Ok(())
-}
-
-fn verify_contents(file: &mut File, expected: &[u8]) -> io::Result<()> {
-    validate_regular_file(file)?;
-    file.seek(SeekFrom::Start(0))?;
-    if read_bytes(file, expected.len())? != expected {
-        return Err(conflict_error("target file has different content"));
-    }
-    Ok(())
-}
-
-fn read_bytes(file: &mut File, expected_len: usize) -> io::Result<Vec<u8>> {
-    let mut contents = Vec::new();
-    file.take(expected_len as u64 + 1)
-        .read_to_end(&mut contents)?;
-    Ok(contents)
-}
-
-#[repr(C)]
-struct FileDetails {
-    attributes: u32,
-    creation_time: [u32; 2],
-    last_access_time: [u32; 2],
-    last_write_time: [u32; 2],
-    volume_serial_number: u32,
-    size_high: u32,
-    size_low: u32,
-    number_of_links: u32,
-    index_high: u32,
-    index_low: u32,
-}
-
-impl FileDetails {
-    fn identity(&self) -> [u32; 3] {
-        [self.volume_serial_number, self.index_high, self.index_low]
-    }
-}
-
-fn file_details(file: &File) -> io::Result<FileDetails> {
-    let mut details = MaybeUninit::<FileDetails>::uninit();
-    // The File supplies a live handle; the system initializes the output on success.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), details.as_mut_ptr()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { details.assume_init() })
-}
-
-#[repr(C)]
-struct FileRenameInfo {
-    replace_existing: u32,
-    root_directory: RawHandle,
-    file_name_length: u32,
-    file_name: [u16; 1],
-}
-
-fn rename_new_file(file: &File, target: &Path) -> io::Result<()> {
-    let path: Vec<u16> = target.as_os_str().encode_wide().collect();
-    let path_bytes = path.len() * size_of::<u16>();
-    let byte_len = size_of::<FileRenameInfo>() + path_bytes;
-    let mut buffer = vec![0usize; byte_len.div_ceil(size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FileRenameInfo>();
-
-    // FILE_RENAME_INFO ends in a variable-length UTF-16 name. The aligned buffer
-    // holds the header and all name bytes; a zero flag forbids replacing the target.
-    let status = unsafe {
-        (*info).replace_existing = 0;
-        (*info).file_name_length = path_bytes as u32;
-        let name = buffer
-            .as_mut_ptr()
-            .cast::<u8>()
-            .add(offset_of!(FileRenameInfo, file_name));
-        std::ptr::copy_nonoverlapping(path.as_ptr(), name.cast::<u16>(), path.len());
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FILE_RENAME_INFO,
-            info.cast(),
-            byte_len as u32,
-        )
-    };
-    if status == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn scope_error(message: &'static str) -> io::Error {
     io::Error::new(ErrorKind::PermissionDenied, message)
 }
 
-fn conflict_error(message: &'static str) -> io::Error {
-    io::Error::new(ErrorKind::AlreadyExists, message)
+pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> io::Result<()> {
+    replace_file(path, body, || Ok(()))
+}
+
+pub(crate) fn replace_markdown(
+    path: &Path,
+    expected: Option<&[u8]>,
+    body: &[u8],
+) -> io::Result<()> {
+    replace_file(path, body, || {
+        let matching = match fs::read(path) {
+            Ok(current) => expected == Some(current.as_slice()),
+            Err(error) if error.kind() == ErrorKind::NotFound => expected.is_none(),
+            Err(error) => return Err(error),
+        };
+        if matching {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                "Markdown changed on disk",
+            ))
+        }
+    })
+}
+
+fn replace_file(
+    path: &Path,
+    body: &[u8],
+    before_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_file_name(format!(
+        ".fmd-{}-{stamp}-{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| {
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
+        before_rename()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -713,32 +380,23 @@ mod tests {
         let state = root.join(STATE_DIR).join("nested");
         fs::create_dir_all(&capture).unwrap();
         fs::create_dir(&outside).unwrap();
+        let checked_root = workspace_root(&root).unwrap();
 
-        assert_eq!(picked_capture_directory(&root, "笔记", &root).unwrap(), "");
-        assert_eq!(picked_capture_directory(&root, ".", &root).unwrap(), "");
         assert_eq!(
-            picked_capture_directory(&root, "", &capture).unwrap(),
+            picked_capture_directory(&checked_root, "笔记", &root).unwrap(),
+            ""
+        );
+        assert_eq!(
+            picked_capture_directory(&checked_root, "", &capture).unwrap(),
             "笔记/随手记"
         );
         assert_eq!(
-            picked_capture_directory(&root, ".\\笔记\\随手记", &capture).unwrap(),
+            picked_capture_directory(&checked_root, ".\\笔记\\随手记", &capture).unwrap(),
             ".\\笔记\\随手记"
         );
         assert!(!root.join(STATE_DIR).exists());
         fs::create_dir_all(&state).unwrap();
-        assert!(picked_capture_directory(&root, "", &state).is_err());
-        assert!(picked_capture_directory(&root, "", &outside).is_err());
+        assert!(picked_capture_directory(&checked_root, "", &state).is_err());
+        assert!(picked_capture_directory(&checked_root, "", &outside).is_err());
     }
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetDriveTypeW(root: *const u16) -> u32;
-    fn GetFileInformationByHandle(file: RawHandle, details: *mut FileDetails) -> i32;
-    fn SetFileInformationByHandle(
-        file: RawHandle,
-        class: i32,
-        info: *const c_void,
-        len: u32,
-    ) -> i32;
 }

@@ -12,6 +12,7 @@ import type {
   DocumentMapping,
   HotkeyStatus,
   IndexRebuildResult,
+  IntegrationsConfig,
   ModelConfig,
   OpenedWorkspace,
   OutputKind,
@@ -23,7 +24,19 @@ import type {
   WikiApplyOutcome,
 } from '../m2'
 
+export interface AppSettings {
+  version: number
+  lastWorkspaceRoot: string | null
+  lastCaptureDir: string
+  hotkey: string
+  autoOrganize: boolean
+  autoSyncMemory: boolean
+}
+
 export const api = {
+  getAppSettings: () => invoke<AppSettings>('get_app_settings'),
+  saveAppSettings: (changes: Partial<Pick<AppSettings, 'autoOrganize' | 'autoSyncMemory'>>) =>
+    invoke<AppSettings>('save_app_settings', changes),
   openWorkspace: (root: string, captureDir: string) =>
     invoke<OpenedWorkspace>('open_workspace', { root, captureDir }),
   resumeWorkspace: () =>
@@ -65,17 +78,18 @@ export const api = {
   getHotkey: () => invoke<HotkeyStatus>('get_hotkey'),
   setHotkey: (id: string) => invoke<HotkeyStatus>('set_hotkey', { id }),
 
-  listCredentials: (session: string) =>
-    invoke<CredentialReference[]>('list_credentials', { session }),
   setCredential: (session: string, slot: CredentialSlot, linked: boolean) =>
     invoke<CredentialReference>('set_credential', { session, slot, linked }),
-  saveCredential: (session: string, slot: CredentialSlot, secret: string) =>
-    invoke<CredentialReference>('save_credential', { session, slot, secret }),
-
   getModelConfig: (session: string) =>
     invoke<ModelConfig | null>('get_model_config', { session }),
-  setModelConfig: (session: string, endpoint: string, model: string, enabled: boolean) =>
-    invoke<ModelConfig>('set_model_config', { session, endpoint, model, enabled }),
+  getIntegrationsConfig: (session: string) =>
+    invoke<IntegrationsConfig>('get_integrations_config', { session }),
+  saveModelConfig: (session: string, endpoint: string, model: string, enabled: boolean, secret?: string) =>
+    invoke<void>('save_model_config', { session, endpoint, model, enabled, secret }),
+  saveMemoryConfig: (session: string, baseUrl: string, namespace: string, enabled: boolean, secret?: string) =>
+    invoke<void>('save_memory_config', { session, baseUrl, namespace, enabled, secret }),
+  testConnection: (session: string, slot: CredentialSlot) =>
+    invoke<string>(slot === 'model' ? 'test_model_connection' : 'test_memory_connection', { session }),
 
   listAnalyses: (session: string, relativePath: string) =>
     invoke<Analysis[]>('list_analyses', { session, relativePath }),
@@ -100,10 +114,10 @@ export const api = {
     invoke<DocumentChange>('preview_wiki_undo', { session, id }),
   rebaseWikiChange: (session: string, id: string) =>
     invoke<DocumentChange>('rebase_wiki_change', { session, id }),
-  wikiTasks: (session: string) =>
-    invoke<TaskList>('wiki_tasks', { session }),
-  prepareTaskStatus: (session: string, taskId: string, baseHash: string, state: 'open' | 'done') =>
-    invoke<DocumentChange>('prepare_task_status', { session, taskId, baseHash, state }),
+  listTasks: (session: string) =>
+    invoke<TaskList>('list_tasks', { session }),
+  toggleTask: (session: string, path: string, taskId: string, expectedLine: string, done: boolean) =>
+    invoke<void>('toggle_task', { session, path, taskId, expectedLine, done }),
 
   prepareAnswer: (params: {
     session: string

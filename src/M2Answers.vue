@@ -395,6 +395,7 @@ async function reviewDisagreement() {
         <p class="hint">{{ answer.outputKind === 'answer' ? '问题' : '主题或要求' }}　{{ answer.query }}</p>
         <p v-if="answer.fromDate || answer.toDate" class="hint">{{ answer.dateBasis === 'recorded' ? '记录日期' : '事件或发表日期' }} {{ answer.fromDate || '不限' }} 至 {{ answer.toDate || '不限' }}</p>
         <p v-if="answer.skipped" class="notice" role="status">检索时跳过了 {{ answer.skipped }} 项无法读取或索引的资料。</p>
+        <p v-if="answer.sourceNotice" class="notice" role="status">{{ answer.sourceNotice }}</p>
         <pre ref="answerBody" class="m2-pre" tabindex="0">{{ sourceMarkdown(answer.text) }}</pre>
         <p v-if="copyFeedback" class="notice success" role="status">{{ copyFeedback }}</p>
         <ErrorNotice :error="copyError" prefix="复制失败。" />

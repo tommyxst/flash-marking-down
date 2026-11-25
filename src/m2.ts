@@ -22,6 +22,7 @@ export type OpenedWorkspace = {
 
 export type RecentCapture = {
   path: string
+  blockId: string | null
   capturedAt: string
   body: string
   contentHash: string
@@ -81,6 +82,12 @@ export type ModelConfig = {
   enabled: boolean
   ready: boolean
   requiresCredential: boolean
+}
+
+export type IntegrationsConfig = {
+  model: ModelConfig | null
+  memory: { baseUrl: string; namespace: string; enabled: boolean } | null
+  credentials: CredentialReference[]
 }
 
 export type RecordEntry = {
@@ -195,6 +202,7 @@ export type AnswerPreparation = {
 
 export type Answer = Omit<AnswerPreparation, 'endpoint'> & {
   text: string
+  sourceNotice?: string
   dateBasis: 'recorded' | 'event'
   fromDate: string | null
   toDate: string | null
@@ -247,6 +255,7 @@ export type WikiApplyOutcome = {
 export type TaskState = 'open' | 'done' | 'cancelled' | 'invalid'
 export type TaskEntry = {
   id: string
+  expectedLine: string
   text: string
   state: TaskState
   sourcePath: string
@@ -261,7 +270,7 @@ export type TaskList = {
   repairMessages: string[]
 }
 
-const GENERATED_CAPTURE_FILE = /^[0-9a-f]{32}\.md$/i
+const GENERATED_CAPTURE_FILE = /^(?:[0-9a-f]{32}\.md|[^\\/]+\.md#fmd-note:[0-9a-f]{8,16})$/i
 
 export function isGeneratedCaptureFile(path: string): boolean {
   const base = path.split(/[\\/]/).pop() ?? ''
@@ -269,7 +278,7 @@ export function isGeneratedCaptureFile(path: string): boolean {
 }
 
 export function presentSourceMarkdown(text: string): string {
-  return text.replace(
+  return text.replace(/[ \t]+<!-- fmd-note:[0-9a-f]{8,16} -->$/gim, '').replace(
     /(^| · )来源：([^\r\n]+?)（第 (\d+–\d+ 行)） <!-- fmd-source:[0-9a-f]{32} fmd-revision:[0-9a-f]{64} -->/gm,
     (citation, prefix: string, path: string, lines: string) =>
       isGeneratedCaptureFile(path) ? `${prefix}来源：随手记（第 ${lines}）` : citation,
