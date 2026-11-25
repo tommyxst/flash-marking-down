@@ -11,7 +11,6 @@ import type {
   CredentialState,
   HotkeyStatus,
   IntegrationsConfig,
-  ModelConfig,
   OpenedWorkspace,
 } from '../m2'
 
@@ -32,14 +31,13 @@ const props = defineProps<{
   hotkey?: HotkeyStatus
   hotkeyBusy: boolean
   hotkeyError: UiError | null
-  modelConfig: ModelConfig | null
 }>()
 
 const emit = defineEmits<{
   'update:open': [open: boolean]
   workspaceOpened: [opened: OpenedWorkspace]
   hotkeyRequest: [choice?: string]
-  modelUpdated: [config: ModelConfig | null]
+  integrationsUpdated: [config: IntegrationsConfig]
   desktopAction: [action: 'drag' | 'close']
 }>()
 
@@ -58,20 +56,26 @@ const slots = ['model', 'memory'] as const
 function emptyForm() {
   return {
     endpoint: '', name: '', enabled: false, secret: '',
-    saved: null as { endpoint: string; name: string; enabled: boolean } | null,
+    syncResources: true, commitMemories: true,
+    saved: null as {
+      endpoint: string; name: string; enabled: boolean; syncResources?: boolean; commitMemories?: boolean
+    } | null,
     credential: undefined as CredentialReference | undefined,
-    pending: '' as '' | 'save' | 'test' | 'link',
+    pending: '' as '' | 'save' | 'test' | 'link' | 'retry',
     error: null as UiError | null, feedback: '',
   }
 }
 const forms = ref({ model: emptyForm(), memory: emptyForm() })
 const loading = ref(false)
 const loadError = ref<UiError | null>(null)
+const modelOptions = ref<string[]>([])
+const loadingModels = ref(false)
 
 function dirty(slot: CredentialSlot) {
   const f = forms.value[slot]
   return !f.saved || f.endpoint.trim() !== f.saved.endpoint || f.name.trim() !== f.saved.name ||
-    f.enabled !== f.saved.enabled || Boolean(f.secret.trim())
+    f.enabled !== f.saved.enabled || Boolean(f.secret.trim()) ||
+    (slot === 'memory' && (f.syncResources !== f.saved.syncResources || f.commitMemories !== f.saved.commitMemories))
 }
 
 const isBusy = computed(() => props.opening || workspaceBusy.value)
@@ -105,6 +109,8 @@ watch(() => props.hotkey, (status) => {
 
 watch([() => props.open, () => props.workspace?.session], ([open, session]) => {
   forms.value = { model: emptyForm(), memory: emptyForm() }
+  modelOptions.value = []
+  loadingModels.value = false
   loading.value = false
   loadError.value = null
   if (open && session) void loadIntegrations(session)
@@ -156,7 +162,13 @@ function updateForm(config: IntegrationsConfig, slot: CredentialSlot) {
   const value = slot === 'model' && config.model
     ? { endpoint: config.model.endpoint, name: config.model.model, enabled: config.model.enabled }
     : slot === 'memory' && config.memory
-      ? { endpoint: config.memory.baseUrl, name: config.memory.namespace, enabled: config.memory.enabled }
+      ? {
+          endpoint: config.memory.baseUrl,
+          name: config.memory.namespace,
+          enabled: config.memory.enabled,
+          syncResources: config.memory.syncResources,
+          commitMemories: config.memory.commitMemories,
+        }
       : null
   if (value) Object.assign(form, value)
   form.saved = value
@@ -171,7 +183,7 @@ async function loadIntegrations(session: string) {
     const config = await api.getIntegrationsConfig(session)
     if (current !== forms.value) return
     for (const slot of slots) updateForm(config, slot)
-    emit('modelUpdated', config.model)
+    emit('integrationsUpdated', config)
   } catch (error) {
     if (current === forms.value) loadError.value = parseAppError(error)
   } finally {
@@ -179,7 +191,28 @@ async function loadIntegrations(session: string) {
   }
 }
 
-async function apply(slot: CredentialSlot, action: 'save' | 'test' | 'link', linked = false) {
+async function fetchModels() {
+  const session = props.workspace?.session
+  const form = forms.value.model
+  if (!session || loadingModels.value || form.pending || isBusy.value || loading.value || loadError.value) return
+  if (!form.endpoint.trim()) return
+  loadingModels.value = true
+  form.error = null
+  form.feedback = ''
+  try {
+    const models = await api.listRemoteModels(session, form.endpoint, form.secret.trim() || undefined)
+    if (form !== forms.value.model) return
+    modelOptions.value = models
+    if (!form.name.trim() && models.length) form.name = models[0]
+    form.feedback = `已获取 ${models.length} 个可用模型，可在输入框下拉选择。`
+  } catch (error) {
+    if (form === forms.value.model) form.error = parseAppError(error)
+  } finally {
+    loadingModels.value = false
+  }
+}
+
+async function apply(slot: CredentialSlot, action: 'save' | 'test' | 'link' | 'retry', linked = false) {
   const session = props.workspace?.session
   const form = forms.value[slot]
   if (!session || form.pending || isBusy.value || loading.value || loadError.value) return
@@ -191,20 +224,34 @@ async function apply(slot: CredentialSlot, action: 'save' | 'test' | 'link', lin
       form.feedback = await api.testConnection(session, slot)
       return
     }
+    if (action === 'retry') {
+      const count = await api.retryMemorySync(session)
+      form.feedback = count ? `已将 ${count} 个同步任务加入队列。` : '没有新增同步任务。'
+      return
+    }
     if (action === 'link') {
       form.credential = await api.setCredential(session, slot, linked)
       form.feedback = linked ? '已关联系统凭据。' : '已解除关联。'
     } else {
       const secret = form.secret.trim() || undefined
-      if (slot === 'model') await api.saveModelConfig(session, form.endpoint, form.name, form.enabled, secret)
-      else await api.saveMemoryConfig(session, form.endpoint, form.name, form.enabled, secret)
+      if (slot === 'model') {
+        await api.saveModelConfig(session, form.endpoint, form.name, form.enabled, secret)
+      } else {
+        await api.saveMemoryConfig(session, {
+          baseUrl: form.endpoint,
+          namespace: form.name,
+          enabled: form.enabled,
+          syncResources: form.syncResources,
+          commitMemories: form.commitMemories,
+        }, secret)
+      }
       form.secret = ''
       form.feedback = '已保存配置。'
     }
     const config = await api.getIntegrationsConfig(session)
     if (form !== forms.value[slot]) return
     if (action === 'save') updateForm(config, slot)
-    emit('modelUpdated', config.model)
+    emit('integrationsUpdated', config)
   } catch (error) {
     form.error = parseAppError(error)
   } finally {
@@ -283,12 +330,22 @@ defineExpose({
         <h3 :id="slot + '-settings-heading'">{{ slot === 'model' ? '整理与问答模型' : 'OpenViking 记忆服务' }}</h3>
         <fieldset class="settings-form service-fields" :disabled="Boolean(forms[slot].pending || loading || loadError || isBusy)"
           @input="forms[slot].feedback = ''; forms[slot].error = null">
-          <label :for="slot + '-endpoint'">{{ slot === 'model' ? '模型地址（完整 Chat Completions URL）' : 'OpenViking 服务地址' }}</label>
+          <label :for="slot + '-endpoint'">{{ slot === 'model' ? '模型地址（支持 Base URL 如 http://127.0.0.1:3425/v1 或完整 URL）' : 'OpenViking 服务地址' }}</label>
           <input :id="slot + '-endpoint'" v-model="forms[slot].endpoint" type="url" required spellcheck="false"
-            :placeholder="slot === 'model' ? 'https://…/v1/chat/completions' : 'http://localhost:1933'">
+            :placeholder="slot === 'model' ? 'http://127.0.0.1:3425/v1 或 https://…/v1/chat/completions' : 'http://localhost:1933'">
           <label :for="slot + '-name'">{{ slot === 'model' ? '模型名称' : '工作区命名空间' }}</label>
-          <input :id="slot + '-name'" v-model="forms[slot].name" required spellcheck="false"
-            :placeholder="slot === 'model' ? '例如：gpt-4.1-mini' : '例如：default'">
+          <div v-if="slot === 'model'" class="folder-field">
+            <input :id="slot + '-name'" v-model="forms[slot].name" required spellcheck="false"
+              :list="modelOptions.length ? 'remote-model-options' : undefined"
+              placeholder="例如：auto/gemini-3.8-flash">
+            <button type="button" :disabled="loadingModels || !forms.model.endpoint.trim()" @click="fetchModels">
+              {{ loadingModels ? '正在获取…' : '获取模型列表' }}
+            </button>
+          </div>
+          <input v-else :id="slot + '-name'" v-model="forms[slot].name" required spellcheck="false" placeholder="例如：default">
+          <datalist v-if="slot === 'model' && modelOptions.length" id="remote-model-options">
+            <option v-for="id in modelOptions" :key="id" :value="id" />
+          </datalist>
           <label :for="slot + '-api-key'">API Key（保存在 Windows 凭据管理器）</label>
           <input :id="slot + '-api-key'" v-model="forms[slot].secret" type="password" autocomplete="off"
             :placeholder="forms[slot].credential?.state === 'linked' ? '已关联，留空保留当前密钥' : '公网服务必填，本机或局域网按需填写'" spellcheck="false">
@@ -296,9 +353,19 @@ defineExpose({
             {{ slot === 'model' ? '启用整理与问答' : '启用 OpenViking' }}
           </label>
           <p v-if="slot === 'model'" class="hint">整理与问答会向此地址发送所选记录或检索命中的片段。测试连接仅发送固定测试消息。</p>
+          <template v-else>
+            <label class="m2-check"><input v-model="forms.memory.syncResources" type="checkbox">同步每日原文到 resources</label>
+            <label class="m2-check"><input v-model="forms.memory.commitMemories" type="checkbox">提交整理要点抽取长期 memories</label>
+          </template>
           <div class="actions">
             <button class="primary" type="submit">{{ forms[slot].pending === 'save' ? '正在保存…' : slot === 'model' ? '保存模型配置' : '保存 OpenViking 配置' }}</button>
             <button type="button" :disabled="dirty(slot)" @click="apply(slot, 'test')">{{ forms[slot].pending === 'test' ? '正在连接…' : '测试连接' }}</button>
+            <button
+              v-if="slot === 'memory' && forms.memory.saved?.enabled"
+              type="button"
+              :disabled="dirty(slot) || !(forms.memory.syncResources || forms.memory.commitMemories)"
+              @click="apply('memory', 'retry')"
+            >{{ forms.memory.pending === 'retry' ? '正在补推…' : '补推未同步笔记' }}</button>
           </div>
           <p v-if="dirty(slot)" class="hint">保存当前配置后即可测试连接。</p>
           <details v-if="forms[slot].credential" class="settings-details">

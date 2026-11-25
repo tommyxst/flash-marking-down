@@ -21,8 +21,8 @@ pub(crate) struct AppSettings {
     pub(crate) last_workspace_root: Option<String>,
     pub(crate) last_capture_dir: String,
     pub(crate) hotkey: String,
-    auto_organize: bool,
-    auto_sync_memory: bool,
+    pub(crate) auto_organize: bool,
+    pub(crate) auto_sync_memory: bool,
 }
 
 impl Default for AppSettings {
@@ -166,14 +166,18 @@ pub(crate) async fn save_app_settings(
     auto_organize: Option<bool>,
     auto_sync_memory: Option<bool>,
 ) -> Result<AppSettings, AppError> {
-    Ok(update(&main_settings_path(&window)?, |settings| {
+    let updated = update(&main_settings_path(&window)?, |settings| {
         if let Some(value) = auto_organize {
             settings.auto_organize = value;
         }
         if let Some(value) = auto_sync_memory {
             settings.auto_sync_memory = value;
         }
-    })?)
+    })?;
+    if auto_sync_memory == Some(true) {
+        crate::m2_commands::wake_memory_backfill(window.app_handle());
+    }
+    Ok(updated)
 }
 
 #[cfg(test)]

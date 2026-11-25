@@ -3,23 +3,37 @@ import { computed, defineAsyncComponent, ref, watch } from 'vue'
 import { api } from '../api/client'
 import { parseAppError, type UiError } from '../api/errors'
 import ErrorNotice from './ErrorNotice.vue'
+import M2Organize from '../M2Organize.vue'
 import UiIcon from '../UiIcon.vue'
-import { recordTitle, useSourcePresentation, type RecordEntry, type RecordSelection, type SourceView } from '../m2'
+import { citationKindLabels, useSourcePresentation, type DocumentMapping, type MemoryConfig, type MemoryPreview, type NoteDetail } from '../m2'
 
 const MarkdownPreview = defineAsyncComponent(() => import('../MarkdownPreview.vue'))
 
 const props = defineProps<{
   session?: string
-  record?: RecordEntry
+  detail?: NoteDetail
+  loading: boolean
+  error: UiError | null
   opening: boolean
-  searchActive: boolean
   desktop: boolean
-  disagreementSlotsFull: boolean
+  modelReady: boolean
+  organizing: boolean
+  memoryConfig: MemoryConfig | null
+  memoryPreview?: MemoryPreview
+  wikiTargets: DocumentMapping[]
+  taskBusyId: string
 }>()
 
 const emit = defineEmits<{
-  organize: [selection: RecordSelection]
-  addDisagreementSource: [selection: RecordSelection]
+  triggerOrganize: [idOrPath: string]
+  toggleTask: [path: string, taskId: string, expectedLine: string, done: boolean]
+  openConflicts: []
+  openWiki: []
+  openSettings: []
+  wikiSuggested: []
+  createConflictFromNote: [detail: NoteDetail]
+  returnToNote: []
+  retryMemoryPreview: []
 }>()
 
 const { showSourcePath, sourceMarkdown } = useSourcePresentation()
@@ -27,110 +41,36 @@ const dateLabel = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'full' })
 const timeLabel = new Intl.DateTimeFormat('zh-CN', { timeStyle: 'short', hour12: false })
 
 const rootEl = ref<HTMLElement>()
-const detailBodyRef = ref<HTMLElement>()
 const detailViewMode = ref<'preview' | 'source'>('preview')
-const source = ref<SourceView>()
 const copyStatus = ref('')
 const openFileError = ref<UiError | null>(null)
-let sourceRequest = 0
 
-const detailPreviewLabel = computed(() => props.searchActive ? '索引预览' : '保存时的 Markdown')
-const detailBodyText = computed(() => {
-  const record = props.record
-  if (!record) return ''
-  return source.value?.state === 'opened' ? source.value.body : record.text
+const displayTitle = computed(() => props.detail?.title || '未命名记录')
+
+watch(() => props.detail?.locator, () => {
+  copyStatus.value = ''
+  openFileError.value = null
 })
 
-watch([
-  () => props.session,
-  () => props.searchActive,
-  () => props.record?.path,
-  () => props.record?.contentHash,
-], resetSource, { flush: 'sync' })
-
-function resetSource() {
-  sourceRequest += 1
-  source.value = undefined
-  copyStatus.value = ''
-  openFileError.value = null
-}
-
-async function openRecordSource() {
-  const session = props.session
-  const record = props.record
-  if (!session || !record || source.value?.state === 'opening') return
-  resetSource()
-  const request = sourceRequest
-  source.value = { state: 'opening' }
-  try {
-    const opened = await api.openRecordSource(session, record.path, record.contentHash)
-    if (request === sourceRequest) {
-      source.value = {
-        state: 'opened',
-        changed: opened.state === 'changed',
-        contentHash: opened.contentHash,
-        body: opened.body,
-        isCapture: opened.isCapture,
-      }
-    }
-  } catch (error) {
-    if (request === sourceRequest) source.value = { state: 'failed', error: parseAppError(error) }
-  }
-}
-
 async function openExternalFile(mode: 'open' | 'reveal') {
-  const session = props.session
-  const record = props.record
-  if (!session || !record) return
+  if (!props.session || !props.detail) return
   openFileError.value = null
   try {
-    await api.openWorkspaceFile(session, record.path, mode)
-  } catch (error) {
-    openFileError.value = parseAppError(error)
+    await api.openWorkspaceFile(props.session, props.detail.path, mode)
+  } catch (err) {
+    openFileError.value = parseAppError(err)
   }
 }
 
-async function copyMarkdown(text: string) {
-  const request = sourceRequest
+async function copyMarkdown() {
+  if (!props.detail) return
   copyStatus.value = ''
   try {
-    await navigator.clipboard.writeText(text)
-    if (request === sourceRequest) copyStatus.value = '已复制 Markdown'
+    await navigator.clipboard.writeText(sourceMarkdown(props.detail.body))
+    copyStatus.value = '已复制 Markdown'
   } catch {
-    if (request === sourceRequest) copyStatus.value = '无法访问剪贴板，请选中正文后手动复制。'
+    copyStatus.value = '无法访问剪贴板，请选中正文后手动复制。'
   }
-}
-
-function selectedDetailExcerpt(): string | undefined {
-  const container = detailBodyRef.value
-  const selection = window.getSelection()
-  if (!container || !selection?.rangeCount || selection.isCollapsed) return undefined
-  if (!selection.getRangeAt(0).intersectsNode(container)) return undefined
-  const text = selection.toString().trim()
-  return text || undefined
-}
-
-function currentSelection(): RecordSelection | undefined {
-  const record = props.record
-  if (!record) return undefined
-  return {
-    path: record.path,
-    title: recordTitle(record),
-    contentHash: source.value?.state === 'opened' ? source.value.contentHash : record.contentHash,
-    isCapture: source.value?.state === 'opened' ? source.value.isCapture : record.isCapture,
-  }
-}
-
-function onOrganize() {
-  const selection = currentSelection()
-  if (selection) emit('organize', selection)
-}
-
-function onAddDisagreementSource() {
-  const selection = currentSelection()
-  if (!selection) return
-  const excerpt = selectedDetailExcerpt()
-  emit('addDisagreementSource', excerpt ? { ...selection, excerpt } : selection)
 }
 
 defineExpose({
@@ -139,63 +79,97 @@ defineExpose({
 </script>
 
 <template>
-  <aside ref="rootEl" class="record-detail" tabindex="-1" aria-labelledby="detail-heading">
-    <header class="section-bar"><UiIcon name="file" /><h2 id="detail-heading">记录详情</h2></header>
-    <div v-if="record" class="detail-card">
-      <h3>{{ recordTitle(record) }}</h3>
-      <time v-if="record.capturedAt" :datetime="record.capturedAt">
-        {{ dateLabel.format(new Date(record.capturedAt)) }} {{ timeLabel.format(new Date(record.capturedAt)) }}
-      </time>
-      <p v-else class="hint">记录日期未知</p>
-      <div v-if="showSourcePath(record.path, record.isCapture)" class="path-bar"><UiIcon name="folder" /><code>{{ record.path }}</code></div>
-      <div class="actions">
-        <button
-          type="button"
-          :disabled="opening"
-          :aria-disabled="source?.state === 'opening' || undefined"
-          @click="source?.state === 'opened' ? resetSource() : openRecordSource()"
-        >
-          {{ source?.state === 'opened' ? (searchActive ? '返回索引预览' : '返回保存快照') : source?.state === 'failed' ? '重试打开原文' : '打开原文' }}
-        </button>
-        <button type="button" :disabled="opening" @click="onOrganize">整理这条记录</button>
-        <button
-          type="button"
-          class="quiet"
-          :disabled="opening"
-          title="可先在下方正文划选片段后再点击，将自动带入分歧依据"
-          @click="onAddDisagreementSource"
-        >
-          {{ disagreementSlotsFull ? '查看已选分歧依据' : '用作分歧依据' }}
-        </button>
-        <button v-if="desktop" type="button" class="quiet" :disabled="opening" @click="openExternalFile('open')">
-          <UiIcon name="external" />外部打开
-        </button>
-        <button v-if="desktop" type="button" class="quiet" :disabled="opening" @click="openExternalFile('reveal')">
-          <UiIcon name="folder" />定位文件
-        </button>
-      </div>
-      <ErrorNotice :error="openFileError" />
-      <p v-if="source?.state === 'opening'" class="notice" role="status">正在读取原文…</p>
-      <ErrorNotice v-else-if="source?.state === 'failed'" :error="source.error" prefix="无法打开原文。" />
-      <p v-else-if="source?.state === 'opened' && source.changed" class="notice" role="status">
-        {{ searchActive ? '原文自索引后已变化。' : '原文自保存后已变化。' }}以下为当前文件内容。
-      </p>
-      <div class="detail-toolbar actions">
-        <span>{{ source?.state === 'opened' ? '当前原文' : detailPreviewLabel }}</span>
-        <div class="actions">
-          <div class="view-switch" role="group" aria-label="正文显示方式">
-            <button type="button" :aria-pressed="detailViewMode === 'preview'" @click="detailViewMode = 'preview'">渲染预览</button>
-            <button type="button" :aria-pressed="detailViewMode === 'source'" @click="detailViewMode = 'source'">源码</button>
-          </div>
-          <button v-if="source?.state === 'opened' || !searchActive" type="button" class="quiet" @click="copyMarkdown(detailBodyText)">复制正文</button>
+  <section ref="rootEl" class="pane pane-center" tabindex="-1" :aria-label="memoryPreview ? 'OpenViking 引用' : '记录详情与内联整理'">
+    <div v-if="memoryPreview" :key="memoryPreview.uri" class="pane-scroll">
+      <article class="detail-card">
+        <header class="m2-card-header">
+          <h2>{{ memoryPreview.title || 'OpenViking 引用' }}</h2>
+          <button type="button" class="quiet compact-btn" @click="emit('returnToNote')">返回本地记录</button>
+        </header>
+        <div class="detail-meta">
+          <span class="badge badge-accent">{{ citationKindLabels[memoryPreview.kind] }}</span>
+          <code class="inline-path">{{ memoryPreview.uri }}</code>
         </div>
-      </div>
-      <div ref="detailBodyRef">
-        <MarkdownPreview v-if="detailViewMode === 'preview'" :source="sourceMarkdown(detailBodyText)" />
-        <pre v-else tabindex="0">{{ sourceMarkdown(detailBodyText) }}</pre>
-      </div>
-      <p v-if="copyStatus" class="notice" role="status">{{ copyStatus }}</p>
+        <p v-if="memoryPreview.state === 'opening'" class="hint" role="status">正在读取 OpenViking 引用…</p>
+        <template v-else-if="memoryPreview.state === 'failed'">
+          <ErrorNotice :error="memoryPreview.error" prefix="无法打开 OpenViking 引用：" />
+          <div class="actions">
+            <button type="button" class="compact-btn" @click="emit('retryMemoryPreview')">重试读取</button>
+          </div>
+        </template>
+        <MarkdownPreview v-else :source="memoryPreview.content" />
+      </article>
     </div>
-    <p v-else class="empty-panel compact">选择记录后可查看详情。</p>
-  </aside>
+    <div v-show="!memoryPreview" class="pane-scroll">
+      <p v-if="loading && !detail" class="empty-panel compact" role="status">正在读取原文与整理结果…</p>
+      <ErrorNotice v-else-if="error && !detail" :error="error" prefix="无法打开记录：" />
+
+      <div v-else-if="detail" class="center-stack">
+        <article class="detail-card">
+          <header class="m2-card-header">
+            <div class="detail-title-group">
+              <h2>{{ displayTitle }}</h2>
+              <div class="detail-meta">
+                <time v-if="detail.capturedAt" :datetime="detail.capturedAt">
+                  {{ dateLabel.format(new Date(detail.capturedAt)) }} {{ timeLabel.format(new Date(detail.capturedAt)) }}
+                </time>
+                <span v-else class="hint">记录日期未知</span>
+                <code v-if="showSourcePath(detail.path, detail.isCapture)" class="inline-path">{{ detail.path }}</code>
+              </div>
+            </div>
+            <div class="actions">
+              <div class="view-switch" role="group" aria-label="正文显示方式">
+                <button type="button" :aria-pressed="detailViewMode === 'preview'" @click="detailViewMode = 'preview'">预览</button>
+                <button type="button" :aria-pressed="detailViewMode === 'source'" @click="detailViewMode = 'source'">源码</button>
+              </div>
+              <button type="button" class="quiet compact-btn" @click="copyMarkdown">
+                <UiIcon name="copy" />复制
+              </button>
+              <button v-if="desktop" type="button" class="quiet compact-btn" :disabled="opening" @click="openExternalFile('open')">
+                <UiIcon name="external" />外部打开
+              </button>
+              <button v-if="desktop" type="button" class="quiet compact-btn" :disabled="opening" @click="openExternalFile('reveal')">
+                <UiIcon name="folder" />定位
+              </button>
+            </div>
+          </header>
+
+          <ErrorNotice :error="openFileError" />
+          <p v-if="copyStatus" class="notice success compact-notice" role="status">{{ copyStatus }}</p>
+
+          <MarkdownPreview
+            v-if="detailViewMode === 'preview'"
+            :source="sourceMarkdown(detail.body)"
+            :session="session"
+            :base-path="detail.path"
+          />
+          <pre v-else class="source-pre" tabindex="0">{{ sourceMarkdown(detail.body) }}</pre>
+        </article>
+
+        <M2Organize
+          v-if="session"
+          :session="session"
+          :detail="detail"
+          :model-ready="modelReady"
+          :organizing="organizing"
+          :memory-config="memoryConfig"
+          :wiki-targets="wikiTargets"
+          :task-busy-id="taskBusyId"
+          @trigger-organize="emit('triggerOrganize', detail.locator)"
+          @toggle-task="(taskId, expectedLine, done) => emit('toggleTask', detail!.locator, taskId, expectedLine, done)"
+          @open-conflicts="emit('openConflicts')"
+          @open-wiki="emit('openWiki')"
+          @open-settings="emit('openSettings')"
+          @wiki-suggested="emit('wikiSuggested')"
+          @create-conflict="emit('createConflictFromNote', detail)"
+        />
+      </div>
+
+      <div v-else class="empty-panel">
+        <UiIcon name="file" />
+        <h2>选择一条记录</h2>
+        <p class="hint">在左栏点击任意随手记或搜索命中项，可在此处阅读原文、查看后台整理结果并直接勾选待办。</p>
+      </div>
+    </div>
+  </section>
 </template>

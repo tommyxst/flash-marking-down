@@ -278,6 +278,19 @@ async fn in_workspace_state<T: Send + 'static>(
     })?
 }
 
+pub(crate) fn active_workspace(app: &AppHandle) -> Result<Option<WorkspaceStorage>, AppError> {
+    let state = app.state::<Mutex<WorkspaceState>>();
+    let state = state.lock().map_err(|_| {
+        AppError::from_message(
+            "INTERNAL_ERROR",
+            "workspace",
+            false,
+            "工作区状态不可用，请重启应用",
+        )
+    })?;
+    Ok(state.active.clone())
+}
+
 pub(crate) async fn with_workspace<T: Send + 'static>(
     window: WebviewWindow,
     session: String,
@@ -335,7 +348,8 @@ pub(crate) async fn open_workspace(
         window.unlisten(listener);
         request.map_err(window_error)?;
     }
-    in_main_window(window, move |state, app| {
+    let app = window.app_handle().clone();
+    let opened = in_main_window(window, move |state, app| {
         app.state::<DesktopWindows>()
             .allow_workspace_switch()
             .map_err(|msg| AppError::from_message("WINDOW_BUSY", "workspace", true, msg))?;
@@ -343,14 +357,17 @@ pub(crate) async fn open_workspace(
             .activate(&settings::settings_path(app)?, &root, &capture_dir, true)
             .map_err(AppError::from)
     })
-    .await
+    .await?;
+    crate::m2_commands::wake_memory_backfill(&app);
+    Ok(opened)
 }
 
 #[tauri::command]
 pub(crate) async fn resume_workspace(
     window: WebviewWindow,
 ) -> Result<Option<OpenedWorkspaceDto>, AppError> {
-    in_main_window(window, move |state, app| {
+    let app = window.app_handle().clone();
+    let opened = in_main_window(window, move |state, app| {
         if state.active.is_some() {
             return state.read_active().map(Some);
         }
@@ -358,7 +375,11 @@ pub(crate) async fn resume_workspace(
             .resume(&settings::settings_path(app)?)
             .map_err(AppError::from)
     })
-    .await
+    .await?;
+    if opened.is_some() {
+        crate::m2_commands::wake_memory_backfill(&app);
+    }
+    Ok(opened)
 }
 
 fn window_error(detail: tauri::Error) -> AppError {
@@ -776,13 +797,21 @@ pub(crate) async fn commit_capture(
     revision: i64,
     body: String,
 ) -> Result<String, AppError> {
-    with_draft_workspace(window, session, move |storage| {
-        storage
-            .save_record(&request_id, CAPTURE_DRAFT, revision, &body)
-            .map(|record| record.relative_path)
-            .map_err(AppError::from)
+    let app = window.app_handle().clone();
+    let preferences = settings::settings_path(&app)
+        .and_then(|path| settings::read(&path))
+        .unwrap_or_default();
+    let (relative_path, enqueued) = with_draft_workspace(window, session, move |storage| {
+        let record = storage.save_record(&request_id, CAPTURE_DRAFT, revision, &body)?;
+        let enqueued =
+            crate::m2_commands::queue_saved_note(storage, &record.record_id, &preferences);
+        Ok((record.relative_path, enqueued))
     })
-    .await
+    .await?;
+    if enqueued {
+        crate::m2_commands::wake_organize_worker(&app);
+    }
+    Ok(relative_path)
 }
 
 #[tauri::command]

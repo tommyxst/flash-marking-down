@@ -77,7 +77,7 @@ pub(crate) fn write_credential(target: &str, secret: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_credential(target: &str) -> io::Result<Option<String>> {
+pub(crate) fn read_credential(target: &str, allow_bearer: bool) -> io::Result<Option<String>> {
     let target = wide(target);
     let mut pointer = null_mut();
     // CredReadW owns the returned buffer until CredFree, including the credential blob.
@@ -92,7 +92,12 @@ pub(crate) fn read_credential(target: &str) -> io::Result<Option<String>> {
             unsafe { std::slice::from_raw_parts(credential.blob, credential.blob_size as usize) };
         let normalize = |raw: &str| {
             let trimmed = raw.trim_end_matches('\0').trim();
-            (!trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_graphic()))
+            let key = if allow_bearer {
+                super::bearer_token(trimmed).unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            (!key.is_empty() && key.bytes().all(|b| b.is_ascii_graphic()))
                 .then(|| trimmed.to_owned())
         };
         if let Ok(text) = std::str::from_utf8(blob)

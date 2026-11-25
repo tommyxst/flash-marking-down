@@ -9,6 +9,7 @@ pub mod dto;
 mod hotkeys;
 #[cfg(windows)]
 mod m2_commands;
+mod memory;
 mod model;
 mod platform;
 #[cfg(windows)]
@@ -31,6 +32,7 @@ pub fn run() {
         .setup(|app| {
             capture_commands::init_tray(app.handle())?;
             hotkeys::init(app.handle());
+            m2_commands::init_organize_worker(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -52,33 +54,40 @@ pub fn run() {
             desktop_commands::open_workspace_file,
             desktop_commands::pick_workspace_markdown,
             desktop_commands::list_workspace_markdown_files,
+            desktop_commands::read_workspace_image,
             credential_commands::set_credential,
             m2_commands::get_model_config,
             m2_commands::get_integrations_config,
             m2_commands::save_model_config,
             m2_commands::save_memory_config,
             m2_commands::test_model_connection,
+            m2_commands::list_remote_models,
             m2_commands::test_memory_connection,
-            m2_commands::list_analyses,
-            m2_commands::analyze_source,
-            m2_commands::prepare_analysis_change,
-            m2_commands::prepare_answer,
-            m2_commands::cancel_answer_preparation,
-            m2_commands::answer_query,
-            m2_commands::copy_answer,
-            m2_commands::list_disagreements,
-            m2_commands::create_disagreement,
-            m2_commands::review_disagreement,
+            m2_commands::list_notes,
+            m2_commands::get_note_detail,
+            m2_commands::trigger_note_organize,
+            m2_commands::retry_memory_sync,
+            m2_commands::drawer_counts,
+            m2_commands::list_conflicts,
+            m2_commands::create_conflict,
+            m2_commands::resolve_conflict,
             m2_commands::wiki_targets,
             m2_commands::map_wiki_target,
+            m2_commands::unmap_wiki_target,
             m2_commands::create_wiki_target,
-            m2_commands::wiki_changes,
-            m2_commands::review_wiki_change,
-            m2_commands::apply_wiki_changes,
-            m2_commands::preview_wiki_undo,
-            m2_commands::rebase_wiki_change,
+            m2_commands::list_wiki_suggestions,
+            m2_commands::create_wiki_suggestion,
+            m2_commands::apply_wiki_suggestion,
+            m2_commands::recompare_wiki_suggestion,
+            m2_commands::reject_wiki_suggestion,
+            m2_commands::undo_wiki_suggestion,
             m2_commands::list_tasks,
             m2_commands::toggle_task,
+            m2_commands::list_conversations,
+            m2_commands::get_conversation,
+            m2_commands::delete_conversation,
+            m2_commands::send_chat_message,
+            m2_commands::read_memory_item,
             settings::get_app_settings,
             settings::save_app_settings,
             hotkeys::get_hotkey,

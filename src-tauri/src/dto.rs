@@ -191,40 +191,18 @@ pub struct WikiTargetDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct WikiChangeDto {
-    pub id: String,
-    pub target: String,
-    pub kind: String,
-    pub phase: String,
-    pub base_hash: String,
-    pub before: String,
-    pub after: String,
-    pub source_path: String,
-    pub source_revision: String,
-    pub start_line: u32,
-    pub end_line: u32,
-    pub source_excerpt: String,
-    pub source_is_capture: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WikiApplyOutcomeDto {
-    pub id: String,
-    pub outcome: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct TaskEntryDto {
     pub id: String,
+    pub path: String,
     pub expected_line: String,
     pub text: String,
     pub state: String,
     pub source_path: String,
     pub source_is_capture: bool,
     pub manual: bool,
+    pub assignee: Option<String>,
+    pub due: Option<String>,
+    pub note_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,4 +212,164 @@ pub struct TaskListDto {
     pub revision: String,
     pub entries: Vec<TaskEntryDto>,
     pub repair_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizedTaskDto {
+    pub id: String,
+    pub text: String,
+    pub assignee: Option<String>,
+    pub due: Option<String>,
+    pub done: bool,
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeResultDto {
+    pub summary: String,
+    pub decisions: Vec<String>,
+    pub tasks: Vec<OrganizedTaskDto>,
+    #[serde(default)]
+    pub source_changed: bool,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSummaryDto {
+    pub id: String,
+    pub path: String,
+    pub locator: String,
+    pub block_id: Option<String>,
+    pub captured_at: String,
+    pub title: String,
+    pub body_preview: String,
+    pub content_hash: String,
+    pub is_capture: bool,
+    pub organize_status: String,
+    pub ov_resource_status: String,
+    pub ov_memory_status: String,
+    pub open_conflict_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDto {
+    pub id: String,
+    pub topic: String,
+    pub current_label: String,
+    pub current_path: Option<String>,
+    pub current_text: String,
+    pub incoming_label: String,
+    pub incoming_path: Option<String>,
+    pub incoming_text: String,
+    pub status: String,
+    pub resolution_note: Option<String>,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WikiSuggestionDto {
+    pub id: String,
+    pub note_id: Option<String>,
+    pub target_path: String,
+    pub base_hash: String,
+    pub before_text: String,
+    pub after_text: String,
+    pub reason: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteDetailDto {
+    pub id: String,
+    pub path: String,
+    pub locator: String,
+    pub block_id: Option<String>,
+    pub captured_at: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub content_hash: String,
+    pub is_capture: bool,
+    pub organize_status: String,
+    pub organize: Option<OrganizeResultDto>,
+    pub organize_error: Option<String>,
+    pub ov_resource_status: String,
+    pub ov_resource_uri: Option<String>,
+    pub ov_memory_status: String,
+    pub ov_error: Option<String>,
+    pub conflicts: Vec<ConflictDto>,
+    pub wiki_suggestions: Vec<WikiSuggestionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawerCountsDto {
+    pub open_conflicts: usize,
+    pub pending_wiki: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CitationDto {
+    pub index: usize,
+    pub kind: String,
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
+    pub captured_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryItemDto {
+    pub uri: String,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummaryDto {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessageDto {
+    pub id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    pub citations: Vec<CitationDto>,
+    pub related_conflicts: Vec<ConflictDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDetailDto {
+    pub conversation: ConversationSummaryDto,
+    pub messages: Vec<ChatMessageDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTurnDto {
+    pub conversation: ConversationSummaryDto,
+    pub user_message: ChatMessageDto,
+    pub assistant_message: ChatMessageDto,
 }

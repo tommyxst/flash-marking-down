@@ -258,3 +258,53 @@ pub(crate) async fn list_workspace_markdown_files(
     .await
     .map_err(|_| AppError::from_message("CANCELLED", "wiki", true, "扫描工作区文件中断"))?
 }
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) & 0x3f] as char);
+        out.push(TABLE[(n >> 12) & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[tauri::command]
+pub(crate) async fn read_workspace_image(
+    window: WebviewWindow,
+    session: String,
+    base_path: Option<String>,
+    image_path: String,
+) -> Result<String, AppError> {
+    let files = with_workspace(window, session, |storage| Ok(storage.workspace_files())).await?;
+    async_runtime::spawn_blocking(move || {
+        let (mime, bytes) = files
+            .read_local_image(base_path.as_deref(), &image_path)
+            .map_err(|error| {
+                AppError::new(
+                    "SOURCE_UNAVAILABLE",
+                    "image",
+                    false,
+                    "无法读取工作区本地图片",
+                    Some(error.to_string()),
+                )
+            })?;
+        Ok(format!("data:{mime};base64,{}", encode_base64(&bytes)))
+    })
+    .await
+    .map_err(|_| AppError::from_message("CANCELLED", "image", true, "读取图片已中断"))?
+}

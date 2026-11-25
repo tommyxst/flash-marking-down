@@ -1,27 +1,29 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
-  Analysis,
-  Answer,
-  AnswerPreparation,
+  ChatTurn,
+  ConflictItem,
+  ConflictStatus,
+  ConversationDetail,
+  ConversationSummary,
   CredentialReference,
   CredentialSlot,
-  Disagreement,
-  DisagreementStatus,
-  DocumentChange,
   DocumentKind,
   DocumentMapping,
+  DrawerCounts,
   HotkeyStatus,
   IndexRebuildResult,
   IntegrationsConfig,
+  MemoryConfig,
+  MemoryItem,
   ModelConfig,
+  NoteDetail,
+  NoteSummary,
   OpenedWorkspace,
-  OutputKind,
   RecentCapture,
   RecordSource,
-  Relation,
   SearchPage,
   TaskList,
-  WikiApplyOutcome,
+  WikiSuggestion,
 } from '../m2'
 
 export interface AppSettings {
@@ -70,6 +72,8 @@ export const api = {
     invoke<string[]>('list_workspace_markdown_files', { session }),
   openWorkspaceFile: (session: string, relativePath: string, mode: 'open' | 'reveal') =>
     invoke<void>('open_workspace_file', { session, relativePath, mode }),
+  readWorkspaceImage: (session: string, basePath: string | undefined, imagePath: string) =>
+    invoke<string>('read_workspace_image', { session, basePath, imagePath }),
   desktopWindowAction: (action: 'drag' | 'minimize' | 'maximize' | 'close') =>
     invoke<void>('desktop_window_action', { action }),
   isMainMaximized: () =>
@@ -86,68 +90,83 @@ export const api = {
     invoke<IntegrationsConfig>('get_integrations_config', { session }),
   saveModelConfig: (session: string, endpoint: string, model: string, enabled: boolean, secret?: string) =>
     invoke<void>('save_model_config', { session, endpoint, model, enabled, secret }),
-  saveMemoryConfig: (session: string, baseUrl: string, namespace: string, enabled: boolean, secret?: string) =>
-    invoke<void>('save_memory_config', { session, baseUrl, namespace, enabled, secret }),
+  saveMemoryConfig: (session: string, config: MemoryConfig, secret?: string) =>
+    invoke<void>('save_memory_config', { session, ...config, secret }),
   testConnection: (session: string, slot: CredentialSlot) =>
     invoke<string>(slot === 'model' ? 'test_model_connection' : 'test_memory_connection', { session }),
+  listRemoteModels: (session: string, endpoint: string, secret?: string) =>
+    invoke<string[]>('list_remote_models', { session, endpoint, secret }),
+  retryMemorySync: (session: string, noteId?: string) =>
+    invoke<number>('retry_memory_sync', { session, noteId }),
+  readMemoryItem: (session: string, uri: string) =>
+    invoke<MemoryItem>('read_memory_item', { session, uri }),
 
-  listAnalyses: (session: string, relativePath: string) =>
-    invoke<Analysis[]>('list_analyses', { session, relativePath }),
-  analyzeSource: (session: string, relativePath: string, contentHash: string, approvedEndpoint: string) =>
-    invoke<Analysis>('analyze_source', { session, relativePath, contentHash, approvedEndpoint }),
-  prepareAnalysisChange: (session: string, itemId: string, target: string) =>
-    invoke<DocumentChange>('prepare_analysis_change', { session, itemId, target }),
+  listNotes: (session: string) =>
+    invoke<NoteSummary[]>('list_notes', { session }),
+  getNoteDetail: (session: string, idOrPath: string) =>
+    invoke<NoteDetail>('get_note_detail', { session, idOrPath }),
+  triggerNoteOrganize: (session: string, idOrPath: string) =>
+    invoke<NoteDetail>('trigger_note_organize', { session, idOrPath }),
+
+  drawerCounts: (session: string) =>
+    invoke<DrawerCounts>('drawer_counts', { session }),
+  listConflicts: (session: string) =>
+    invoke<ConflictItem[]>('list_conflicts', { session }),
+  createConflict: (params: {
+    session: string
+    topic: string
+    currentLabel?: string
+    currentPath?: string
+    currentText: string
+    incomingLabel?: string
+    incomingPath?: string
+    incomingText: string
+  }) => invoke<ConflictItem>('create_conflict', params),
+  resolveConflict: (params: {
+    session: string
+    id: string
+    status: ConflictStatus
+    resolutionNote?: string
+    wikiTarget?: string
+  }) => invoke<ConflictItem>('resolve_conflict', params),
 
   wikiTargets: (session: string) =>
     invoke<DocumentMapping[]>('wiki_targets', { session }),
   mapWikiTarget: (session: string, kind: DocumentKind, path: string) =>
     invoke<void>('map_wiki_target', { session, kind, path }),
+  unmapWikiTarget: (session: string, path: string) =>
+    invoke<void>('unmap_wiki_target', { session, path }),
   createWikiTarget: (session: string, path: string) =>
     invoke<void>('create_wiki_target', { session, path }),
-  wikiChanges: (session: string) =>
-    invoke<DocumentChange[]>('wiki_changes', { session }),
-  reviewWikiChange: (session: string, id: string, decision: 'rejected' | 'deferred') =>
-    invoke<void>('review_wiki_change', { session, id, decision }),
-  applyWikiChanges: (session: string, ids: string[]) =>
-    invoke<WikiApplyOutcome[]>('apply_wiki_changes', { session, ids }),
-  previewWikiUndo: (session: string, id: string) =>
-    invoke<DocumentChange>('preview_wiki_undo', { session, id }),
-  rebaseWikiChange: (session: string, id: string) =>
-    invoke<DocumentChange>('rebase_wiki_change', { session, id }),
+  listWikiSuggestions: (session: string) =>
+    invoke<WikiSuggestion[]>('list_wiki_suggestions', { session }),
+  createWikiSuggestion: (params: {
+    session: string
+    noteId?: string
+    targetPath: string
+    content: string
+    reason: string
+  }) => invoke<WikiSuggestion>('create_wiki_suggestion', params),
+  applyWikiSuggestion: (session: string, id: string) =>
+    invoke<WikiSuggestion>('apply_wiki_suggestion', { session, id }),
+  recompareWikiSuggestion: (session: string, id: string) =>
+    invoke<WikiSuggestion>('recompare_wiki_suggestion', { session, id }),
+  rejectWikiSuggestion: (session: string, id: string) =>
+    invoke<void>('reject_wiki_suggestion', { session, id }),
+  undoWikiSuggestion: (session: string, id: string) =>
+    invoke<WikiSuggestion>('undo_wiki_suggestion', { session, id }),
+
   listTasks: (session: string) =>
     invoke<TaskList>('list_tasks', { session }),
   toggleTask: (session: string, path: string, taskId: string, expectedLine: string, done: boolean) =>
     invoke<void>('toggle_task', { session, path, taskId, expectedLine, done }),
 
-  prepareAnswer: (params: {
-    session: string
-    query: string
-    keyword: string
-    dateBasis: 'recorded' | 'event'
-    fromDate?: string
-    toDate?: string
-    outputKind: OutputKind
-    anchorClaimId?: string
-  }) => invoke<AnswerPreparation>('prepare_answer', params),
-  answerQuery: (session: string, preparationId: string, approvedEndpoint: string) =>
-    invoke<Answer>('answer_query', { session, preparationId, approvedEndpoint }),
-  cancelAnswerPreparation: (session: string, preparationId: string) =>
-    invoke<void>('cancel_answer_preparation', { session, preparationId }),
-  copyAnswer: (session: string, answerId: string) =>
-    invoke<string>('copy_answer', { session, answerId }),
-  listDisagreements: (session: string) =>
-    invoke<Disagreement[]>('list_disagreements', { session }),
-  createDisagreement: (
-    session: string,
-    question: string,
-    relation: Relation,
-    members: { path: string; revision: string; excerpt: string }[],
-  ) => invoke<Disagreement>('create_disagreement', { session, question, relation, members }),
-  reviewDisagreement: (
-    session: string,
-    id: string,
-    status: DisagreementStatus,
-    judgment: string,
-    reason: string,
-  ) => invoke<Disagreement>('review_disagreement', { session, id, status, judgment, reason }),
+  listConversations: (session: string) =>
+    invoke<ConversationSummary[]>('list_conversations', { session }),
+  getConversation: (session: string, id: string) =>
+    invoke<ConversationDetail>('get_conversation', { session, id }),
+  deleteConversation: (session: string, id: string) =>
+    invoke<void>('delete_conversation', { session, id }),
+  sendChatMessage: (session: string, conversationId: string | undefined, message: string) =>
+    invoke<ChatTurn>('send_chat_message', { session, conversationId, message }),
 }

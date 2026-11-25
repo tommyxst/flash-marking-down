@@ -46,8 +46,8 @@ watch(() => props.open, (open) => {
     <h3 id="auto-actions-heading">自动处理偏好</h3>
     <template v-if="preferences">
       <label class="m2-check"><input type="checkbox" :checked="preferences.autoOrganize" :disabled="busy" @change="change('autoOrganize', $event)" />保存后自动整理笔记</label>
-      <label class="m2-check"><input type="checkbox" :checked="preferences.autoSyncMemory" :disabled="busy" @change="change('autoSyncMemory', $event)" />自动同步到 OpenViking</label>
-      <p class="hint">当前版本会保存你的选择。后台整理与同步将在对应功能上线后启用。</p>
+      <label class="m2-check"><input type="checkbox" :checked="preferences.autoSyncMemory" :disabled="busy" @change="change('autoSyncMemory', $event)" />保存后自动同步到 OpenViking</label>
+      <p class="hint">自动处理需要先启用对应服务。可在 OpenViking 设置中选择同步内容，也可手动补推。</p>
     </template>
     <p v-else-if="busy" class="hint" role="status">正在读取偏好…</p>
     <ErrorNotice :error="error" />

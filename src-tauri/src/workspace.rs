@@ -159,6 +159,81 @@ impl WorkspaceFiles {
         fs::read(self.markdown_full_path(relative_path)?)
     }
 
+    pub(crate) fn read_local_image(
+        &self,
+        base_markdown: Option<&str>,
+        image_ref: &str,
+    ) -> io::Result<(&'static str, Vec<u8>)> {
+        let trimmed = image_ref.trim();
+        let raw_path = trimmed
+            .split(['#', '?'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\\', "/");
+        if raw_path.is_empty()
+            || raw_path.starts_with("//")
+            || raw_path.starts_with('/')
+            || raw_path
+                .split('/')
+                .next()
+                .is_some_and(|head| head.contains(':'))
+        {
+            return Err(scope_error("remote or absolute image paths are blocked"));
+        }
+        let rel = Path::new(&raw_path);
+        for component in rel.components() {
+            match component {
+                Component::CurDir | Component::ParentDir => (),
+                Component::Normal(name) if !name.eq_ignore_ascii_case(STATE_DIR) => {
+                    validate_component(name)?;
+                }
+                _ => return Err(scope_error("image path is outside the document scope")),
+            }
+        }
+        let base_dir = match base_markdown {
+            Some(base) if !base.trim().is_empty() => {
+                let physical = base.split_once("#fmd-note:").map_or(base, |(path, _)| path);
+                let mut parent = self.root.clone();
+                if let Some(dir) = Path::new(physical).parent() {
+                    validate_relative(dir)?;
+                    parent.push(dir);
+                }
+                parent
+            }
+            _ => self.root.clone(),
+        };
+        let resolved = base_dir.join(rel).canonicalize()?;
+        self.key(&resolved)?;
+        let meta = resolved.metadata()?;
+        if !meta.is_file() {
+            return Err(scope_error("expected a regular image file"));
+        }
+        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+        if meta.len() > MAX_IMAGE_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "image exceeds 10 MiB limit",
+            ));
+        }
+        let mime = match resolved
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("svg") => "image/svg+xml",
+            Some("ico") => "image/x-icon",
+            _ => return Err(scope_error("unsupported image extension")),
+        };
+        Ok((mime, fs::read(resolved)?))
+    }
+
     pub(crate) fn markdown_full_path(&self, relative_path: &str) -> io::Result<PathBuf> {
         let path = self.markdown_input(relative_path)?.canonicalize()?;
         self.checked_markdown(&path)?;
@@ -398,5 +473,45 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         assert!(picked_capture_directory(&checked_root, "", &state).is_err());
         assert!(picked_capture_directory(&checked_root, "", &outside).is_err());
+    }
+
+    #[test]
+    fn reads_relative_workspace_images_and_blocks_remote_or_escaping_paths() {
+        let dir = TestDir::new();
+        let root = dir.0.join("workspace");
+        let outside = dir.0.join("outside.png");
+        fs::create_dir_all(root.join("daily/assets")).unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        fs::write(root.join("daily/assets/shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(root.join(STATE_DIR).join("secret.png"), b"\x89PNG").unwrap();
+        fs::write(&outside, b"\x89PNG").unwrap();
+
+        let files = WorkspaceFiles::open(&root, STATE_DIR).unwrap();
+        let (mime, bytes) = files
+            .read_local_image(
+                Some("daily/2026-11-25.md#fmd-note:abcd1234"),
+                "./assets/shot.png",
+            )
+            .unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+
+        for blocked in [
+            "https://example.com/tracker.png",
+            "http://localhost/x.png",
+            "data:image/png;base64,AAAA",
+            "../outside.png",
+            "../../outside.png",
+            "../.flash-marking-down/secret.png",
+            ".flash-marking-down/secret.png",
+            "assets/not-image.txt",
+        ] {
+            assert!(
+                files
+                    .read_local_image(Some("daily/2026-11-25.md"), blocked)
+                    .is_err(),
+                "expected `{blocked}` to be rejected"
+            );
+        }
     }
 }

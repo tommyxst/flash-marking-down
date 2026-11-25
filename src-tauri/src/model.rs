@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use tauri::Url;
 
 use crate::dto::AppError;
+use crate::memory::{MemoryProvider, OpenVikingProvider};
 use crate::platform::{Auth, HttpTransport, default_http_transport, request_json};
 
 #[derive(Serialize, Deserialize)]
@@ -18,6 +19,14 @@ pub(crate) struct MemoryConfig {
     pub base_url: String,
     pub namespace: String,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub sync_resources: bool,
+    #[serde(default = "default_true")]
+    pub commit_memories: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const JSON_RETRY_LIMIT: usize = 1;
@@ -51,6 +60,52 @@ pub(crate) fn endpoint(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+pub(crate) fn chat_endpoint(value: &str) -> Result<Url, String> {
+    let mut url = endpoint(value)?;
+    let trimmed = url.path().trim_end_matches('/').to_owned();
+    if trimmed.is_empty() {
+        url.set_path("/v1/chat/completions");
+    } else if trimmed.ends_with("/v1") || trimmed.ends_with("/v4") {
+        url.set_path(&format!("{trimmed}/chat/completions"));
+    }
+    Ok(url)
+}
+
+pub(crate) fn models_endpoint(value: &str) -> Result<Url, String> {
+    let mut url = chat_endpoint(value)?;
+    let trimmed = url.path().trim_end_matches('/').to_owned();
+    let next = if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        format!("{prefix}/models")
+    } else {
+        format!("{trimmed}/models")
+    };
+    url.set_path(&next);
+    Ok(url)
+}
+
+pub(crate) fn list_models(url: &Url, token: Option<&str>) -> Result<Vec<String>, AppError> {
+    let response = request_json(url, token.map_or(Auth::None, Auth::Bearer), None)?;
+    let result: Value = serde_json::from_slice(&response)
+        .map_err(|_| AppError::invalid("model_config", "端点未返回有效的 /models JSON 列表"))?;
+    let mut models = Vec::new();
+    if let Some(items) = result["data"].as_array() {
+        for item in items {
+            if let Some(id) = item["id"].as_str().map(str::trim).filter(|s| !s.is_empty())
+                && !models.iter().any(|existing: &String| existing == id)
+            {
+                models.push(id.to_owned());
+            }
+        }
+    }
+    if models.is_empty() {
+        return Err(AppError::invalid(
+            "model_config",
+            "端点未返回可用的模型列表（/models）",
+        ));
+    }
+    Ok(models)
+}
+
 impl ModelSettings {
     pub(crate) fn new(url: &str, model: &str, enabled: bool) -> Result<Self, String> {
         let model = model.trim();
@@ -58,7 +113,7 @@ impl ModelSettings {
             return Err("请填写有效的模型名称".into());
         }
         Ok(Self {
-            endpoint: endpoint(url)?.to_string(),
+            endpoint: chat_endpoint(url)?.to_string(),
             model: model.into(),
             enabled,
         })
@@ -66,7 +121,13 @@ impl ModelSettings {
 }
 
 impl MemoryConfig {
-    pub(crate) fn new(base_url: &str, namespace: &str, enabled: bool) -> Result<Self, String> {
+    pub(crate) fn new(
+        base_url: &str,
+        namespace: &str,
+        enabled: bool,
+        sync_resources: bool,
+        commit_memories: bool,
+    ) -> Result<Self, String> {
         let url = endpoint(base_url)?;
         if url.query().is_some() {
             return Err("OpenViking 服务地址不能包含查询参数".into());
@@ -84,6 +145,8 @@ impl MemoryConfig {
             base_url: url.as_str().trim_end_matches('/').to_owned(),
             namespace: name.into(),
             enabled,
+            sync_resources,
+            commit_memories,
         })
     }
 }
@@ -111,52 +174,23 @@ pub(crate) fn probe_model(url: &Url, model: &str, token: Option<&str>) -> Result
 }
 
 pub(crate) fn probe_memory(base_url: &Url, token: Option<&str>) -> Result<String, AppError> {
-    let mut url = base_url.clone();
-    url.path_segments_mut()
-        .map_err(|_| AppError::invalid("connection", "OpenViking 服务地址无效"))?
-        .pop_if_empty()
-        .push("health");
-    let response = request_json(&url, token.map_or(Auth::None, Auth::ApiKey), None)?;
-    let health: Value = serde_json::from_slice(&response).map_err(|_| {
-        AppError::invalid("connection", "未收到 OpenViking 健康状态，请核对服务地址")
-    })?;
-    if health["status"] != "ok" {
+    let provider =
+        OpenVikingProvider::new(base_url.clone(), String::new(), token.map(str::to_owned));
+    let health = provider.health_check()?;
+    if !health.healthy {
         return Err(AppError::invalid(
             "connection",
             "OpenViking 未报告就绪，请检查服务状态",
         ));
     }
-    let version = health["version"].as_str().filter(|v| !v.is_empty());
-    if health["auth_mode"] == "dev" {
-        return Ok(match version {
-            Some(version) => format!("连接成功（OpenViking {version}，免密开发模式）。"),
-            None => "连接成功，服务处于免密开发模式。".into(),
-        });
-    }
-    if health["role"] == "root" {
-        return Err(AppError::from_message(
-            "AUTH_FAILED",
-            "connection",
-            false,
-            "当前为 OpenViking root 管理密钥，无法读写笔记与记忆，请改用用户或管理员 API Key",
-        ));
-    }
-    match (health["account_id"].as_str(), health["user_id"].as_str()) {
-        (Some(account), Some(user)) if !account.is_empty() && !user.is_empty() => {
-            Ok(match version {
-                Some(version) => {
-                    format!("连接成功（OpenViking {version}），账户 {account}，用户 {user}。")
-                }
-                None => format!("连接成功，账户 {account}，用户 {user}。"),
-            })
+    Ok(match (health.version, health.identity) {
+        (Some(version), Some(identity)) => {
+            format!("连接成功（OpenViking {version}），{identity}。")
         }
-        _ => Err(AppError::from_message(
-            "AUTH_FAILED",
-            "connection",
-            false,
-            "OpenViking 可达，但未确认认证身份，请检查 API Key",
-        )),
-    }
+        (None, Some(identity)) => format!("连接成功，{identity}。"),
+        (Some(version), None) => format!("连接成功（OpenViking {version}，免密开发模式）。"),
+        (None, None) => "连接成功，服务处于免密开发模式。".into(),
+    })
 }
 
 pub(crate) fn loopback(url: &Url) -> bool {
@@ -671,6 +705,66 @@ mod tests {
         });
         let value = generate(&url, "fixture", None, "instruction", json!({"a":1})).unwrap();
         assert_eq!(value["items"], json!([]));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn normalizes_base_urls_lists_models_and_surfaces_404_detail() {
+        assert_eq!(
+            chat_endpoint("http://127.0.0.1:3425").unwrap().as_str(),
+            "http://127.0.0.1:3425/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("http://127.0.0.1:3425/v1").unwrap().as_str(),
+            "http://127.0.0.1:3425/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("http://127.0.0.1:3425/v1/").unwrap().as_str(),
+            "http://127.0.0.1:3425/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("https://open.bigmodel.cn/api/paas/v4")
+                .unwrap()
+                .as_str(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            models_endpoint("http://127.0.0.1:3425/v1")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3425/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("http://127.0.0.1:3425/v1/chat/completions")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3425/v1/models"
+        );
+
+        let (url, peer) = reply_once(
+            "GET /proxy/models HTTP/1.1",
+            "",
+            "200 OK",
+            r#"{"data":[{"id":"auto/gemini-3.8-flash"},{"id":"group/deepseek-v4.1-flash"},{"id":"auto/gemini-3.8-flash"}]}"#,
+        );
+        let mut models_url = url;
+        models_url.set_path("/proxy/models");
+        assert_eq!(
+            list_models(&models_url, None).unwrap(),
+            vec!["auto/gemini-3.8-flash", "group/deepseek-v4.1-flash"]
+        );
+        peer.join().unwrap();
+
+        let (url, peer) = reply_once(
+            "POST /proxy HTTP/1.1",
+            "",
+            "404 Not Found",
+            r#"{"error":{"message":"magpie knows no model \"gpt-4.1-mini\""}}"#,
+        );
+        let error = probe_model(&url, "fixture", None).unwrap_err();
+        assert_eq!(error.code, "SERVICE_ERROR");
+        assert!(error.safe_message.contains("HTTP 404"));
+        assert!(error.safe_message.contains("magpie knows no model"));
         peer.join().unwrap();
     }
 }

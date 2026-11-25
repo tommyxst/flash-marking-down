@@ -1,9 +1,13 @@
 <script setup lang="ts">
 const paths = {
   bolt: 'M13 2 4 14h7l-1 8 10-12h-7l1-8Z',
+  chat: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z',
   check: 'M5 13l4 4L19 7',
   close: 'M6 6l12 12M18 6 6 18',
+  conflict: 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 0c0 6-6 3-12 6m0 6a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z',
   copy: 'M9 9h10v10H9zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1',
+  plus: 'M12 5v14M5 12h14',
+  sidebar: 'M3 5h18v14H3zM15 5v14',
   external: 'M14 5h5v5m0-5-9 9M10 7H6a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-4',
   file: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Zm0 0v6h6M8 13h8m-8 4h6',
   folder: 'M3 5h6l2 3h10v11H3Z',

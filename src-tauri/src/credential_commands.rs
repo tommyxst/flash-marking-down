@@ -4,7 +4,7 @@ use tauri::WebviewWindow;
 
 use crate::capture_commands::with_workspace;
 use crate::dto::{AppError, CredentialStatusDto};
-use crate::platform::{credential_exists, read_credential};
+use crate::platform::{bearer_token, credential_exists, read_credential};
 use crate::storage::Storage;
 
 const CRED_MAX_CREDENTIAL_BLOB_SIZE: usize = 5 * 512;
@@ -49,7 +49,8 @@ pub(crate) fn config_key<'a>(
     if secret.trim().is_empty() {
         return Ok(None);
     }
-    let token = validate_secret(secret).map_err(|msg| AppError::invalid("credential", msg))?;
+    let token = validate_secret(secret, slot == "memory")
+        .map_err(|msg| AppError::invalid("credential", msg))?;
     Ok(Some((target_name(storage.workspace_id(), slot)?, token)))
 }
 
@@ -57,9 +58,14 @@ pub(crate) fn model_credential_state(storage: &Storage) -> Result<String, AppErr
     Ok(status(storage, "model")?.state)
 }
 
-fn validate_secret(secret: &str) -> Result<&str, String> {
+fn validate_secret(secret: &str, allow_bearer: bool) -> Result<&str, String> {
     let token = secret.trim();
-    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+    let key = if allow_bearer {
+        bearer_token(token).unwrap_or(token)
+    } else {
+        token
+    };
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()) {
         return Err("密钥不能为空，且仅允许可见 ASCII 字符（不能含内部空格或换行）".into());
     }
     if token.encode_utf16().count() * size_of::<u16>() > CRED_MAX_CREDENTIAL_BLOB_SIZE {
@@ -135,7 +141,7 @@ pub(crate) fn service_token(
             "请先在工作区设置录入或关联此服务的 API Key",
         ));
     }
-    let token = read_credential(&target).map_err(credential_error)?;
+    let token = read_credential(&target, slot == "memory").map_err(credential_error)?;
     token.map(Some).ok_or_else(|| {
         AppError::from_message(
             "AUTH_FAILED",
@@ -164,15 +170,24 @@ mod tests {
 
     #[test]
     fn validates_and_trims_credential_secrets() {
-        assert!(validate_secret(&"x".repeat(1280)).is_ok());
+        assert!(validate_secret(&"x".repeat(1280), false).is_ok());
         assert!(
-            validate_secret(&"x".repeat(1281))
+            validate_secret(&"x".repeat(1281), false)
                 .unwrap_err()
                 .contains("UTF-16")
         );
-        assert_eq!(validate_secret("  sk-test-123\r\n").unwrap(), "sk-test-123");
-        assert!(validate_secret("   ").is_err());
-        assert!(validate_secret("sk test").is_err());
-        assert!(validate_secret("sk-\u{0007}").is_err());
+        assert_eq!(
+            validate_secret("  sk-test-123\r\n", false).unwrap(),
+            "sk-test-123"
+        );
+        assert!(validate_secret("   ", false).is_err());
+        assert!(validate_secret("sk test", false).is_err());
+        assert!(validate_secret("sk-\u{0007}", false).is_err());
+        assert_eq!(
+            validate_secret("  bEaReR fixture  ", true).unwrap(),
+            "bEaReR fixture"
+        );
+        assert!(validate_secret("Bearer fixture other", true).is_err());
+        assert!(validate_secret("Bearer fixture", false).is_err());
     }
 }

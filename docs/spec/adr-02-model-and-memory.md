@@ -9,7 +9,7 @@
 
 ## 2. 大模型接入（OpenAI 兼容 Chat Completions）
 
-- **端点与凭据**：工作区保存完整 Chat Completions URL（允许常规 query 参数如 Azure `api-version`，禁止 URL 内嵌凭据或片段）、模型名与启用状态。公网端点要求 HTTPS 并配置 API Key（经 Windows `CredWriteW` 写入系统凭据管理器，输入校验同步兼顾 UTF-16 编码字节上限）；本机回环（`localhost` / `127.0.0.1` / `[::1]`）与局域网私有地址允许 HTTP 及按需免凭据。
+- **端点与凭据**：工作区保存完整 Chat Completions URL 或标准 Base URL（`http://host:port` / `.../v1` 自动补全为 `/v1/chat/completions` 或 `/chat/completions`，允许常规 query 参数如 Azure `api-version`，禁止 URL 内嵌凭据或片段）、模型名与启用状态，并支持从 `/models` 获取可用模型列表。公网端点要求 HTTPS 并配置 API Key（经 Windows `CredWriteW` 写入系统凭据管理器，输入校验同步兼顾 UTF-16 编码字节上限）；本机回环（`localhost` / `127.0.0.1` / `[::1]`）与局域网私有地址允许 HTTP 及按需免凭据。
 - **体验约定**：
   - 设置弹窗内将模型配置与 API Key 合并为一次提交，并提供一键「测试连接」。
   - 启用后，后台自动整理与右侧多轮对话直接发起请求，不弹逐次确认窗。
@@ -23,6 +23,6 @@
   - **认证**：支持 `X-API-Key`（默认）或 `Authorization: Bearer <token>`，API Key 同样存 Windows 系统凭据管理器（槽位 `memory`）。
   - **连通性测试**：`GET /health`（携带认证头解析 `account_id / user_id / role`），支撑设置页一键测试连接。
   - **知识原文路**：笔记落盘每日文件后，后台异步调用 `POST /api/v1/content/write`（`mode: "replace"`, `wait: false`），写入工作区隔离前缀 `viking://resources/flash-marking-down/<workspace>/daily/<YYYY-MM-DD>.md`，利用 OV 自动生成 L0/L1 分层摘要与向量索引。
-  - **长期记忆路**：后台整理完成后，将本次新笔记要点通过 `POST /api/v1/sessions` → `POST /api/v1/sessions/{id}/messages` → `POST /api/v1/sessions/{id}/commit`（`wait: false`）交由 OV 记忆管线抽取并去重沉淀为长期 `memories`。
+  - **长期记忆路**：后台整理后，将原文及已有整理要点通过 `POST /api/v1/sessions` → `POST /api/v1/sessions/{id}/messages` → `POST /api/v1/sessions/{id}/commit`（请求体 `{}`）提交给 OV，由服务后台抽取长期 `memories`。
   - **混合对话召回**：对话提问时并行检索本地 FTS5 与 `POST /api/v1/search/search`（召回 `memories` 与 `resources`），按需通过 `GET /api/v1/content/overview` 或 `GET /api/v1/content/read` 展开细节。
-- **务实容错**：不引入重型异步双验证 Saga 对账矩阵。OV 离线、超时或鉴权失败时，本地记录轻量 `pending | failed` 同步状态供自动重试或手动一键补推；对话自动降级为纯本地笔记召回并温和提示。
+- 两路与整理共用后台队列，提交状态用 `pending | synced | failed` 表示。资源按日覆盖，记忆按笔记提交。OV 检索失效时，整理和对话沿用本地召回，对话消息记录降级原因。

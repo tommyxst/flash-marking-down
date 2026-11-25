@@ -1,334 +1,232 @@
 <script setup lang="ts">
-import { isTauri } from '@tauri-apps/api/core'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import { api } from './api/client'
 import { parseAppError, type UiError } from './api/errors'
 import ErrorNotice from './components/ErrorNotice.vue'
 import DiffViewer from './DiffViewer.vue'
-import M2Evidence from './M2Evidence.vue'
 import UiIcon from './UiIcon.vue'
-import type {
-  ChangeKind,
-  ChangePhase,
-  DocumentChange,
-  DocumentMapping,
-  Evidence,
-  RecordSelection,
-  TaskEntry,
-  TaskList,
-  TaskState,
-  WikiApplyOutcome,
+import {
+  wikiStatusLabels,
+  wikiStatusTone,
+  type DocumentMapping,
+  type WikiSuggestion,
 } from './m2'
-import { phaseBadgeTone, useSourcePresentation } from './m2'
 
 const props = defineProps<{
   session: string
-  mode: 'wiki' | 'tasks' | null
-  mappings: DocumentMapping[]
-  preview?: DocumentChange
+  suggestions: WikiSuggestion[]
+  wikiTargets: DocumentMapping[]
+  workspaceFiles: string[]
+  desktop: boolean
 }>()
-const emit = defineEmits<{ showOrganize: []; selectDisagreementSource: [source: RecordSelection] }>()
-const { showSourcePath } = useSourcePresentation()
-const desktop = isTauri()
 
-const phaseLabels: Record<ChangePhase, string> = {
-  pending: '待审阅', deferred: '稍后处理', rejected: '已拒绝', prepared: '待核对写入结果',
-  applied: '已采用', conflict: '版本冲突', reverted: '已撤销', superseded: '已由新版预览替代',
-}
-const kindLabels: Record<ChangeKind, string> = {
-  wiki: 'Wiki 修改', task: '加入任务清单', status: '任务状态修改',
-  undo_wiki: '撤销 Wiki 修改', undo_task: '撤销加入任务', undo_status: '撤销任务状态修改',
-}
-const stateLabels: Record<TaskState, string> = { open: '待办', done: '已完成', cancelled: '已取消', invalid: '待修复' }
-const stateBadgeTone: Record<TaskState, string> = { open: 'badge-accent', done: 'badge-success', cancelled: 'badge-muted', invalid: 'badge-error' }
+const emit = defineEmits<{
+  updated: []
+  targetsChanged: []
+}>()
 
-const changes = ref<DocumentChange[]>([])
-const selectedId = ref('')
-const chosen = ref<string[]>([])
-const changesLoading = ref(false)
-const outcomes = ref<WikiApplyOutcome[]>([])
-const taskList = ref<TaskList>()
-const taskLoading = ref(false)
-const busy = ref(false)
+const mappingPath = ref('')
+const mappingMode = ref<'existing' | 'new'>('existing')
+const mappingBusy = ref(false)
+const pickingFile = ref(false)
+const busyId = ref('')
 const error = ref<UiError | null>(null)
 const feedback = ref('')
 
-const taskTarget = computed(() => props.mappings.find((m) => m.kind === 'tasks')?.path)
-const selected = computed(() => changes.value.find((change) => change.id === selectedId.value) ?? changes.value[0])
-const editable = computed(() => selected.value && canReview(selected.value))
-const changeSource = computed<Evidence | undefined>(() => {
-  const item = selected.value
-  if (!item) return undefined
-  return {
-    id: item.id,
-    path: item.sourcePath,
-    revision: item.sourceRevision,
-    startLine: item.startLine,
-    endLine: item.endLine,
-    excerpt: item.sourceExcerpt,
-    date: null,
-    available: true,
-    changed: false,
-    outsideRange: false,
-    isCapture: item.sourceIsCapture,
-  }
-})
+const mappedWikis = computed(() =>
+  props.wikiTargets.filter((item) => item.kind === 'wiki'),
+)
 
-async function openTargetExternal(path: string, mode: 'open' | 'reveal') {
+async function pickMarkdownFile() {
+  if (pickingFile.value || mappingBusy.value) return
+  pickingFile.value = true
   error.value = null
   try {
-    await api.openWorkspaceFile(props.session, path, mode)
-  } catch (failure) {
-    error.value = parseAppError(failure)
-  }
-}
-
-watch(() => props.preview, (change) => { if (change) showChange(change) })
-watch(() => props.mode, (mode) => {
-  error.value = null
-  feedback.value = ''
-  if (mode === 'wiki') void loadChanges()
-})
-watch(() => [props.mode, taskTarget.value] as const, ([mode, target], previous) => {
-  if (target !== previous?.[1]) taskList.value = undefined
-  if (mode === 'tasks' && target) void loadTasks()
-}, { immediate: true })
-
-onMounted(() => window.addEventListener('focus', refreshFromDisk))
-onUnmounted(() => window.removeEventListener('focus', refreshFromDisk))
-
-function refreshFromDisk() {
-  if (props.mode === 'tasks' && taskTarget.value && !busy.value) void loadTasks()
-}
-
-function showChange(change: DocumentChange) {
-  changes.value = [change, ...changes.value.filter((item) => item.id !== change.id)]
-  selectedId.value = change.id
-}
-
-function canReview(change: DocumentChange) {
-  return change.phase === 'pending' || change.phase === 'deferred'
-}
-
-async function loadChanges() {
-  if (changesLoading.value) return
-  changesLoading.value = true
-  try {
-    changes.value = await api.wikiChanges(props.session)
-    chosen.value = chosen.value.filter((id) => changes.value.some((change) => change.id === id && canReview(change)))
-  } catch (failure) {
-    error.value = parseAppError(failure)
+    const selected = await api.pickWorkspaceMarkdown(props.session, 'wiki')
+    if (selected) mappingPath.value = selected
+  } catch (err) {
+    error.value = parseAppError(err)
   } finally {
-    changesLoading.value = false
+    pickingFile.value = false
   }
 }
 
-async function refreshChanges() {
-  error.value = null
-  await loadChanges()
-}
-
-async function applyChanges(ids: string[]) {
-  if (!ids.length || busy.value || changesLoading.value) return
-  busy.value = true
-  outcomes.value = []
+async function addMapping() {
+  const path = mappingPath.value.trim()
+  if (!path || mappingBusy.value) return
+  mappingBusy.value = true
   error.value = null
   feedback.value = ''
   try {
-    outcomes.value = await api.applyWikiChanges(props.session, ids)
-    await loadChanges()
-  } catch (failure) {
-    error.value = parseAppError(failure)
+    if (mappingMode.value === 'new') await api.createWikiTarget(props.session, path)
+    else await api.mapWikiTarget(props.session, 'wiki', path)
+    mappingPath.value = ''
+    feedback.value = mappingMode.value === 'new' ? `已新建并映射 ${path}` : `已映射 ${path}`
+    emit('targetsChanged')
+  } catch (err) {
+    error.value = parseAppError(err)
   } finally {
-    busy.value = false
+    mappingBusy.value = false
   }
 }
 
-async function decide(id: string, decision: 'rejected' | 'deferred') {
-  if (busy.value) return
-  busy.value = true
+async function unmapTarget(path: string) {
+  if (mappingBusy.value) return
+  mappingBusy.value = true
   error.value = null
   feedback.value = ''
   try {
-    await api.reviewWikiChange(props.session, id, decision)
-    feedback.value = decision === 'rejected' ? '已拒绝此变更。' : '已保留预览，稍后可继续审阅。'
-    await loadChanges()
-  } catch (failure) {
-    error.value = parseAppError(failure)
+    await api.unmapWikiTarget(props.session, path)
+    feedback.value = `已解除 Wiki 目标映射：${path}`
+    emit('targetsChanged')
+  } catch (err) {
+    error.value = parseAppError(err)
   } finally {
-    busy.value = false
+    mappingBusy.value = false
   }
 }
 
-async function generatePreview(id: string, command: 'preview_wiki_undo' | 'rebase_wiki_change') {
-  if (busy.value) return
-  busy.value = true
+async function runAction(
+  id: string,
+  action: 'apply' | 'recompare' | 'reject' | 'undo',
+) {
+  if (busyId.value) return
+  busyId.value = id
   error.value = null
   feedback.value = ''
   try {
-    const change = command === 'preview_wiki_undo'
-      ? await api.previewWikiUndo(props.session, id)
-      : await api.rebaseWikiChange(props.session, id)
-    showChange(change)
-    await loadChanges()
-  } catch (failure) {
-    error.value = parseAppError(failure)
-  } finally {
-    busy.value = false
-  }
-}
-
-async function loadTasks() {
-  const target = taskTarget.value
-  if (!target || taskLoading.value) return
-  taskLoading.value = true
-  try {
-    const list = await api.listTasks(props.session)
-    if (taskTarget.value === target) taskList.value = list
-  } catch (failure) {
-    if (taskTarget.value === target) {
-      taskList.value = undefined
-      error.value = parseAppError(failure)
+    if (action === 'apply') {
+      await api.applyWikiSuggestion(props.session, id)
+      feedback.value = '已采纳并写入 Wiki 文件。'
+    } else if (action === 'recompare') {
+      await api.recompareWikiSuggestion(props.session, id)
+      feedback.value = '已基于最新磁盘内容重新生成 Diff，请核对后采纳。'
+    } else if (action === 'reject') {
+      await api.rejectWikiSuggestion(props.session, id)
+      feedback.value = '已拒绝该变更建议。'
+    } else {
+      await api.undoWikiSuggestion(props.session, id)
+      feedback.value = '已撤销此次写入（保留随后的手工编辑）。'
     }
+    emit('updated')
+  } catch (err) {
+    error.value = parseAppError(err)
+    emit('updated')
   } finally {
-    taskLoading.value = false
-    if (taskTarget.value !== target && props.mode === 'tasks') void loadTasks()
+    busyId.value = ''
   }
 }
 
-async function refreshTasks() {
-  error.value = null
-  await loadTasks()
-}
-
-async function toggleTask(task: TaskEntry, event: Event) {
-  const checkbox = event.currentTarget as HTMLInputElement
-  checkbox.checked = task.state === 'done'
-  const list = taskList.value
-  if (!list || busy.value || taskLoading.value || !task.id || (task.state !== 'open' && task.state !== 'done')) return
-  busy.value = true
-  error.value = null
-  feedback.value = ''
+async function openExternal(path: string) {
   try {
-    await api.toggleTask(props.session, list.path, task.id, task.expectedLine, task.state === 'open')
-    feedback.value = '已保存任务状态。'
-  } catch (failure) {
-    error.value = parseAppError(failure)
-  } finally {
-    await loadTasks()
-    busy.value = false
+    await api.openWorkspaceFile(props.session, path, 'open')
+  } catch (err) {
+    error.value = parseAppError(err)
   }
-}
-
-function targetFor(id: string) {
-  return changes.value.find((change) => change.id === id)?.target ?? ''
 }
 </script>
 
 <template>
-  <section v-if="mode === 'wiki'" class="m2-stack" aria-label="审阅文件变更">
-    <div class="m2-card-header">
-      <div class="actions">
-        <button type="button" class="quiet" :disabled="busy || changesLoading" @click="refreshChanges">刷新变更列表</button>
-        <button v-if="chosen.length" type="button" class="primary" :disabled="busy || changesLoading" @click="applyChanges(chosen)">采用所选 {{ chosen.length }} 项</button>
-      </div>
-    </div>
-    <p v-if="busy || changesLoading" class="hint" role="status">{{ busy ? '正在处理文件变更…' : '正在读取变更…' }}</p>
-    <ErrorNotice :error="error" />
-    <p v-if="feedback" class="notice success" role="status">{{ feedback }}</p>
-    <ul v-if="outcomes.length" class="m2-list" aria-label="逐项处理结果">
-      <li v-for="item in outcomes" :key="item.id" class="notice" :class="item.outcome === 'applied' ? 'success' : 'error'" role="status">
-        <code>{{ targetFor(item.id) }}</code>　{{ item.outcome === 'applied' ? '已应用' : item.message || '变更未应用，请刷新核对' }}
-      </li>
-    </ul>
-    <div v-if="!changes.length && !changesLoading && !error" class="empty-panel compact">
-      <p>还没有待审阅的文件变更。整理记录后可预览 Wiki 修改或加入任务清单。</p>
-      <button class="quiet" type="button" @click="emit('showOrganize')">查看整理建议</button>
-    </div>
-    <div v-if="selected && changeSource" class="m2-review-layout">
-      <ul class="m2-list" aria-label="文件变更列表">
-        <li v-for="change in changes" :key="change.id">
-          <button type="button" class="record-card" :aria-pressed="selected.id === change.id" @click="selectedId = change.id">
-            <div class="m2-card-header">
-              <strong>{{ kindLabels[change.kind] }}</strong>
-              <span class="badge" :class="phaseBadgeTone[change.phase]">{{ phaseLabels[change.phase] }}</span>
-            </div>
-            <code class="record-path" :title="change.target">{{ change.target }}</code>
-          </button>
-        </li>
-      </ul>
-      <article class="detail-card m2-stack">
-        <header class="m2-card-header">
-          <h2>{{ kindLabels[selected.kind] }}</h2>
-          <span class="badge" :class="phaseBadgeTone[selected.phase]">{{ phaseLabels[selected.phase] }}</span>
-        </header>
-        <div class="m2-card-header">
-          <div class="path-bar"><code>{{ selected.target }}</code></div>
-          <div v-if="desktop" class="actions">
-            <button type="button" class="quiet" @click="openTargetExternal(selected.target, 'open')"><UiIcon name="external" />外部打开</button>
-          </div>
-        </div>
-        <M2Evidence
-          :session="session"
-          :evidence="changeSource"
-          @select-disagreement-source="emit('selectDisagreementSource', $event)"
-        />
-        <details><summary>基准版本</summary><code>{{ selected.baseHash }}</code></details>
-        <DiffViewer :before="selected.before" :after="selected.after" />
-        <template v-if="editable">
+  <div class="m2-stack">
+    <details class="detail-card" :open="!mappedWikis.length">
+      <summary>Wiki 目标页管理（{{ mappedWikis.length }}）</summary>
+      <ul v-if="mappedWikis.length" class="m2-list wiki-target-list">
+        <li v-for="item in mappedWikis" :key="item.path" class="wiki-target-row">
+          <code>{{ item.path }}</code>
           <div class="actions">
-            <button class="primary" type="button" :disabled="busy || changesLoading" @click="applyChanges([selected.id])">{{ selected.kind.startsWith('undo_') ? '确认撤销' : '采用此项' }}</button>
-            <button type="button" :disabled="busy || changesLoading" @click="decide(selected.id, 'rejected')">拒绝</button>
-            <button v-if="selected.phase === 'pending'" type="button" class="quiet" :disabled="busy || changesLoading" @click="decide(selected.id, 'deferred')">稍后处理</button>
-          </div>
-          <label class="m2-check"><input v-model="chosen" type="checkbox" :value="selected.id" :disabled="busy || changesLoading">加入本次批量采用</label>
-        </template>
-        <div v-else-if="selected.phase === 'conflict'" class="actions">
-          <p v-if="selected.kind === 'status'" class="hint">请在任务清单中勾选最新状态。</p>
-          <button v-else type="button" :disabled="busy || changesLoading" @click="generatePreview(selected.id, 'rebase_wiki_change')">读取当前版本并重新比较</button>
-        </div>
-        <div v-else-if="selected.phase === 'applied' && !selected.kind.startsWith('undo_')" class="actions">
-          <button type="button" :disabled="busy || changesLoading" @click="generatePreview(selected.id, 'preview_wiki_undo')">查看撤销预览</button>
-        </div>
-      </article>
-    </div>
-  </section>
-
-  <section v-else-if="mode === 'tasks'" class="m2-stack" aria-label="Markdown 任务清单">
-    <div v-if="taskTarget" class="m2-card-header">
-      <code class="m2-path">{{ taskTarget }}</code>
-      <div class="actions">
-        <button v-if="desktop" type="button" class="quiet" @click="openTargetExternal(taskTarget, 'open')"><UiIcon name="external" />外部编辑清单</button>
-        <button type="button" class="quiet" :disabled="busy || taskLoading" @click="refreshTasks">刷新清单</button>
-      </div>
-    </div>
-    <p v-if="taskLoading || busy" class="hint" role="status">{{ busy ? '正在写入任务状态并回读清单…' : '正在读取 Markdown 清单…' }}</p>
-    <ErrorNotice :error="error" />
-    <p v-if="feedback" class="notice success" role="status">{{ feedback }}</p>
-    <p v-if="!taskTarget" class="empty-panel compact">先映射一个 Markdown 任务清单文件。采用的候选任务会写入该清单。</p>
-    <template v-else-if="taskList">
-      <ul v-if="taskList.repairMessages.length" class="m2-list" aria-label="任务清单待修复项">
-        <li v-for="(message, index) in taskList.repairMessages" :key="index" class="notice error">{{ message }}</li>
-      </ul>
-      <p v-if="!taskList.entries.length && !taskLoading" class="empty-panel compact">任务清单为空。</p>
-      <ul class="m2-list">
-        <li v-for="(task, index) in taskList.entries" :key="task.id || index" class="detail-card m2-task" :class="{ 'm2-task-done': task.state === 'done' }">
-          <label class="m2-check">
-            <input
-              type="checkbox"
-              :checked="task.state === 'done'"
-              :disabled="busy || taskLoading || !task.id || task.state === 'invalid' || task.state === 'cancelled'"
-              @change="toggleTask(task, $event)"
+            <button v-if="desktop" type="button" class="quiet compact-btn" @click="openExternal(item.path)">
+              <UiIcon name="external" />打开
+            </button>
+            <button
+              type="button"
+              class="quiet compact-btn"
+              :disabled="mappingBusy"
+              @click="unmapTarget(item.path)"
             >
-            <strong>{{ task.text }}</strong>
-          </label>
-          <div class="actions">
-            <span class="badge" :class="stateBadgeTone[task.state]">{{ stateLabels[task.state] }}</span>
-            <span v-if="task.manual && task.state !== 'invalid'" class="badge badge-muted">手工任务</span>
-            <span v-if="task.sourcePath" class="hint">来源 <code v-if="showSourcePath(task.sourcePath, task.sourceIsCapture)">{{ task.sourcePath }}</code><span v-else>随手记</span></span>
+              解除映射
+            </button>
           </div>
         </li>
       </ul>
-    </template>
-  </section>
+      <form class="m2-form" @submit.prevent="addMapping">
+        <div class="actions">
+          <select v-model="mappingMode" :disabled="mappingBusy || pickingFile">
+            <option value="existing">映射已有 Wiki 页</option>
+            <option value="new">新建空白 Wiki 页</option>
+          </select>
+        </div>
+        <div class="folder-field">
+          <input
+            v-model="mappingPath"
+            required
+            :list="mappingMode === 'existing' ? 'drawer-wiki-files' : undefined"
+            :placeholder="mappingMode === 'new' ? '例如：wiki/主题.md' : '选择或输入工作区 .md 路径…'"
+            :disabled="mappingBusy || pickingFile"
+            spellcheck="false"
+          >
+          <button
+            v-if="desktop && mappingMode === 'existing'"
+            type="button"
+            class="compact-btn"
+            :disabled="mappingBusy || pickingFile"
+            @click="pickMarkdownFile"
+          >
+            浏览
+          </button>
+        </div>
+        <datalist id="drawer-wiki-files">
+          <option v-for="file in workspaceFiles" :key="file" :value="file" />
+        </datalist>
+        <button type="submit" class="compact-btn" :disabled="mappingBusy || pickingFile || !mappingPath.trim()">
+          {{ mappingMode === 'new' ? '创建并映射' : '添加映射' }}
+        </button>
+      </form>
+    </details>
+
+    <ErrorNotice :error="error" />
+    <p v-if="feedback" class="notice success compact-notice" role="status">{{ feedback }}</p>
+
+    <div v-if="!suggestions.length" class="empty-panel compact">
+      <p>暂无待审阅的 Wiki 文档变更建议。后台整理或中栏「推送 Wiki 建议」后会在此列出。</p>
+    </div>
+
+    <article v-for="item in suggestions" :key="item.id" class="detail-card">
+      <header class="m2-card-header">
+        <div class="actions">
+          <code>{{ item.targetPath }}</code>
+          <span class="badge" :class="wikiStatusTone[item.status]">{{ wikiStatusLabels[item.status] }}</span>
+        </div>
+        <button v-if="desktop" type="button" class="quiet compact-btn" @click="openExternal(item.targetPath)">
+          <UiIcon name="external" />外部打开
+        </button>
+      </header>
+
+      <p v-if="item.reason" class="hint">{{ item.reason }}</p>
+      <DiffViewer :before="item.beforeText" :after="item.afterText" :show-full-comparison="false" />
+
+      <div class="actions">
+        <template v-if="item.status === 'pending'">
+          <button type="button" class="primary compact-btn" :disabled="busyId === item.id" @click="runAction(item.id, 'apply')">
+            采纳写入
+          </button>
+          <button type="button" class="compact-btn" :disabled="busyId === item.id" @click="runAction(item.id, 'reject')">
+            拒绝
+          </button>
+        </template>
+        <template v-else-if="item.status === 'conflict'">
+          <button type="button" class="primary compact-btn" :disabled="busyId === item.id" @click="runAction(item.id, 'recompare')">
+            重新比较当前文件
+          </button>
+          <button type="button" class="compact-btn" :disabled="busyId === item.id" @click="runAction(item.id, 'reject')">
+            拒绝
+          </button>
+        </template>
+        <template v-else-if="item.status === 'applied'">
+          <button type="button" class="compact-btn" :disabled="busyId === item.id" @click="runAction(item.id, 'undo')">
+            撤销此变更
+          </button>
+        </template>
+      </div>
+    </article>
+  </div>
 </template>

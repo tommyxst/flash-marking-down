@@ -6,15 +6,18 @@ use std::{fs, io};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::dto::{NoteDetailDto, NoteSummaryDto, OrganizeResultDto};
 use crate::workspace::{WorkspaceFiles, replace_markdown};
 
 mod search;
 pub(crate) use search::SearchReader;
 pub(crate) mod m2;
 pub(crate) mod m2_answer;
+pub(crate) mod memory_sync;
 pub(crate) mod wiki;
 
 const RECENT_CAPTURE_LIMIT: i64 = 50;
+const NOTE_LIST_LIMIT: i64 = 200;
 
 pub(crate) type RecentCapture = (String, String, String, String, Option<String>);
 pub(crate) const NOTE_ANCHOR: &str = "#fmd-note:";
@@ -93,33 +96,25 @@ pub struct Storage {
     workspace: WorkspaceStorage,
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkspaceStorage {
     files: Arc<WorkspaceFiles>,
     search_build: Arc<Mutex<()>>,
     capture_dir: String,
     workspace_id: String,
-    answer_preparation: Option<serde_json::Value>,
 }
 
 impl WorkspaceStorage {
     pub(crate) fn with_storage<T, E: From<StorageError>>(
-        &mut self,
+        &self,
         action: impl FnOnce(&mut Storage) -> Result<T, E>,
     ) -> Result<T, E> {
         let connection = self.connect()?;
         let mut storage = Storage {
             connection,
-            workspace: Self {
-                files: self.files.clone(),
-                search_build: self.search_build.clone(),
-                capture_dir: self.capture_dir.clone(),
-                workspace_id: self.workspace_id.clone(),
-                answer_preparation: self.answer_preparation.take(),
-            },
+            workspace: self.clone(),
         };
-        let result = action(&mut storage);
-        self.answer_preparation = storage.workspace.answer_preparation;
-        result
+        action(&mut storage)
     }
 
     fn connect(&self) -> Result<Connection, StorageError> {
@@ -228,10 +223,10 @@ impl Storage {
             {
                 tx.execute_batch(SCHEMA).map_err(migration_error)?;
                 tx.execute_batch(search::SCHEMA).map_err(migration_error)?;
-                tx.execute_batch(m2::SCHEMA).map_err(migration_error)?;
                 tx.execute_batch(wiki::SCHEMA).map_err(migration_error)?;
                 tx.execute_batch(m2_answer::SCHEMA)
                     .map_err(migration_error)?;
+                tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
                 tx.pragma_update(None, "application_id", APPLICATION_ID)
                     .map_err(migration_error)?;
                 tx.execute(
@@ -239,10 +234,19 @@ impl Storage {
                     [],
                 )
                 .map_err(migration_error)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                    .map_err(migration_error)?;
             }
             1..=SCHEMA_VERSION if application_id == APPLICATION_ID => {
-                if version < SCHEMA_VERSION {
+                if version < 5 {
                     migrate_workspace(&tx, version)?;
+                    tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
+                    migrate_captures(&tx)?;
+                }
+                if version < SCHEMA_VERSION {
+                    migrate_to_v6(&tx)?;
+                    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                        .map_err(migration_error)?;
                 }
             }
             _ => {
@@ -255,14 +259,6 @@ impl Storage {
                     version,
                 ));
             }
-        }
-        if version < SCHEMA_VERSION {
-            tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
-            if version != 0 {
-                migrate_captures(&tx)?;
-            }
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .map_err(migration_error)?;
         }
         tx.execute(
             "INSERT INTO workspace_settings VALUES ('capture_dir', ?1)
@@ -278,9 +274,12 @@ impl Storage {
             )
             .map_err(migration_error)?;
         tx.commit().map_err(migration_error)?;
-        connection.execute(
-            "UPDATE jobs SET state='failed' WHERE state='running' AND id IN (SELECT id FROM m2_analyses)", [],
-        ).map_err(|e| database_error("recover_analysis", None, e))?;
+        connection
+            .execute(
+                "UPDATE background_jobs SET status = 'queued' WHERE status = 'running'",
+                [],
+            )
+            .map_err(|e| database_error("recover_jobs", None, e))?;
         Ok(Self {
             connection,
             workspace: WorkspaceStorage {
@@ -288,7 +287,6 @@ impl Storage {
                 search_build: Arc::default(),
                 capture_dir,
                 workspace_id,
-                answer_preparation: None,
             },
         })
     }
@@ -453,12 +451,14 @@ impl Storage {
 
     pub(crate) fn list_recent_captures(&self) -> Result<Vec<RecentCapture>, StorageError> {
         let read_error = |error| database_error("recent_captures", None, error);
-        let mut statement = self.connection.prepare(
-            "SELECT n.relative_path, n.captured_at, n.id, n.source_id, n.block_id, n.content_hash, CAST(s.snapshot AS TEXT)
-             FROM notes n LEFT JOIN source_revisions s ON n.block_id IS NULL
-                 AND s.source_id = n.source_id AND s.revision = n.content_hash
-             ORDER BY n.captured_at DESC, n.rowid DESC LIMIT ?1",
-        ).map_err(read_error)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT relative_path, captured_at, id, source_id, block_id, content_hash
+                 FROM notes
+                 ORDER BY captured_at DESC, rowid DESC LIMIT ?1",
+            )
+            .map_err(read_error)?;
         let mut rows = statement
             .query([RECENT_CAPTURE_LIMIT])
             .map_err(read_error)?;
@@ -467,27 +467,29 @@ impl Storage {
         while let Some(row) = rows.next().map_err(read_error)? {
             let path: String = row.get(0).map_err(read_error)?;
             let block_id: Option<String> = row.get(4).map_err(read_error)?;
+            let cached = files.entry(path.clone()).or_insert_with(|| {
+                self.workspace
+                    .files
+                    .read_markdown(&path)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            });
+            let Some(text) = cached.as_deref() else {
+                continue;
+            };
             let (body, revision) = if let Some(id) = &block_id {
-                let body = files.entry(path.clone()).or_insert_with(|| {
-                    self.workspace
-                        .files
-                        .read_markdown(&path)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                });
-                let Some(body) = body.as_deref().and_then(|text| block_body(text, id)) else {
+                let Some(body) = block_body(text, id) else {
                     continue;
                 };
                 (body.to_owned(), revision_hash(body.as_bytes()))
             } else {
                 let record: String = row.get(2).map_err(read_error)?;
                 let source: String = row.get(3).map_err(read_error)?;
-                let snapshot: Option<String> = row.get(6).map_err(read_error)?;
-                let Some(snapshot) = snapshot else { continue };
-                let body = snapshot
+                let stripped = text
                     .strip_prefix(&capture_header(&record, &source))
-                    .unwrap_or(&snapshot);
-                (body.to_owned(), row.get(5).map_err(read_error)?)
+                    .unwrap_or(text);
+                let hash = revision_hash(text.as_bytes());
+                (stripped.to_owned(), hash)
             };
             captures.push((
                 path,
@@ -498,6 +500,371 @@ impl Storage {
             ));
         }
         Ok(captures)
+    }
+
+    pub(crate) fn list_notes(&self) -> Result<Vec<NoteSummaryDto>, StorageError> {
+        let read_error = |error| database_error("notes", None, error);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, source_id, relative_path, block_id, captured_at, title, body_preview,
+                        content_hash, organize_status, ov_resource_status, ov_memory_status
+                 FROM notes
+                 ORDER BY captured_at DESC, rowid DESC LIMIT ?1",
+            )
+            .map_err(read_error)?;
+        let mut rows = statement.query([NOTE_LIST_LIMIT]).map_err(read_error)?;
+        let mut files = HashMap::new();
+        let mut notes = Vec::new();
+        while let Some(row) = rows.next().map_err(read_error)? {
+            let id: String = row.get(0).map_err(read_error)?;
+            let source_id: String = row.get(1).map_err(read_error)?;
+            let path: String = row.get(2).map_err(read_error)?;
+            let block_id: Option<String> = row.get(3).map_err(read_error)?;
+            let captured_at: String = row.get(4).map_err(read_error)?;
+            let fallback_title: String = row.get(5).map_err(read_error)?;
+            let fallback_preview: String = row.get(6).map_err(read_error)?;
+            let fallback_hash: String = row.get(7).map_err(read_error)?;
+            let organize_status: String = row.get(8).map_err(read_error)?;
+            let ov_resource_status: String = row.get(9).map_err(read_error)?;
+            let ov_memory_status: String = row.get(10).map_err(read_error)?;
+
+            let cached = files.entry(path.clone()).or_insert_with(|| {
+                self.workspace
+                    .files
+                    .read_markdown(&path)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            });
+            let (title, body_preview, content_hash) = if let Some(text) = cached.as_deref() {
+                if let Some(marker) = block_id.as_deref() {
+                    let Some(body) = block_body(text, marker) else {
+                        continue;
+                    };
+                    (
+                        note_title(body),
+                        note_preview(body),
+                        revision_hash(body.as_bytes()),
+                    )
+                } else {
+                    let body = text
+                        .strip_prefix(&capture_header(&id, &source_id))
+                        .unwrap_or(text);
+                    (
+                        note_title(body),
+                        note_preview(body),
+                        revision_hash(text.as_bytes()),
+                    )
+                }
+            } else {
+                (fallback_title, fallback_preview, fallback_hash)
+            };
+            let locator = note_locator(&path, block_id.as_deref());
+            let open_conflict_count = self.open_conflicts_for(&path, &locator);
+            notes.push(NoteSummaryDto {
+                id,
+                path,
+                locator,
+                block_id,
+                captured_at,
+                title,
+                body_preview,
+                content_hash,
+                is_capture: true,
+                organize_status,
+                ov_resource_status,
+                ov_memory_status,
+                open_conflict_count,
+            });
+        }
+        Ok(notes)
+    }
+
+    fn open_conflicts_for(&self, path: &str, locator: &str) -> usize {
+        self.connection
+            .query_row(
+                "SELECT count(*) FROM conflicts
+                 WHERE status = 'open'
+                   AND (current_path IN (?1, ?2) OR incoming_path IN (?1, ?2))",
+                params![path, locator],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as usize
+    }
+
+    pub(crate) fn get_note_detail(&self, id_or_path: &str) -> Result<NoteDetailDto, StorageError> {
+        let read_error = |error| database_error("note_detail", None, error);
+        let (file_path, marker) = id_or_path
+            .split_once(NOTE_ANCHOR)
+            .map_or((id_or_path, None), |(p, m)| (p, Some(m)));
+
+        let row: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        )> = self
+            .connection
+            .query_row(
+                "SELECT id, source_id, relative_path, block_id, captured_at, organize_status, organize_json,
+                        ov_resource_status, ov_resource_uri, ov_memory_status
+                 FROM notes
+                 WHERE id = ?1 OR (relative_path = ?2 AND block_id IS ?3)
+                 ORDER BY rowid DESC LIMIT 1",
+                params![id_or_path, file_path, marker],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(read_error)?;
+
+        let (
+            id,
+            source_id,
+            path,
+            block_id,
+            captured_at,
+            organize_status,
+            organize_json,
+            ov_resource_status,
+            ov_resource_uri,
+            ov_memory_status,
+        ) = if let Some(found) = row {
+            (
+                found.0,
+                found.1,
+                found.2,
+                found.3,
+                Some(found.4),
+                found.5,
+                found.6,
+                found.7,
+                found.8,
+                found.9,
+            )
+        } else {
+            let is_indexed: bool = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM search_documents WHERE relative_path = ?1)",
+                    [file_path],
+                    |row| row.get(0),
+                )
+                .map_err(read_error)?;
+            if !is_indexed {
+                return Err(error(
+                    "SOURCE_UNAVAILABLE",
+                    "note_detail",
+                    None,
+                    false,
+                    "找不到对应的记录或 Markdown 文件",
+                    id_or_path,
+                ));
+            }
+            (
+                format!("file:{file_path}"),
+                String::new(),
+                file_path.to_owned(),
+                marker.map(str::to_owned),
+                self.connection
+                    .query_row(
+                        "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
+                        [file_path],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(read_error)?
+                    .flatten(),
+                "idle".to_owned(),
+                None,
+                "pending".to_owned(),
+                None,
+                "pending".to_owned(),
+            )
+        };
+
+        let locator = note_locator(&path, block_id.as_deref());
+        let raw_bytes = read_source_bytes(&self.workspace.files, &locator).map_err(|e| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "note_detail",
+                None,
+                true,
+                "找不到原文，文件可能已移动或删除",
+                e,
+            )
+        })?;
+        let text = String::from_utf8(raw_bytes).map_err(|e| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "note_detail",
+                None,
+                false,
+                "原文不是有效的 UTF-8 Markdown",
+                e,
+            )
+        })?;
+        let (body, content_hash) = if block_id.is_some() {
+            let hash = revision_hash(text.as_bytes());
+            (text, hash)
+        } else {
+            let hash = revision_hash(text.as_bytes());
+            let body = if !source_id.is_empty() {
+                text.strip_prefix(&capture_header(&id, &source_id))
+                    .unwrap_or(&text)
+                    .to_owned()
+            } else {
+                text
+            };
+            (body, hash)
+        };
+        let organize = organize_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<OrganizeResultDto>(raw).ok());
+        let organize_error = self
+            .connection
+            .query_row(
+                "SELECT last_error FROM background_jobs
+                 WHERE note_id = ?1 AND kind = 'organize' AND status = 'failed'
+                 ORDER BY rowid DESC LIMIT 1",
+                [&id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(read_error)?
+            .flatten()
+            .or_else(|| organize.as_ref().and_then(|o| o.last_error.clone()));
+
+        let conflicts = self.conflicts_for_paths(&path, &locator)?;
+        let wiki_suggestions = self.wiki_suggestions_for_note(&id)?;
+        let ov_error = self.memory_sync_error(
+            &id,
+            &path,
+            ov_resource_status == "failed",
+            ov_memory_status == "failed",
+        )?;
+        let is_capture = !id.starts_with("file:");
+
+        Ok(NoteDetailDto {
+            id,
+            path,
+            locator,
+            block_id,
+            captured_at,
+            title: note_title(&body),
+            body,
+            content_hash,
+            is_capture,
+            organize_status,
+            organize,
+            organize_error,
+            ov_resource_status,
+            ov_resource_uri,
+            ov_memory_status,
+            ov_error,
+            conflicts,
+            wiki_suggestions,
+        })
+    }
+
+    pub(crate) fn ensure_note_for_source(
+        &mut self,
+        id_or_path: &str,
+    ) -> Result<String, StorageError> {
+        let db_error = |e| database_error("note", None, e);
+        let file_path = physical_path(id_or_path);
+        let marker = id_or_path.split_once(NOTE_ANCHOR).map(|(_, m)| m);
+        if let Some(existing) = self
+            .connection
+            .query_row(
+                "SELECT id FROM notes
+                 WHERE id = ?1 OR (relative_path = ?2 AND block_id IS ?3)
+                 ORDER BY rowid DESC LIMIT 1",
+                params![id_or_path, file_path, marker],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+        {
+            return Ok(existing);
+        }
+        let key = self.workspace.files.markdown_key(file_path).map_err(|e| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "note",
+                None,
+                false,
+                "找不到可整理的 Markdown 文件",
+                e,
+            )
+        })?;
+        let bytes = self.workspace.files.read_markdown(&key).map_err(|e| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "note",
+                None,
+                true,
+                "无法读取 Markdown 文件",
+                e,
+            )
+        })?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
+            error(
+                "INVALID_INPUT",
+                "note",
+                None,
+                false,
+                "文件不是有效的 UTF-8 Markdown",
+                e,
+            )
+        })?;
+        let note_id: String = self
+            .connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))
+            .map_err(db_error)?;
+        let now: String = self
+            .connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+                r.get(0)
+            })
+            .map_err(db_error)?;
+        let hash = revision_hash(&bytes);
+        let request_id = format!("manual-{note_id}");
+        self.connection
+            .execute(
+                "INSERT INTO notes (id, request_id, source_id, relative_path, block_id, captured_at,
+                    title, body_preview, content_hash, organize_status, draft_id, draft_revision, body_hash, saved_at, updated_at)
+                 VALUES (?1, ?2, ?1, ?3, NULL, ?4, ?5, ?6, ?7, 'idle', 'manual', 0, ?7, ?4, ?4)",
+                params![
+                    note_id,
+                    request_id,
+                    key,
+                    now,
+                    note_title(text),
+                    note_preview(text),
+                    hash
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(note_id)
     }
 
     pub fn save_record(
@@ -657,22 +1024,12 @@ impl Storage {
                 true
             }
         };
-        let title = block
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default();
-        let title: String = title
-            .trim()
-            .trim_start_matches('#')
-            .trim()
-            .chars()
-            .take(120)
-            .collect();
-        let preview: String = block.chars().take(180).collect();
+        let title = note_title(block);
+        let preview = note_preview(block);
         tx.execute(
             "INSERT INTO notes (id, request_id, source_id, relative_path, block_id, captured_at, title, body_preview,
-                content_hash, draft_id, draft_revision, body_hash, saved_at, updated_at)
-             VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                content_hash, organize_status, draft_id, draft_revision, body_hash, saved_at, updated_at)
+             VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', ?9, ?10, ?11, ?12, ?12)",
             params![record_id, request_id, relative_path, marker, captured_at, title, preview,
                 revision, draft_id, draft_revision, body_hash, saved_at],
         ).map_err(db_error)?;
@@ -739,6 +1096,10 @@ fn is_capture(conn: &Connection, path: &str) -> bool {
 }
 
 fn block_body<'a>(text: &'a str, id: &str) -> Option<&'a str> {
+    block_body_with_start(text, id).map(|(_, body)| body)
+}
+
+fn block_body_with_start<'a>(text: &'a str, id: &str) -> Option<(usize, &'a str)> {
     let mut start = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -752,7 +1113,7 @@ fn block_body<'a>(text: &'a str, id: &str) -> Option<&'a str> {
             && marker.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             if let Some(start) = start {
-                return Some(text[start..offset].trim_end_matches(['\r', '\n']));
+                return Some((start, text[start..offset].trim_end_matches(['\r', '\n'])));
             }
             if marker == id {
                 let content = offset + line.len();
@@ -769,7 +1130,7 @@ fn block_body<'a>(text: &'a str, id: &str) -> Option<&'a str> {
         }
         offset += line.len();
     }
-    start.map(|start| text[start..].trim_end_matches(['\r', '\n']))
+    start.map(|start| (start, text[start..].trim_end_matches(['\r', '\n'])))
 }
 
 fn read_source_bytes(files: &WorkspaceFiles, path: &str) -> io::Result<Vec<u8>> {
@@ -799,6 +1160,29 @@ fn newline(bytes: &[u8]) -> &'static str {
     }
 }
 
+pub(crate) fn note_locator(path: &str, block_id: Option<&str>) -> String {
+    match block_id {
+        Some(id) if !id.is_empty() => format!("{path}{NOTE_ANCHOR}{id}"),
+        _ => path.to_owned(),
+    }
+}
+
+pub(crate) fn note_title(body: &str) -> String {
+    body.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+pub(crate) fn note_preview(body: &str) -> String {
+    body.trim().chars().take(180).collect()
+}
+
 fn revision_hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -807,33 +1191,30 @@ fn revision_hash(bytes: &[u8]) -> String {
 }
 
 const APPLICATION_ID: i64 = i64::from_be_bytes(*b"\0\0\0\0FMD1");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = "
 CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE drafts (id TEXT PRIMARY KEY, body TEXT, edit_revision INTEGER NOT NULL CHECK(edit_revision >= 0), persisted_revision INTEGER NOT NULL CHECK(persisted_revision = edit_revision), updated_at TEXT NOT NULL);
-CREATE TABLE sources (id TEXT PRIMARY KEY, location TEXT NOT NULL UNIQUE, current_revision TEXT NOT NULL, availability TEXT NOT NULL);
-CREATE TABLE source_revisions (source_id TEXT NOT NULL REFERENCES sources(id), revision TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot BLOB NOT NULL, encoding TEXT NOT NULL, newline TEXT NOT NULL, PRIMARY KEY(source_id, revision));
-CREATE TABLE jobs (id TEXT PRIMARY KEY, operation_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, source_id TEXT NOT NULL, source_revision TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, deletion_epoch INTEGER NOT NULL, FOREIGN KEY(source_id, source_revision) REFERENCES source_revisions(source_id, revision));";
+CREATE TABLE drafts (id TEXT PRIMARY KEY, body TEXT, edit_revision INTEGER NOT NULL CHECK(edit_revision >= 0), persisted_revision INTEGER NOT NULL CHECK(persisted_revision = edit_revision), updated_at TEXT NOT NULL);";
 const NOTES_SCHEMA: &str = "
-CREATE TABLE notes (
+CREATE TABLE IF NOT EXISTS notes (
     id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL,
     relative_path TEXT NOT NULL, block_id TEXT, captured_at TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT '', body_preview TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
-    organize_status TEXT NOT NULL DEFAULT 'pending', organize_json TEXT,
+    organize_status TEXT NOT NULL DEFAULT 'idle', organize_json TEXT,
     ov_resource_status TEXT NOT NULL DEFAULT 'pending', ov_resource_uri TEXT,
     ov_memory_status TEXT NOT NULL DEFAULT 'pending', ov_task_id TEXT,
     draft_id TEXT NOT NULL, draft_revision INTEGER NOT NULL, body_hash TEXT NOT NULL,
     saved_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX notes_file_block ON notes(relative_path, block_id);
-CREATE INDEX notes_recent ON notes(captured_at);
-CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE chat_messages (
+CREATE UNIQUE INDEX IF NOT EXISTS notes_file_block ON notes(relative_path, block_id);
+CREATE INDEX IF NOT EXISTS notes_recent ON notes(captured_at);
+CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role TEXT NOT NULL, content TEXT NOT NULL, citations_json TEXT, conflict_ids_json TEXT, created_at TEXT NOT NULL
 );
-CREATE TABLE background_jobs (
-    id TEXT PRIMARY KEY, kind TEXT NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id),
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     payload_json TEXT, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL
 );";
 
@@ -849,6 +1230,17 @@ fn table_exists(tx: &Connection, name: &str) -> rusqlite::Result<bool> {
     )
 }
 
+fn column_exists(tx: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn migrate_workspace(tx: &Connection, version: i64) -> Result<(), StorageError> {
     if version == 1 {
         tx.execute_batch(search::SCHEMA).map_err(migration_error)?;
@@ -856,14 +1248,10 @@ fn migrate_workspace(tx: &Connection, version: i64) -> Result<(), StorageError> 
         tx.execute_batch(search::MIGRATE_V4)
             .map_err(migration_error)?;
     }
-    tx.execute_batch(m2::SCHEMA).map_err(migration_error)?;
     if table_exists(tx, "wiki_changes").map_err(migration_error)? {
         tx.execute_batch("ALTER TABLE wiki_changes RENAME TO wiki_suggestions;")
             .map_err(migration_error)?;
     }
-    tx.execute_batch(wiki::SCHEMA).map_err(migration_error)?;
-    tx.execute_batch("UPDATE wiki_suggestions SET phase = 'pending' WHERE phase = 'prepared';")
-        .map_err(migration_error)?;
     if table_exists(tx, "m2_model").map_err(migration_error)? {
         tx.execute_batch(
             "INSERT OR IGNORE INTO workspace_settings (key, value)
@@ -877,6 +1265,57 @@ fn migrate_workspace(tx: &Connection, version: i64) -> Result<(), StorageError> 
     tx.execute_batch("DROP TABLE IF EXISTS m2_preparations;")
         .map_err(migration_error)?;
     m2_answer::migrate_conflicts(tx).map_err(migration_error)?;
+    Ok(())
+}
+
+fn migrate_to_v6(tx: &Connection) -> Result<(), StorageError> {
+    if table_exists(tx, "wiki_suggestions").map_err(migration_error)?
+        && column_exists(tx, "wiki_suggestions", "phase").map_err(migration_error)?
+    {
+        tx.execute_batch(
+            "CREATE TABLE wiki_suggestions_v6 (
+                id TEXT PRIMARY KEY,
+                note_id TEXT,
+                target_path TEXT NOT NULL,
+                base_hash TEXT NOT NULL,
+                before_text TEXT NOT NULL,
+                after_text TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO wiki_suggestions_v6 (
+                id, note_id, target_path, base_hash, before_text, after_text, reason, status, created_at
+             )
+             SELECT id,
+                    (SELECT n.id FROM notes n
+                     WHERE (n.relative_path || coalesce('#fmd-note:' || n.block_id, '')) = source_path
+                        OR n.relative_path = source_path
+                     LIMIT 1),
+                    target,
+                    base_hash,
+                    before_text,
+                    after_text,
+                    coalesce(nullif(entry_text, ''), source_excerpt),
+                    CASE phase WHEN 'deferred' THEN 'pending' WHEN 'prepared' THEN 'pending' ELSE phase END,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             FROM wiki_suggestions
+             WHERE kind = 'wiki' AND phase <> 'superseded';
+             DROP TABLE wiki_suggestions;
+             ALTER TABLE wiki_suggestions_v6 RENAME TO wiki_suggestions;",
+        )
+        .map_err(migration_error)?;
+    }
+    tx.execute_batch(wiki::SCHEMA).map_err(migration_error)?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS m2_analyses;
+         DROP TABLE IF EXISTS m2_answers;
+         DROP TABLE IF EXISTS jobs;
+         DROP TABLE IF EXISTS source_revisions;
+         DROP TABLE IF EXISTS sources;
+         UPDATE notes SET organize_status = 'idle' WHERE organize_status = 'pending';",
+    )
+    .map_err(migration_error)?;
     Ok(())
 }
 
@@ -1125,6 +1564,11 @@ pub(crate) mod tests {
             [date],
         )
         .unwrap();
+        db.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, location TEXT NOT NULL UNIQUE, current_revision TEXT NOT NULL, availability TEXT NOT NULL);
+             CREATE TABLE source_revisions (source_id TEXT NOT NULL, revision TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot BLOB NOT NULL, encoding TEXT NOT NULL, newline TEXT NOT NULL);",
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO sources VALUES ('source','old.md',?1,'available')",
             [&revision],
@@ -1138,11 +1582,19 @@ pub(crate) mod tests {
         search::upsert_document(&db, "old.md", Some(date), &revision, body).unwrap();
         db.execute("INSERT INTO search_status VALUES (1,1,0)", [])
             .unwrap();
-        db.execute_batch(wiki::SCHEMA).unwrap();
-        db.execute_batch("ALTER TABLE wiki_suggestions RENAME TO wiki_changes;")
-            .unwrap();
-        db.execute("INSERT INTO wiki_targets VALUES ('Wiki.md','wiki')", [])
-            .unwrap();
+        db.execute_batch(
+            "CREATE TABLE wiki_targets (path TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('wiki','tasks')));
+             CREATE TABLE wiki_changes (
+                id TEXT PRIMARY KEY, operation_key TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+                phase TEXT NOT NULL, base_hash TEXT NOT NULL, after_hash TEXT NOT NULL, before_text TEXT NOT NULL,
+                after_text TEXT NOT NULL, source_path TEXT NOT NULL, source_revision TEXT NOT NULL,
+                start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, source_excerpt TEXT NOT NULL, entry_text TEXT NOT NULL,
+                task_id TEXT, dependency TEXT, undoes TEXT
+             );
+             INSERT INTO wiki_changes VALUES ('w1','k1','Wiki.md','wiki','deferred','h1','h2','before','after','old.md','rev',1,1,'原文','同步决策',NULL,NULL,NULL);
+             INSERT INTO wiki_targets VALUES ('Wiki.md','wiki');",
+        )
+        .unwrap();
         drop(db);
 
         let mut storage = dir.open();
@@ -1151,11 +1603,27 @@ pub(crate) mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
-        assert!(!table_exists(&storage.connection, "capture_intents").unwrap());
-        assert!(!table_exists(&storage.connection, "m2_preparations").unwrap());
-        assert!(!table_exists(&storage.connection, "disagreements").unwrap());
+        for dropped in [
+            "capture_intents",
+            "m2_preparations",
+            "disagreements",
+            "sources",
+            "source_revisions",
+            "jobs",
+            "m2_analyses",
+            "m2_answers",
+        ] {
+            assert!(
+                !table_exists(&storage.connection, dropped).unwrap(),
+                "expected legacy table `{dropped}` to be removed"
+            );
+        }
+        let migrated_wiki = storage.list_wiki_suggestions().unwrap();
+        assert_eq!(migrated_wiki.len(), 1);
+        assert_eq!(migrated_wiki[0].status, "pending");
+        assert_eq!(migrated_wiki[0].reason, "同步决策");
         let legacy: String = storage
             .connection
             .query_row(

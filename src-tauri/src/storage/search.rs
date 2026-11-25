@@ -109,6 +109,7 @@ pub(crate) struct SearchReader {
 }
 
 impl Storage {
+    #[cfg(test)]
     pub(crate) fn search_reader(&self) -> Result<SearchReader, StorageError> {
         self.workspace.search_reader()
     }

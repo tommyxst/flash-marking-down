@@ -1,4 +1,6 @@
 export type WorkspacePage = 'records' | 'organize' | 'wiki' | 'tasks' | 'answers'
+export type LeftTab = 'notes' | 'tasks'
+export type DrawerTab = 'conflicts' | 'wiki'
 
 export type DraftDto = {
   revision: number
@@ -84,19 +86,33 @@ export type ModelConfig = {
   requiresCredential: boolean
 }
 
+export type MemoryConfig = {
+  baseUrl: string
+  namespace: string
+  enabled: boolean
+  syncResources: boolean
+  commitMemories: boolean
+}
+
 export type IntegrationsConfig = {
   model: ModelConfig | null
-  memory: { baseUrl: string; namespace: string; enabled: boolean } | null
+  memory: MemoryConfig | null
   credentials: CredentialReference[]
 }
 
+export type MemorySyncStatus = 'pending' | 'synced' | 'failed'
+
 export type RecordEntry = {
+  id?: string
   path: string
+  locator?: string
   capturedAt: string | null
   text: string
   contentHash: string
   titleText: string
   isCapture: boolean
+  organizeStatus?: string
+  openConflictCount?: number
 }
 
 export function recordTitle(record: Pick<RecordEntry, 'titleText'>): string {
@@ -113,101 +129,94 @@ export type IndexFeedback =
   | { state: 'ready'; indexed: number; skipped: number }
   | { state: 'failed'; error: import('./api/errors').UiError }
 
-export type RecordSelection = {
-  path: string
-  title: string
-  contentHash: string
-  isCapture?: boolean
-  excerpt?: string
-}
-
-export type Evidence = {
+export type OrganizedTask = {
   id: string
-  sourceId?: string
-  path: string
-  revision: string
-  startLine: number
-  endLine: number
-  excerpt: string
-  date: string | null
-  eventDate?: string | null
-  movedFrom?: string
-  available: boolean
-  changed: boolean
-  outsideRange: boolean
-  isCapture?: boolean
-}
-
-export type AnalysisItem = {
-  id: string
-  kind: 'discussion' | 'decision' | 'action' | 'open' | 'wiki'
   text: string
-  source: Evidence
   assignee: string | null
   due: string | null
+  done: boolean
+  line: number | null
 }
 
-export type Analysis = {
+export type OrganizeResult = {
+  summary: string
+  decisions: string[]
+  tasks: OrganizedTask[]
+  sourceChanged: boolean
+  lastError: string | null
+}
+
+export type NoteSummary = {
   id: string
   path: string
-  revision: string
-  status: 'running' | 'succeeded' | 'failed' | 'stale'
-  error: string | null
-  items: AnalysisItem[]
+  locator: string
+  blockId: string | null
+  capturedAt: string
+  title: string
+  bodyPreview: string
+  contentHash: string
+  isCapture: boolean
+  organizeStatus: 'idle' | 'queued' | 'running' | 'done' | 'failed' | string
+  ovResourceStatus: MemorySyncStatus
+  ovMemoryStatus: MemorySyncStatus
+  openConflictCount: number
 }
 
-export const relationLabels = { contradiction: '意见矛盾', conditions: '适用条件不同', historical: '历史变化' }
-export const disagreementStatuses = { open: '待判断', decided: '已记录当前判断', resolved: '已解决', superseded: '已被替代' }
-export type Relation = keyof typeof relationLabels
-export type DisagreementStatus = keyof typeof disagreementStatuses
+export type ConflictStatus = 'open' | 'keep_current' | 'accept_incoming' | 'keep_both'
 
-export type PossibleDisagreement = {
-  question: string
-  relation: Relation
-  members: { text: string; source: Evidence; claimId?: string }[]
-}
-
-export type Disagreement = PossibleDisagreement & {
+export type ConflictItem = {
   id: string
-  status: DisagreementStatus
-  judgment: string | null
-  reason: string | null
-  judgmentNeedsSources?: boolean
-  sourcesChanged?: boolean
+  topic: string
+  currentLabel: string
+  currentPath: string | null
+  currentText: string
+  incomingLabel: string
+  incomingPath: string | null
+  incomingText: string
+  status: ConflictStatus
+  resolutionNote: string | null
+  createdAt: string
+  resolvedAt: string | null
 }
 
-export const relationBadgeTone: Record<Relation, string> = {
-  contradiction: 'badge-error',
-  conditions: 'badge-warn',
-  historical: 'badge-accent',
-}
+export type WikiSuggestionStatus = 'pending' | 'applied' | 'rejected' | 'conflict' | 'reverted'
 
-export const statusBadgeTone: Record<DisagreementStatus, string> = {
-  open: 'badge-warn',
-  decided: 'badge-accent',
-  resolved: 'badge-success',
-  superseded: 'badge-muted',
-}
-
-export type OutputKind = 'answer' | 'summary' | 'plan'
-
-export type AnswerPreparation = {
+export type WikiSuggestion = {
   id: string
-  endpoint: string
-  query: string
-  outputKind: OutputKind
-  sources: Evidence[]
-  disagreements: Disagreement[]
+  noteId: string | null
+  targetPath: string
+  baseHash: string
+  beforeText: string
+  afterText: string
+  reason: string
+  status: WikiSuggestionStatus
+  createdAt: string
 }
 
-export type Answer = Omit<AnswerPreparation, 'endpoint'> & {
-  text: string
-  sourceNotice?: string
-  dateBasis: 'recorded' | 'event'
-  fromDate: string | null
-  toDate: string | null
-  skipped: number
-  possibleDisagreements?: PossibleDisagreement[]
+export type NoteDetail = {
+  id: string
+  path: string
+  locator: string
+  blockId: string | null
+  capturedAt: string | null
+  title: string
+  body: string
+  contentHash: string
+  isCapture: boolean
+  organizeStatus: string
+  organize: OrganizeResult | null
+  organizeError: string | null
+  ovResourceStatus: MemorySyncStatus
+  ovResourceUri: string | null
+  ovMemoryStatus: MemorySyncStatus
+  ovError: string | null
+  conflicts: ConflictItem[]
+  wikiSuggestions: WikiSuggestion[]
+}
+
+export type DrawerCounts = {
+  openConflicts: number
+  pendingWiki: number
 }
 
 export type DocumentKind = 'wiki' | 'tasks'
@@ -216,51 +225,19 @@ export type DocumentMapping = {
   path: string
 }
 
-export type ChangePhase = 'pending' | 'deferred' | 'rejected' | 'prepared' | 'applied' | 'conflict' | 'reverted' | 'superseded'
-export type ChangeKind = 'wiki' | 'task' | 'status' | 'undo_wiki' | 'undo_task' | 'undo_status'
-
-export const phaseBadgeTone: Record<ChangePhase, string> = {
-  pending: 'badge-warn',
-  deferred: 'badge-muted',
-  rejected: 'badge-muted',
-  prepared: 'badge-warn',
-  applied: 'badge-success',
-  conflict: 'badge-error',
-  reverted: 'badge-accent',
-  superseded: 'badge-muted',
-}
-
-export type DocumentChange = {
-  id: string
-  target: string
-  kind: ChangeKind
-  phase: ChangePhase
-  baseHash: string
-  before: string
-  after: string
-  sourcePath: string
-  sourceRevision: string
-  startLine: number
-  endLine: number
-  sourceExcerpt: string
-  sourceIsCapture: boolean
-}
-
-export type WikiApplyOutcome = {
-  id: string
-  outcome: string
-  message: string
-}
-
 export type TaskState = 'open' | 'done' | 'cancelled' | 'invalid'
 export type TaskEntry = {
   id: string
+  path: string
   expectedLine: string
   text: string
   state: TaskState
   sourcePath: string
   sourceIsCapture: boolean
   manual: boolean
+  assignee: string | null
+  due: string | null
+  noteId: string | null
 }
 
 export type TaskList = {
@@ -268,6 +245,97 @@ export type TaskList = {
   revision: string
   entries: TaskEntry[]
   repairMessages: string[]
+}
+
+export type CitationKind = 'local' | 'ov_memory' | 'ov_resource'
+
+export const citationKindLabels: Record<CitationKind, string> = {
+  local: '[本地]',
+  ov_memory: '[OV记忆]',
+  ov_resource: '[OV资源]',
+}
+
+export type CitationItem = {
+  index: number
+  kind: CitationKind
+  path: string
+  title: string
+  snippet: string
+  capturedAt: string | null
+}
+
+export type MemoryItem = {
+  uri: string
+  kind: Exclude<CitationKind, 'local'>
+  title: string
+  content: string
+}
+
+export type MemorySource = Omit<MemoryItem, 'content'>
+
+export type MemoryPreview = MemorySource & (
+  | { state: 'opening' }
+  | { state: 'opened'; content: string }
+  | { state: 'failed'; error: import('./api/errors').UiError }
+)
+
+export type ConversationSummary = {
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type ChatMessage = {
+  id: string
+  conversationId: string
+  role: 'user' | 'assistant' | string
+  content: string
+  citations: CitationItem[]
+  relatedConflicts: ConflictItem[]
+  createdAt: string
+  notice?: string | null
+}
+
+export type ConversationDetail = {
+  conversation: ConversationSummary
+  messages: ChatMessage[]
+}
+
+export type ChatTurn = {
+  conversation: ConversationSummary
+  userMessage: ChatMessage
+  assistantMessage: ChatMessage
+}
+
+export const conflictStatusLabels: Record<ConflictStatus, string> = {
+  open: '待解决',
+  keep_current: '保留当前',
+  accept_incoming: '采纳新记录',
+  keep_both: '保留双方',
+}
+
+export const conflictStatusTone: Record<ConflictStatus, string> = {
+  open: 'badge-warn',
+  keep_current: 'badge-accent',
+  accept_incoming: 'badge-success',
+  keep_both: 'badge-accent',
+}
+
+export const wikiStatusLabels: Record<WikiSuggestionStatus, string> = {
+  pending: '待审阅',
+  applied: '已采纳',
+  rejected: '已拒绝',
+  conflict: '版本冲突',
+  reverted: '已撤销',
+}
+
+export const wikiStatusTone: Record<WikiSuggestionStatus, string> = {
+  pending: 'badge-warn',
+  applied: 'badge-success',
+  rejected: 'badge-muted',
+  conflict: 'badge-error',
+  reverted: 'badge-accent',
 }
 
 const GENERATED_CAPTURE_FILE = /^(?:[0-9a-f]{32}\.md|[^\\/]+\.md#fmd-note:[0-9a-f]{8,16})$/i
