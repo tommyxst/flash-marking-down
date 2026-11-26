@@ -181,6 +181,16 @@ impl SearchReader {
                 row.get(0)
             })
             .map_err(index_error)?;
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS dirty_before_scan (
+                    relative_path TEXT PRIMARY KEY, revision TEXT NOT NULL, captured_at TEXT
+                 );
+                 DELETE FROM temp.dirty_before_scan;
+                 INSERT INTO temp.dirty_before_scan
+                 SELECT relative_path, revision, captured_at FROM search_documents WHERE mtime_ns = 0;",
+            )
+            .map_err(index_error)?;
         let mut captured = HashMap::new();
         {
             let mut statement = self
@@ -310,13 +320,26 @@ impl SearchReader {
             .map_err(index_error)?;
         tx.execute(
             "DELETE FROM temp.scanned_changes WHERE relative_path IN
-                 (SELECT relative_path FROM notes WHERE rowid > ?1)",
+                 (SELECT relative_path FROM notes WHERE rowid > ?1)
+             OR relative_path IN (
+                 SELECT d.relative_path FROM search_documents d
+                 WHERE d.mtime_ns = 0 AND NOT EXISTS (
+                     SELECT 1 FROM temp.dirty_before_scan old WHERE old.relative_path = d.relative_path
+                       AND old.revision = d.revision AND old.captured_at IS d.captured_at
+                 )
+             )",
             [watermark],
         )
         .map_err(index_error)?;
         tx.execute(
-            "DELETE FROM search_documents WHERE relative_path NOT IN (SELECT relative_path FROM temp.scanned_paths)
-             AND relative_path NOT IN (SELECT relative_path FROM notes WHERE rowid > ?1)", [watermark],
+            "DELETE FROM search_documents AS d
+             WHERE d.relative_path NOT IN (SELECT relative_path FROM temp.scanned_paths)
+               AND d.relative_path NOT IN (SELECT relative_path FROM notes WHERE rowid > ?1)
+               AND (d.mtime_ns <> 0 OR EXISTS (
+                   SELECT 1 FROM temp.dirty_before_scan old WHERE old.relative_path = d.relative_path
+                     AND old.revision = d.revision AND old.captured_at IS d.captured_at
+               ))",
+            [watermark],
         ).map_err(index_error)?;
         tx.execute_batch(
             "INSERT INTO search_documents (relative_path, captured_at, revision, body, mtime_ns, file_size)
@@ -758,9 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn publishing_an_older_scan_keeps_captures_saved_during_the_scan() {
+    fn publishing_an_older_scan_keeps_captures_and_wiki_updates() {
         let dir = TestDir::new();
         let mut storage = open(&dir);
+        let wiki = "existing-wiki.md";
+        storage.create_wiki_target(wiki).unwrap();
         let mut scanner = storage.search_reader().unwrap();
         scanner.rebuild_search_index().unwrap();
         let mut search = storage.search_reader().unwrap();
@@ -781,7 +806,13 @@ mod tests {
                 );
             }
         }
-        // The scan started before both notes were appended to this day's file.
+        let suggestion = storage
+            .create_wiki_suggestion(None, wiki, "索引期间的建议", "更新索引")
+            .unwrap();
+        storage.apply_wiki_suggestion(&suggestion.id).unwrap();
+        storage.create_wiki_target("new-wiki.md").unwrap();
+
+        // Re-publish the staged view from before the notes and Wiki writes.
         scanner.publish_scan(0, 0).unwrap();
         let hits = search.search_records("并发保存", None, None, 0).unwrap().0;
         assert_eq!(hits.len(), 1);
@@ -789,6 +820,18 @@ mod tests {
             hits[0].1.is_some()
                 && hits[0].3.contains("并发保存 1")
                 && hits[0].3.contains("并发保存 2")
+        );
+        assert_eq!(
+            search
+                .search_records("索引期间的建议", None, None, 0)
+                .unwrap()
+                .0[0]
+                .0,
+            wiki
+        );
+        assert_eq!(
+            search.search_records("new-wiki", None, None, 0).unwrap().0[0].0,
+            "new-wiki.md"
         );
     }
 

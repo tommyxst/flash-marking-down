@@ -1,6 +1,7 @@
 <script setup lang="ts">
 const paths = {
   bolt: 'M13 2 4 14h7l-1 8 10-12h-7l1-8Z',
+  book: 'M12 6a6 6 0 0 0-4.5-2H3v15h4.5a6 6 0 0 1 4.5 2 6 6 0 0 1 4.5-2H21V4h-4.5A6 6 0 0 0 12 6Zm0 0v15',
   chat: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z',
   check: 'M5 13l4 4L19 7',
   close: 'M6 6l12 12M18 6 6 18',

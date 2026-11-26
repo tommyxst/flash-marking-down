@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, Prefix};
 use std::sync::{Arc, Mutex};
 use std::{fs, io};
@@ -307,6 +307,10 @@ impl Storage {
         self.workspace.files.clone()
     }
 
+    pub(crate) fn workspace_handle(&self) -> WorkspaceStorage {
+        self.workspace.clone()
+    }
+
     pub(crate) fn credential_reference(&self, key: &str) -> Result<Option<String>, StorageError> {
         self.connection
             .query_row(
@@ -437,11 +441,15 @@ impl Storage {
         is_capture(&self.connection, relative_path)
     }
 
-    pub(crate) fn capture_paths(&self) -> Result<Vec<String>, StorageError> {
+    pub(crate) fn is_in_capture_dir(&self, key: &str) -> bool {
+        is_in_capture_dir(key, self.capture_dir())
+    }
+
+    pub(crate) fn capture_paths(&self) -> Result<HashSet<String>, StorageError> {
         let read_error = |error| database_error("capture_paths", None, error);
         let mut q = self
             .connection
-            .prepare("SELECT DISTINCT relative_path FROM notes")
+            .prepare("SELECT DISTINCT relative_path FROM notes WHERE draft_id <> 'manual'")
             .map_err(read_error)?;
         q.query_map([], |row| row.get(0))
             .map_err(read_error)?
@@ -456,6 +464,7 @@ impl Storage {
             .prepare(
                 "SELECT relative_path, captured_at, id, source_id, block_id, content_hash
                  FROM notes
+                 WHERE draft_id <> 'manual'
                  ORDER BY captured_at DESC, rowid DESC LIMIT ?1",
             )
             .map_err(read_error)?;
@@ -510,6 +519,7 @@ impl Storage {
                 "SELECT id, source_id, relative_path, block_id, captured_at, title, body_preview,
                         content_hash, organize_status, ov_resource_status, ov_memory_status
                  FROM notes
+                 WHERE draft_id <> 'manual'
                  ORDER BY captured_at DESC, rowid DESC LIMIT ?1",
             )
             .map_err(read_error)?;
@@ -594,6 +604,16 @@ impl Storage {
 
     pub(crate) fn get_note_detail(&self, id_or_path: &str) -> Result<NoteDetailDto, StorageError> {
         let read_error = |error| database_error("note_detail", None, error);
+        let source_error = |e: io::Error| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "note_detail",
+                None,
+                true,
+                "找不到原文，请检查文件路径、权限或占用情况",
+                e,
+            )
+        };
         let (file_path, marker) = id_or_path
             .split_once(NOTE_ANCHOR)
             .map_or((id_or_path, None), |(p, m)| (p, Some(m)));
@@ -609,11 +629,12 @@ impl Storage {
             String,
             Option<String>,
             String,
+            String,
         )> = self
             .connection
             .query_row(
                 "SELECT id, source_id, relative_path, block_id, captured_at, organize_status, organize_json,
-                        ov_resource_status, ov_resource_uri, ov_memory_status
+                        ov_resource_status, ov_resource_uri, ov_memory_status, draft_id
                  FROM notes
                  WHERE id = ?1 OR (relative_path = ?2 AND block_id IS ?3)
                  ORDER BY rowid DESC LIMIT 1",
@@ -630,6 +651,7 @@ impl Storage {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -647,7 +669,12 @@ impl Storage {
             ov_resource_status,
             ov_resource_uri,
             ov_memory_status,
+            is_capture,
+            raw_bytes,
         ) = if let Some(found) = row {
+            let locator = note_locator(&found.2, found.3.as_deref());
+            let raw_bytes =
+                read_source_bytes(&self.workspace.files, &locator).map_err(source_error)?;
             (
                 found.0,
                 found.1,
@@ -659,59 +686,53 @@ impl Storage {
                 found.7,
                 found.8,
                 found.9,
+                found.10 != "manual",
+                raw_bytes,
             )
         } else {
-            let is_indexed: bool = self
-                .connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM search_documents WHERE relative_path = ?1)",
-                    [file_path],
-                    |row| row.get(0),
-                )
-                .map_err(read_error)?;
-            if !is_indexed {
+            if marker.is_some() {
                 return Err(error(
                     "SOURCE_UNAVAILABLE",
                     "note_detail",
                     None,
                     false,
-                    "找不到对应的记录或 Markdown 文件",
+                    "找不到对应的随手记区块",
                     id_or_path,
                 ));
             }
+            let (key, full_path) = self
+                .workspace
+                .files
+                .markdown_file(file_path)
+                .map_err(source_error)?;
+            let raw_bytes = fs::read(full_path).map_err(source_error)?;
+            let captured_at = self
+                .connection
+                .query_row(
+                    "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
+                    [&key],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(read_error)?
+                .flatten();
             (
-                format!("file:{file_path}"),
+                format!("file:{key}"),
                 String::new(),
-                file_path.to_owned(),
-                marker.map(str::to_owned),
-                self.connection
-                    .query_row(
-                        "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
-                        [file_path],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                    .optional()
-                    .map_err(read_error)?
-                    .flatten(),
+                key,
+                None,
+                captured_at,
                 "idle".to_owned(),
                 None,
                 "pending".to_owned(),
                 None,
                 "pending".to_owned(),
+                false,
+                raw_bytes,
             )
         };
 
         let locator = note_locator(&path, block_id.as_deref());
-        let raw_bytes = read_source_bytes(&self.workspace.files, &locator).map_err(|e| {
-            error(
-                "SOURCE_UNAVAILABLE",
-                "note_detail",
-                None,
-                true,
-                "找不到原文，文件可能已移动或删除",
-                e,
-            )
-        })?;
         let text = String::from_utf8(raw_bytes).map_err(|e| {
             error(
                 "SOURCE_UNAVAILABLE",
@@ -754,15 +775,17 @@ impl Storage {
             .or_else(|| organize.as_ref().and_then(|o| o.last_error.clone()));
 
         let conflicts = self.conflicts_for_paths(&path, &locator)?;
-        let wiki_suggestions = self.wiki_suggestions_for_note(&id)?;
+        let wiki_suggestions = if is_capture {
+            self.wiki_suggestions_for_note(&id)?
+        } else {
+            self.wiki_suggestions_for_target(&path)?
+        };
         let ov_error = self.memory_sync_error(
             &id,
             &path,
             ov_resource_status == "failed",
             ov_memory_status == "failed",
         )?;
-        let is_capture = !id.starts_with("file:");
-
         Ok(NoteDetailDto {
             id,
             path,
@@ -783,6 +806,244 @@ impl Storage {
             conflicts,
             wiki_suggestions,
         })
+    }
+
+    pub(crate) fn update_note(
+        &mut self,
+        id_or_path: &str,
+        expected_hash: &str,
+        body: &str,
+    ) -> Result<(String, Option<String>), StorageError> {
+        let db_error = |e| database_error("update_note", None, e);
+        let source_error = |e: io::Error| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "update_note",
+                None,
+                true,
+                "无法读取原文，请检查文件是否可用",
+                e,
+            )
+        };
+        let conflict = || {
+            error(
+                "VERSION_CONFLICT",
+                "update_note",
+                None,
+                true,
+                "笔记原文已在外部被修改，请刷新或复制当前内容后重试",
+                "Markdown changed on disk",
+            )
+        };
+        let (file_path, marker) = id_or_path
+            .split_once(NOTE_ANCHOR)
+            .map_or((id_or_path, None), |(p, m)| (p, Some(m)));
+        let record = self
+            .connection
+            .query_row(
+                "SELECT id, source_id, relative_path, block_id, captured_at, organize_json, draft_id
+                 FROM notes
+                 WHERE id = ?1 OR (relative_path = ?2 AND block_id IS ?3)
+                 ORDER BY rowid DESC LIMIT 1",
+                params![id_or_path, file_path, marker],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        let is_capture = record
+            .as_ref()
+            .is_some_and(|(_, _, _, _, _, _, draft_id)| draft_id != "manual");
+        if is_capture && body.trim().is_empty() {
+            return Err(error(
+                "INVALID_INPUT",
+                "update_note",
+                None,
+                false,
+                "笔记正文不能为空",
+                "capture body is empty",
+            ));
+        }
+        let missing_block = || {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "update_note",
+                None,
+                true,
+                "找不到对应的随手记区块，文件可能已被外部改写",
+                id_or_path,
+            )
+        };
+        let (note_id, source_id, path, block_id, captured_at, organize_json) = match record {
+            Some((id, source, path, block, captured, organize, _)) => {
+                (Some(id), source, path, block, Some(captured), organize)
+            }
+            None if marker.is_some() => return Err(missing_block()),
+            None => (
+                None,
+                String::new(),
+                self.workspace
+                    .files
+                    .markdown_key(file_path)
+                    .map_err(source_error)?,
+                None,
+                None,
+                None,
+            ),
+        };
+        let full_path = self
+            .workspace
+            .files
+            .markdown_full_path(&path)
+            .map_err(source_error)?;
+        let before_bytes = fs::read(&full_path).map_err(source_error)?;
+        let before_text = std::str::from_utf8(&before_bytes).map_err(|e| {
+            error(
+                "SOURCE_UNAVAILABLE",
+                "update_note",
+                None,
+                false,
+                "原文不是有效的 UTF-8 Markdown",
+                e,
+            )
+        })?;
+        let lb = if newline(&before_bytes) == "crlf" {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let (after_text, content_hash, body_for_meta) = if let Some(marker) = block_id.as_deref() {
+            let (body_start, next_start, current_body) =
+                block_span(before_text, marker).ok_or_else(missing_block)?;
+            if revision_hash(current_body.as_bytes()) != expected_hash {
+                return Err(conflict());
+            }
+            let normalized_body = body
+                .trim_end_matches(['\r', '\n'])
+                .replace("\r\n", "\n")
+                .replace('\n', lb);
+            let mut after = before_text[..body_start].to_owned();
+            if !after.ends_with('\n') {
+                after.push_str(lb);
+            }
+            if !after.ends_with("\n\n") && !after.ends_with("\n\r\n") {
+                after.push_str(lb);
+            }
+            after.push_str(&normalized_body);
+            after.push_str(lb);
+            if next_start < before_text.len() {
+                after.push_str(lb);
+                after.push_str(&before_text[next_start..]);
+            }
+            (
+                after,
+                revision_hash(normalized_body.as_bytes()),
+                normalized_body,
+            )
+        } else {
+            if revision_hash(&before_bytes) != expected_hash {
+                return Err(conflict());
+            }
+            let normalized_body = body.replace("\r\n", "\n").replace('\n', lb);
+            let mut after = note_id
+                .as_deref()
+                .filter(|_| !source_id.is_empty())
+                .map(|id| capture_header(id, &source_id))
+                .filter(|header| before_text.starts_with(header))
+                .unwrap_or_default();
+            after.push_str(&normalized_body);
+            if !after.is_empty() && !after.ends_with('\n') {
+                after.push_str(lb);
+            }
+            let hash = revision_hash(after.as_bytes());
+            (after, hash, normalized_body)
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if let Some(id) = note_id.as_deref() {
+            let organize_json = if let Some(mut result) = organize_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<OrganizeResultDto>(raw).ok())
+            {
+                result.source_changed = true;
+                Some(serde_json::to_string(&result).map_err(|e| {
+                    error(
+                        "WRITE_FAILED",
+                        "update_note",
+                        Some(id),
+                        true,
+                        "无法更新整理结果状态",
+                        e,
+                    )
+                })?)
+            } else {
+                organize_json
+            };
+            tx.execute(
+                "UPDATE notes SET title = ?2, body_preview = ?3, content_hash = ?4, body_hash = ?5,
+                                  organize_json = ?6, ov_memory_status = 'pending',
+                                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+                params![
+                    id,
+                    note_title(&body_for_meta),
+                    note_preview(&body_for_meta),
+                    content_hash,
+                    revision_hash(body.as_bytes()),
+                    organize_json
+                ],
+            )
+            .map_err(db_error)?;
+            tx.execute(
+                "UPDATE notes SET ov_resource_status = 'pending' WHERE relative_path = ?1",
+                [&path],
+            )
+            .map_err(db_error)?;
+        }
+        let indexed_at = tx
+            .query_row(
+                "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
+                [&path],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if indexed_at.is_some() || !is_capture {
+            let captured_at = captured_at.or_else(|| indexed_at.flatten());
+            let file_hash = if block_id.is_some() {
+                revision_hash(after_text.as_bytes())
+            } else {
+                content_hash
+            };
+            search::upsert_document(&tx, &path, captured_at.as_deref(), &file_hash, &after_text)
+                .map_err(db_error)?;
+        }
+        replace_markdown(&full_path, Some(&before_bytes), after_text.as_bytes()).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                conflict()
+            } else {
+                error(
+                    "WRITE_FAILED",
+                    "update_note",
+                    None,
+                    true,
+                    "笔记原文写入失败",
+                    e,
+                )
+            }
+        })?;
+        tx.commit().map_err(db_error)?;
+        Ok((note_locator(&path, block_id.as_deref()), note_id))
     }
 
     pub(crate) fn ensure_note_for_source(
@@ -967,17 +1228,19 @@ impl Storage {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(db_error)?;
-        let filename = format!("{date}.md");
-        let relative_path = if self.workspace.capture_dir.is_empty() {
-            filename
-        } else {
-            format!("{}/{filename}", self.workspace.capture_dir)
-        };
+        let relative_path = format!("{}/{date}.md", self.workspace.capture_dir);
         let (relative_path, path) = self
             .workspace
             .files
             .markdown_target(&relative_path)
             .map_err(file_error)?;
+        // A directory or file link can resolve to a daily file at the workspace root.
+        if path.parent() == Some(self.workspace.files.root_path()) {
+            return Err(file_error(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "capture directory must be a subfolder inside the workspace",
+            )));
+        }
         let before = match fs::read_to_string(&path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -1086,9 +1349,14 @@ pub(crate) fn physical_path(path: &str) -> &str {
     path.split_once(NOTE_ANCHOR).map_or(path, |(path, _)| path)
 }
 
+pub(crate) fn is_in_capture_dir(key: &str, capture_dir: &str) -> bool {
+    key.strip_prefix(capture_dir)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
 fn is_capture(conn: &Connection, path: &str) -> bool {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM notes WHERE relative_path = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE relative_path = ?1 AND draft_id <> 'manual')",
         [physical_path(path)],
         |row| row.get(0),
     )
@@ -1096,10 +1364,14 @@ fn is_capture(conn: &Connection, path: &str) -> bool {
 }
 
 fn block_body<'a>(text: &'a str, id: &str) -> Option<&'a str> {
-    block_body_with_start(text, id).map(|(_, body)| body)
+    block_span(text, id).map(|(_, _, body)| body)
 }
 
 fn block_body_with_start<'a>(text: &'a str, id: &str) -> Option<(usize, &'a str)> {
+    block_span(text, id).map(|(start, _, body)| (start, body))
+}
+
+fn block_span<'a>(text: &'a str, id: &str) -> Option<(usize, usize, &'a str)> {
     let mut start = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -1113,7 +1385,11 @@ fn block_body_with_start<'a>(text: &'a str, id: &str) -> Option<(usize, &'a str)
             && marker.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             if let Some(start) = start {
-                return Some((start, text[start..offset].trim_end_matches(['\r', '\n'])));
+                return Some((
+                    start,
+                    offset,
+                    text[start..offset].trim_end_matches(['\r', '\n']),
+                ));
             }
             if marker == id {
                 let content = offset + line.len();
@@ -1130,7 +1406,13 @@ fn block_body_with_start<'a>(text: &'a str, id: &str) -> Option<(usize, &'a str)
         }
         offset += line.len();
     }
-    start.map(|start| (start, text[start..].trim_end_matches(['\r', '\n'])))
+    start.map(|start| {
+        (
+            start,
+            text.len(),
+            text[start..].trim_end_matches(['\r', '\n']),
+        )
+    })
 }
 
 fn read_source_bytes(files: &WorkspaceFiles, path: &str) -> io::Result<Vec<u8>> {
@@ -1396,6 +1678,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn empty_and_dot_capture_paths_create_and_write_to_notes() {
+        for input in ["", "."] {
+            let dir = TestDir::new();
+            let mut storage = Storage::open(&dir.0, Path::new(input), ".flash-test").unwrap();
+            assert_eq!(storage.capture_dir(), "notes");
+            assert!(dir.0.join("notes").is_dir());
+
+            storage.save_draft("draft", 1, "默认目录正文").unwrap();
+            let saved = storage
+                .save_record("default", "draft", 1, "默认目录正文")
+                .unwrap();
+            let daily_file = saved.relative_path.strip_prefix("notes/").unwrap();
+            assert!(
+                fs::read_to_string(dir.0.join(&saved.relative_path))
+                    .unwrap()
+                    .contains("默认目录正文")
+            );
+            assert!(!dir.0.join(daily_file).exists());
+        }
+    }
+
+    #[test]
+    fn missing_nested_capture_directory_is_created_before_saving() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("journal/daily"), ".flash-test").unwrap();
+        assert_eq!(storage.capture_dir(), "journal/daily");
+        assert!(dir.0.join("journal/daily").is_dir());
+
+        storage.save_draft("draft", 1, "嵌套目录正文").unwrap();
+        let saved = storage
+            .save_record("nested", "draft", 1, "嵌套目录正文")
+            .unwrap();
+        let daily_file = saved.relative_path.strip_prefix("journal/daily/").unwrap();
+        assert!(dir.0.join(&saved.relative_path).is_file());
+        assert!(!dir.0.join(daily_file).exists());
+    }
+
+    #[test]
     fn daily_notes_append_personal_text_and_deduplicate_requests() {
         let dir = TestDir::new();
         let mut storage = dir.open();
@@ -1403,7 +1723,7 @@ pub(crate) mod tests {
             .connection
             .query_row("SELECT date('now','localtime')", [], |row| row.get(0))
             .unwrap();
-        let file = dir.0.join(format!("{today}.md"));
+        let file = dir.0.join(format!("notes/{today}.md"));
         fs::write(&file, "手工记录\r\n保留原文").unwrap();
 
         storage
@@ -1466,6 +1786,246 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn update_note_preserves_adjacent_daily_blocks_and_line_endings() {
+        for lb in ["\n", "\r\n"] {
+            let dir = TestDir::new();
+            let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+            let original_bodies = ["首条保持原样", "中间旧正文", "末条旧正文"];
+            let records = original_bodies.map(|body| {
+                storage.save_draft(body, 1, body).unwrap();
+                storage
+                    .save_record(&format!("1795579200000-{body}"), body, 1, body)
+                    .unwrap()
+            });
+            assert!(
+                records
+                    .iter()
+                    .all(|note| note.relative_path == records[0].relative_path)
+            );
+            let file = dir.0.join(&records[0].relative_path);
+            let original = fs::read_to_string(&file).unwrap().replace('\n', lb);
+            let date = file.file_stem().unwrap().to_str().unwrap();
+            assert!(original.starts_with(&format!("# {date}{lb}{lb}")));
+            fs::write(&file, &original).unwrap();
+
+            let middle = storage.get_note_detail(&records[1].record_id).unwrap();
+            let new_middle = "# 中间新标题\n第二行\r\n\n";
+            let (middle_locator, note_id) = storage
+                .update_note(&middle.id, &middle.content_hash, new_middle)
+                .unwrap();
+            assert_eq!(middle_locator, middle.locator);
+            assert_eq!(note_id.as_deref(), Some(middle.id.as_str()));
+            let middle_body = format!("# 中间新标题{lb}第二行");
+            let edited = original.replace(original_bodies[1], &middle_body);
+            assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+
+            let tail = storage.get_note_detail(&records[2].record_id).unwrap();
+            storage
+                .update_note(&tail.locator, &tail.content_hash, "末条新正文\r\n")
+                .unwrap();
+            let disk = fs::read_to_string(&file).unwrap();
+            assert_eq!(disk, edited.replace(original_bodies[2], "末条新正文"));
+            assert_eq!(
+                storage.get_note_detail(&records[0].record_id).unwrap().body,
+                original_bodies[0]
+            );
+            let refreshed = storage.get_note_detail(&middle_locator).unwrap();
+            assert_eq!(refreshed.body, middle_body);
+            let metadata: (String, String, String, String) = storage
+                .connection
+                .query_row(
+                    "SELECT title, body_preview, content_hash, body_hash FROM notes WHERE id = ?1",
+                    [&middle.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                metadata,
+                (
+                    "中间新标题".into(),
+                    middle_body,
+                    refreshed.content_hash,
+                    revision_hash(new_middle.as_bytes())
+                )
+            );
+
+            let (start, _, _) = block_span(&disk, tail.block_id.as_deref().unwrap()).unwrap();
+            let header_only = disk[..start].trim_end_matches(['\r', '\n']);
+            fs::write(&file, header_only).unwrap();
+            let empty = storage.get_note_detail(&tail.locator).unwrap();
+            storage
+                .update_note(&tail.locator, &empty.content_hash, "\n补回正文")
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("{header_only}{lb}{lb}{lb}补回正文{lb}")
+            );
+            assert_eq!(
+                storage.get_note_detail(&tail.locator).unwrap().body,
+                format!("{lb}补回正文")
+            );
+        }
+    }
+
+    #[test]
+    fn update_note_rejects_empty_captures_and_preserves_external_edits() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        let original = "随手记原文";
+        storage.save_draft("draft", 1, original).unwrap();
+        let saved = storage
+            .save_record("edit-conflict", "draft", 1, original)
+            .unwrap();
+        let detail = storage.get_note_detail(&saved.record_id).unwrap();
+        let file = dir.0.join(&saved.relative_path);
+        let before = fs::read_to_string(&file).unwrap();
+        let err = storage
+            .update_note(&detail.locator, &detail.content_hash, " \r\n")
+            .unwrap_err();
+        assert_eq!(
+            (err.code, err.safe_message),
+            ("INVALID_INPUT", "笔记正文不能为空")
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+
+        let external = before.replace(original, "外部编辑的新版本");
+        fs::write(&file, &external).unwrap();
+        let err = storage
+            .update_note(&detail.locator, &detail.content_hash, "尝试覆盖")
+            .unwrap_err();
+        assert_eq!(err.code, "VERSION_CONFLICT");
+        assert!(err.retryable);
+        assert_eq!(fs::read_to_string(&file).unwrap(), external);
+
+        fs::write(&file, "# 保留手写文件\n").unwrap();
+        let err = storage
+            .update_note(&detail.locator, &detail.content_hash, "尝试覆盖")
+            .unwrap_err();
+        assert_eq!(err.code, "SOURCE_UNAVAILABLE");
+        let missing = note_locator(&saved.relative_path, Some("deadbeef"));
+        assert_eq!(
+            storage
+                .update_note(&missing, &detail.content_hash, "不会创建区块")
+                .unwrap_err()
+                .code,
+            "SOURCE_UNAVAILABLE"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "# 保留手写文件\n");
+    }
+
+    #[test]
+    fn update_note_saves_whole_markdown_and_updates_search_immediately() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        let path = "手写文档.md";
+        let file = dir.0.join(path);
+        let original = "# 旧文档\r\noldkeyword\r\n";
+        fs::write(&file, original).unwrap();
+        let mut reader = storage.search_reader().unwrap();
+        assert_eq!(
+            reader
+                .search_records("oldkeyword", None, None, 0)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+
+        let detail = storage.get_note_detail(path).unwrap();
+        let (locator, note_id) = storage
+            .update_note(
+                &detail.locator,
+                &detail.content_hash,
+                "# 新文档\nnewkeyword",
+            )
+            .unwrap();
+        assert_eq!((locator.as_str(), note_id), (path, None));
+        let expected = "# 新文档\r\nnewkeyword\r\n";
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        let indexed: String = storage
+            .connection
+            .query_row(
+                "SELECT body FROM search_documents WHERE relative_path = ?1",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, expected);
+        let updated = reader
+            .search_records("newkeyword", None, None, 0)
+            .unwrap()
+            .0;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].0, path);
+        assert!(
+            reader
+                .search_records("oldkeyword", None, None, 0)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .update_note(path, &detail.content_hash, "旧基线")
+                .unwrap_err()
+                .code,
+            "VERSION_CONFLICT"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+
+        let note_id = storage.ensure_note_for_source(path).unwrap();
+        let detail = storage.get_note_detail(&note_id).unwrap();
+        assert!(!detail.is_capture);
+        assert_eq!(
+            storage.update_note(path, &detail.content_hash, "").unwrap(),
+            (path.into(), Some(note_id))
+        );
+        assert!(fs::read(&file).unwrap().is_empty());
+
+        let blank = "未索引的空文档.md";
+        fs::write(dir.0.join(blank), "").unwrap();
+        storage
+            .update_note(blank, &revision_hash(b""), "# 只有标题")
+            .unwrap();
+        assert_eq!(storage.get_note_detail(blank).unwrap().body, "# 只有标题\n");
+    }
+
+    #[test]
+    fn update_note_keeps_the_header_of_legacy_capture_files() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        storage.save_draft("draft", 1, "旧正文").unwrap();
+        let saved = storage
+            .save_record("legacy-capture", "draft", 1, "旧正文")
+            .unwrap();
+        let path = "legacy.md";
+        let header = capture_header(&saved.record_id, &saved.source_id);
+        fs::write(dir.0.join(path), format!("{header}旧正文\n")).unwrap();
+        storage
+            .connection
+            .execute(
+                "UPDATE notes SET relative_path = ?2, block_id = NULL WHERE id = ?1",
+                params![saved.record_id, path],
+            )
+            .unwrap();
+        let detail = storage.get_note_detail(&saved.record_id).unwrap();
+        assert_eq!(detail.body, "旧正文\n");
+
+        let (locator, note_id) = storage
+            .update_note(&detail.id, &detail.content_hash, "新正文")
+            .unwrap();
+        assert_eq!(
+            (locator.as_str(), note_id.as_deref()),
+            (path, Some(saved.record_id.as_str()))
+        );
+        assert_eq!(
+            fs::read_to_string(dir.0.join(path)).unwrap(),
+            format!("{header}新正文\n")
+        );
+        assert_eq!(storage.get_note_detail(&locator).unwrap().body, "新正文\n");
+    }
+
+    #[test]
     fn failed_daily_write_preserves_the_draft_and_can_retry() {
         let dir = TestDir::new();
         let mut storage = dir.open();
@@ -1473,7 +2033,7 @@ pub(crate) mod tests {
             .connection
             .query_row("SELECT date('now','localtime')", [], |row| row.get(0))
             .unwrap();
-        let blocked = dir.0.join(format!("{today}.md"));
+        let blocked = dir.0.join(format!("notes/{today}.md"));
         fs::create_dir(&blocked).unwrap();
         storage.save_draft("draft", 1, "待重试版本").unwrap();
         assert!(

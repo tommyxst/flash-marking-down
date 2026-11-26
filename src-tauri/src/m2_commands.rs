@@ -9,7 +9,7 @@ use crate::credential_commands::{model_credential_state, model_token, service_to
 use crate::dto::{
     AppError, ChatTurnDto, ConflictDto, ConversationDetailDto, ConversationSummaryDto,
     DrawerCountsDto, MemoryItemDto, ModelConfigDto, NoteDetailDto, NoteSummaryDto, TaskListDto,
-    WikiSuggestionDto, WikiTargetDto,
+    WikiDocumentDto, WikiSuggestionDto, WikiTargetDto,
 };
 use crate::memory::{MemoryProvider, OpenVikingProvider, markdown_body, memory_item_title};
 use crate::model::MemoryConfig;
@@ -233,14 +233,13 @@ fn run_background_job(
     let tags = ["app=flash-marking-down".to_owned()];
     if job.kind == "ov_write_resource" {
         let (through_row, relative_uri) = storage.resource_batch(&job.path)?;
+        let markdown = storage.read_note_markdown(&job.path);
         let result = provider.and_then(|ov| {
-            let markdown = storage.read_note_markdown(&job.path)?;
-            let uri = ov
-                .upsert_daily_note(&relative_uri, &markdown, &tags)
-                .map_err(|e| e.safe_message)?;
-            Ok((uri, markdown))
+            let markdown = markdown.as_ref().map_err(String::clone)?;
+            ov.upsert_daily_note(&relative_uri, markdown, &tags)
+                .map_err(|e| e.safe_message)
         });
-        storage.complete_resource_job(&job, through_row, result)?;
+        storage.complete_resource_job(&job, through_row, markdown.as_deref().ok(), result)?;
     } else {
         let result = provider.and_then(|ov| {
             let (title, markdown) = storage.memory_commit_input(&job)?;
@@ -455,6 +454,71 @@ pub(crate) async fn get_note_detail(
 }
 
 #[tauri::command]
+pub(crate) async fn update_note(
+    window: WebviewWindow,
+    session: String,
+    id_or_path: String,
+    expected_hash: String,
+    body: String,
+    reorganize: Option<bool>,
+) -> CommandResult<NoteDetailDto> {
+    let app = window.app_handle().clone();
+    let prefs = settings::settings_path(&app)
+        .and_then(|path| settings::read(&path))
+        .unwrap_or_default();
+    let (detail, wake) = with_workspace(window, session, move |storage| {
+        update_note_and_queue(
+            storage,
+            &id_or_path,
+            &expected_hash,
+            &body,
+            reorganize.unwrap_or(true),
+            &prefs,
+        )
+    })
+    .await?;
+    let _ = app.emit_to("main", "note-updated", json!({ "noteId": detail.id }));
+    if wake {
+        wake_organize_worker(&app);
+    }
+    Ok(detail)
+}
+
+fn update_note_and_queue(
+    storage: &mut Storage,
+    id_or_path: &str,
+    expected_hash: &str,
+    body: &str,
+    reorganize: bool,
+    prefs: &AppSettings,
+) -> CommandResult<(NoteDetailDto, bool)> {
+    let (locator, note_id) = storage.update_note(id_or_path, expected_hash, body)?;
+    let note_id = match note_id {
+        None if reorganize => Some(storage.ensure_note_for_source(&locator)?),
+        id => id,
+    };
+    let wake = if let Some(id) = note_id {
+        let organize = reorganize
+            && storage
+                .model_config()
+                .map_err(|message| m2_err("organize", message))?
+                .is_some_and(|config| config.2);
+        let memory = if prefs.auto_sync_memory {
+            memory_config(storage).ok().flatten().filter(|config| {
+                config.enabled && (config.sync_resources || config.commit_memories)
+            })
+        } else {
+            None
+        };
+        // A running job may already be working from the previous version. Keep one follow-up.
+        storage.enqueue_note_jobs(&id, organize, memory.as_ref(), true)? || organize
+    } else {
+        false
+    };
+    Ok((storage.get_note_detail(&locator)?, wake))
+}
+
+#[tauri::command]
 pub(crate) async fn trigger_note_organize(
     window: WebviewWindow,
     session: String,
@@ -585,6 +649,23 @@ pub(crate) async fn resolve_conflict(
     .await?;
     let _ = app.emit_to("main", "drawer-badge-updated", ());
     Ok(updated)
+}
+
+#[tauri::command]
+pub(crate) async fn list_wiki_documents(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<Vec<WikiDocumentDto>> {
+    let workspace =
+        with_workspace(window, session, |storage| Ok(storage.workspace_handle())).await?;
+    // Reading every Markdown file must not hold the quick-capture workspace lock.
+    async_runtime::spawn_blocking(move || {
+        workspace.with_storage(|storage| storage.list_wiki_documents().map_err(AppError::from))
+    })
+    .await
+    .map_err(|_| {
+        AppError::from_message("CANCELLED", "wiki", true, "读取 Wiki 文档中断，请刷新重试")
+    })?
 }
 
 #[tauri::command]

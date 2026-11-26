@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const STATE_DIR: &str = ".flash-marking-down";
+pub(crate) const DEFAULT_CAPTURE_DIR: &str = "notes";
 const STATE_DB_NAME: &str = "state.sqlite";
 const REPARSE_POINT: u32 = 0x0400;
 
@@ -75,8 +76,39 @@ impl WorkspaceFiles {
     }
 
     pub(crate) fn capture_key(&self, relative: &Path) -> io::Result<String> {
-        let capture = capture_picker_path(&self.root, relative)?;
-        self.key(&capture)
+        validate_relative(relative)?;
+        let relative = if relative.as_os_str().is_empty() || relative == Path::new(".") {
+            Path::new(DEFAULT_CAPTURE_DIR)
+        } else {
+            relative
+        };
+        let current = self.ensure_directory(relative)?;
+        if current == self.root {
+            return Err(scope_error(
+                "capture directory must be a subfolder inside the workspace",
+            ));
+        }
+        self.key(&current)
+    }
+
+    fn ensure_directory(&self, relative: &Path) -> io::Result<PathBuf> {
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(segment) = component else {
+                continue;
+            };
+            let next = current.join(segment);
+            if !next.try_exists()? {
+                match fs::create_dir(&next) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            current = workspace_root(&next)?;
+            self.key(&current)?;
+        }
+        Ok(current)
     }
 
     fn key(&self, resolved: &Path) -> io::Result<String> {
@@ -235,14 +267,15 @@ impl WorkspaceFiles {
     }
 
     pub(crate) fn markdown_full_path(&self, relative_path: &str) -> io::Result<PathBuf> {
-        let path = self.markdown_input(relative_path)?.canonicalize()?;
-        self.checked_markdown(&path)?;
-        Ok(path)
+        self.markdown_file(relative_path).map(|(_, path)| path)
     }
 
     pub(crate) fn markdown_key(&self, relative_path: &str) -> io::Result<String> {
-        let path = self.markdown_input(relative_path)?.canonicalize()?;
-        self.checked_markdown(&path)
+        self.markdown_file(relative_path).map(|(key, _)| key)
+    }
+
+    pub(crate) fn markdown_file(&self, relative_path: &str) -> io::Result<(String, PathBuf)> {
+        self.picked_markdown(&self.markdown_input(relative_path)?)
     }
 
     pub(crate) fn picked_markdown(&self, selected: &Path) -> io::Result<(String, PathBuf)> {
@@ -260,6 +293,25 @@ impl WorkspaceFiles {
         let path = parent.join(requested.file_name().expect("Markdown path has a name"));
         let key = self.key(&path)?;
         Ok((key, path))
+    }
+
+    pub(crate) fn create_markdown_target(
+        &self,
+        relative_path: &str,
+    ) -> io::Result<(String, PathBuf)> {
+        let requested = self.markdown_input(relative_path)?;
+        if let Some(path) = existing_path(&requested)? {
+            return Ok((self.checked_markdown(&path)?, path));
+        }
+        if self.root.canonicalize()? != self.root {
+            return Err(scope_error("workspace path changed"));
+        }
+        let parent = Path::new(relative_path)
+            .parent()
+            .expect("Markdown path has a parent");
+        let parent = self.ensure_directory(parent)?;
+        let path = parent.join(requested.file_name().expect("Markdown path has a name"));
+        Ok((self.key(&path)?, path))
     }
 
     fn checked_markdown(&self, path: &Path) -> io::Result<String> {
@@ -301,10 +353,14 @@ pub(crate) fn workspace_root(root: &Path) -> io::Result<PathBuf> {
 
 pub(crate) fn capture_picker_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     validate_relative(relative)?;
-    if relative.as_os_str().is_empty() {
+    if relative.as_os_str().is_empty() || relative == Path::new(".") {
         return Ok(root.to_owned());
     }
-    let capture = workspace_root(&root.join(relative))?;
+    let capture = match workspace_root(&root.join(relative)) {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(root.to_owned()),
+        Err(error) => return Err(error),
+    };
     in_workspace(root, &capture)?;
     Ok(capture)
 }
@@ -317,7 +373,9 @@ pub(crate) fn picked_capture_directory(
     let selected = workspace_root(selected)?;
     let relative = in_workspace(checked_root, &selected)?;
     if relative.as_os_str().is_empty() {
-        return Ok(String::new());
+        return Err(scope_error(
+            "capture directory must be a subfolder inside the workspace",
+        ));
     }
     if capture_picker_path(checked_root, Path::new(current)).is_ok_and(|path| path == selected) {
         return Ok(current.to_owned());
@@ -457,10 +515,14 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         let checked_root = workspace_root(&root).unwrap();
 
-        assert_eq!(
-            picked_capture_directory(&checked_root, "笔记", &root).unwrap(),
-            ""
-        );
+        for relative in ["", ".", "missing/daily"] {
+            assert_eq!(
+                capture_picker_path(&checked_root, Path::new(relative)).unwrap(),
+                checked_root
+            );
+        }
+        assert!(!root.join("missing").exists());
+        assert!(picked_capture_directory(&checked_root, "笔记", &root).is_err());
         assert_eq!(
             picked_capture_directory(&checked_root, "", &capture).unwrap(),
             "笔记/随手记"

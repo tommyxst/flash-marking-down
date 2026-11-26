@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::dto::{TaskEntryDto, WikiSuggestionDto};
+use crate::dto::{TaskEntryDto, WikiDocumentDto, WikiSuggestionDto};
 
 use super::*;
 
@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS wiki_suggestions (
 );";
 
 pub(crate) type WikiApplyOutcome = (String, String, String);
+
+pub(crate) const CAPTURE_TARGET_MESSAGE: &str = "随手记目录内的文件不能作为 Wiki 或任务清单目标";
 
 fn db(e: rusqlite::Error) -> StorageError {
     database_error("wiki", None, e)
@@ -48,6 +50,26 @@ fn file_error(e: io::Error) -> StorageError {
 
 fn utf8(bytes: Vec<u8>) -> Result<String, StorageError> {
     String::from_utf8(bytes).map_err(|_| invalid("目标文件不是有效的 UTF-8 Markdown"))
+}
+
+fn update_wiki_index(conn: &Connection, path: &str, body: &str) -> Result<(), StorageError> {
+    let captured_at: Option<String> = conn
+        .query_row(
+            "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
+            [path],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(db)?
+        .flatten();
+    search::upsert_document(
+        conn,
+        path,
+        captured_at.as_deref(),
+        &revision_hash(body.as_bytes()),
+        body,
+    )
+    .map_err(db)
 }
 
 fn map_suggestion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WikiSuggestionDto> {
@@ -103,8 +125,11 @@ impl Storage {
         let (key, target) = self
             .workspace
             .files
-            .markdown_target(path)
+            .create_markdown_target(path)
             .map_err(file_error)?;
+        if self.is_in_capture_dir(&key) || self.is_capture_path(&key) {
+            return Err(invalid(CAPTURE_TARGET_MESSAGE));
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -122,6 +147,7 @@ impl Storage {
         if role != "wiki" {
             return Err(invalid("此路径已映射为任务清单"));
         }
+        update_wiki_index(&tx, &key, "")?;
         replace_markdown(&target, None, &[]).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 conflict("同名文件已存在，请使用关联已有页")
@@ -143,24 +169,115 @@ impl Storage {
             .map_err(db)
     }
 
+    pub(crate) fn list_wiki_documents(&self) -> Result<Vec<WikiDocumentDto>, StorageError> {
+        let mut mapped_wiki = HashSet::new();
+        let mut tasks_target = None;
+        for (kind, path) in self.wiki_targets()? {
+            match kind.as_str() {
+                "wiki" => {
+                    mapped_wiki.insert(path);
+                }
+                "tasks" => tasks_target = Some(path),
+                _ => (),
+            }
+        }
+        let mut counts = self
+            .connection
+            .prepare(
+                "SELECT target_path, SUM(status = 'pending'), SUM(status = 'conflict')
+             FROM wiki_suggestions WHERE status IN ('pending', 'conflict') GROUP BY target_path",
+            )
+            .map_err(db)?;
+        let counts = counts
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, i64>(2)? as usize,
+                    ),
+                ))
+            })
+            .map_err(db)?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(db)?;
+        let capture_files = self.capture_paths()?;
+        let (entries, _) = self
+            .workspace
+            .files
+            .markdown_entries()
+            .map_err(file_error)?;
+        let mut timestamp = self
+            .connection
+            .prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch')")
+            .map_err(db)?;
+        let mut documents = Vec::new();
+        for entry in entries {
+            let path = entry.relative_path;
+            if self.is_in_capture_dir(&path)
+                || capture_files.contains(&path)
+                || tasks_target.as_deref() == Some(path.as_str())
+            {
+                continue;
+            }
+            let Ok(bytes) = self.workspace.files.read_markdown(&path) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let mut title = note_title(text);
+            if title.is_empty() {
+                title = Path::new(&path)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&path)
+                    .to_owned();
+            }
+            let folder = path
+                .rsplit_once('/')
+                .map_or(String::new(), |(dir, _)| dir.to_owned());
+            let (pending_suggestions, conflict_suggestions) =
+                counts.get(&path).copied().unwrap_or_default();
+            let updated_at = if entry.mtime_ns > 0 {
+                // MarkdownEntry stores Windows FILETIME ticks (100 ns since 1601).
+                let unix_seconds = entry.mtime_ns / 10_000_000 - 11_644_473_600;
+                timestamp
+                    .query_row([unix_seconds], |row| row.get(0))
+                    .map_err(db)?
+            } else {
+                None
+            };
+            documents.push(WikiDocumentDto {
+                title,
+                preview: note_preview(text),
+                folder,
+                mapped: mapped_wiki.contains(&path),
+                pending_suggestions,
+                conflict_suggestions,
+                updated_at,
+                path,
+            });
+        }
+        documents.sort_unstable_by(|a, b| {
+            (!a.mapped, &a.folder, &a.path).cmp(&(!b.mapped, &b.folder, &b.path))
+        });
+        Ok(documents)
+    }
+
     pub(crate) fn map_wiki_target(&mut self, kind: &str, path: &str) -> Result<(), StorageError> {
         if !matches!(kind, "tasks" | "wiki") {
             return Err(invalid("请选择 Wiki 或任务清单"));
         }
-        let target = self
+        let (target, full_path) = self
             .workspace
             .files
-            .markdown_key(path)
+            .markdown_file(path)
             .map_err(file_error)?;
-        utf8(
-            self.workspace
-                .files
-                .read_markdown(path)
-                .map_err(file_error)?,
-        )?;
-        if self.is_capture_path(&target) {
-            return Err(invalid("原始随手记文件不能映射为写入目标"));
+        if self.is_in_capture_dir(&target) || self.is_capture_path(&target) {
+            return Err(invalid(CAPTURE_TARGET_MESSAGE));
         }
+        utf8(fs::read(full_path).map_err(file_error)?)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -253,6 +370,21 @@ impl Storage {
             .map_err(db)
     }
 
+    pub(crate) fn wiki_suggestions_for_target(
+        &self,
+        target_path: &str,
+    ) -> Result<Vec<WikiSuggestionDto>, StorageError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, note_id, target_path, base_hash, before_text, after_text, reason, status, created_at
+             FROM wiki_suggestions WHERE target_path = ?1
+             ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'conflict' THEN 1 ELSE 2 END, rowid DESC",
+        ).map_err(db)?;
+        stmt.query_map([target_path], map_suggestion_row)
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)
+    }
+
     pub(crate) fn create_wiki_suggestion(
         &mut self,
         note_id: Option<&str>,
@@ -338,9 +470,20 @@ impl Storage {
                 .map_err(db)?;
             return Err(conflict("目标 Wiki 文件已被外部修改，请先重新比较"));
         }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db)?;
+        update_wiki_index(&tx, &item.target_path, &item.after_text)?;
+        tx.execute(
+            "UPDATE wiki_suggestions SET status = 'applied' WHERE id = ?1",
+            [id],
+        )
+        .map_err(db)?;
         #[cfg(test)]
         tests::at_write_boundary();
         if let Err(e) = replace_markdown(&full_path, Some(&current), item.after_text.as_bytes()) {
+            drop(tx);
             if e.kind() == io::ErrorKind::AlreadyExists {
                 self.connection
                     .execute(
@@ -352,12 +495,7 @@ impl Storage {
             }
             return Err(file_error(e));
         }
-        self.connection
-            .execute(
-                "UPDATE wiki_suggestions SET status = 'applied' WHERE id = ?1",
-                [id],
-            )
-            .map_err(db)?;
+        tx.commit().map_err(db)?;
         Ok((item.id, "applied".into(), String::new()))
     }
 
@@ -454,6 +592,16 @@ impl Storage {
             next.replace_range(pos..pos + added.len(), sep);
             next
         };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db)?;
+        update_wiki_index(&tx, &item.target_path, &restored)?;
+        tx.execute(
+            "UPDATE wiki_suggestions SET status = 'reverted' WHERE id = ?1",
+            [id],
+        )
+        .map_err(db)?;
         replace_markdown(&full_path, Some(current.as_bytes()), restored.as_bytes()).map_err(
             |e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
@@ -463,12 +611,7 @@ impl Storage {
                 }
             },
         )?;
-        self.connection
-            .execute(
-                "UPDATE wiki_suggestions SET status = 'reverted' WHERE id = ?1",
-                [id],
-            )
-            .map_err(db)?;
+        tx.commit().map_err(db)?;
         load_suggestion(&self.connection, id)
     }
 
@@ -964,6 +1107,183 @@ mod tests {
     }
 
     #[test]
+    fn lists_wiki_documents_without_captures_or_task_list() {
+        for capture_dir in ["notes", "inbox/daily"] {
+            let dir = TestDir::new();
+            let mut storage = Storage::open(&dir.0, Path::new(capture_dir), ".flash-test").unwrap();
+            fs::write(dir.0.join(capture_dir).join("untracked.md"), "每日原文").unwrap();
+            fs::write(dir.0.join("legacy.md"), "历史随手记").unwrap();
+            let legacy = storage.ensure_note_for_source("legacy.md").unwrap();
+            storage
+                .connection
+                .execute(
+                    "UPDATE notes SET draft_id = 'legacy-capture' WHERE id = ?1",
+                    [&legacy],
+                )
+                .unwrap();
+            fs::write(dir.0.join("notes-index.md"), "# 首页\n\n项目资料").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(dir.0.join("notes-index.md"))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                .unwrap();
+            fs::write(dir.0.join("bad.md"), [0xff, 0xfe]).unwrap();
+            fs::write(dir.0.join(".flash-test/hidden.md"), "内部状态").unwrap();
+
+            let target = "wiki/architecture.md";
+            storage.create_wiki_target(target).unwrap();
+            fs::write(dir.0.join("wiki/topics.md"), "# 主题").unwrap();
+            fs::write(dir.0.join("wiki/tasks.md"), "- [ ] 待办").unwrap();
+            storage.map_wiki_target("tasks", "wiki/tasks.md").unwrap();
+
+            let applied = storage
+                .create_wiki_suggestion(None, target, "已确认的决定", "采纳理由")
+                .unwrap();
+            storage.apply_wiki_suggestion(&applied.id).unwrap();
+            let conflict = storage
+                .create_wiki_suggestion(None, target, "待核对的内容", "冲突理由")
+                .unwrap();
+            fs::write(dir.0.join(target), "# 架构设计\n\n手工补充").unwrap();
+            assert_eq!(
+                storage
+                    .apply_wiki_suggestion(&conflict.id)
+                    .unwrap_err()
+                    .code,
+                "VERSION_CONFLICT"
+            );
+            let pending = storage
+                .create_wiki_suggestion(None, target, "候选设计", "待审理由")
+                .unwrap();
+
+            let docs = storage.list_wiki_documents().unwrap();
+            assert_eq!(
+                docs.iter().map(|doc| doc.path.as_str()).collect::<Vec<_>>(),
+                [target, "notes-index.md", "wiki/topics.md"]
+            );
+            let mapped = &docs[0];
+            assert!(mapped.mapped);
+            assert_eq!(
+                (&mapped.title[..], &mapped.folder[..]),
+                ("架构设计", "wiki")
+            );
+            assert_eq!(
+                (mapped.pending_suggestions, mapped.conflict_suggestions),
+                (1, 1)
+            );
+            assert!(mapped.preview.contains("手工补充"));
+            let root = &docs[1];
+            assert!(!root.mapped && root.folder.is_empty());
+            assert_eq!(root.updated_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+            let detail = storage.get_note_detail(target).unwrap();
+            assert_eq!(
+                detail
+                    .wiki_suggestions
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                [pending.id, conflict.id, applied.id]
+            );
+        }
+    }
+
+    #[test]
+    fn creates_opens_and_indexes_nested_wiki_pages() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        let mut search = storage.search_reader().unwrap();
+        search.rebuild_search_index().unwrap();
+
+        let path = "wiki/arch/overview.md";
+        storage.create_wiki_target(path).unwrap();
+        assert!(fs::read(dir.0.join(path)).unwrap().is_empty());
+        let blank = storage.list_wiki_documents().unwrap().pop().unwrap();
+        assert_eq!(
+            (&blank.title[..], &blank.folder[..]),
+            ("overview", "wiki/arch")
+        );
+        assert!(blank.mapped && blank.preview.is_empty());
+        // A disk-backed page stays readable even before its index entry exists.
+        assert_eq!(
+            storage
+                .connection
+                .execute(
+                    "DELETE FROM search_documents WHERE relative_path = ?1",
+                    [path]
+                )
+                .unwrap(),
+            1
+        );
+        let detail = storage.get_note_detail(r"wiki\arch\overview.md").unwrap();
+        assert_eq!(detail.id, format!("file:{path}"));
+        assert_eq!(detail.path, path);
+        assert!(!detail.is_capture && detail.body.is_empty() && detail.captured_at.is_none());
+        assert_eq!(
+            storage
+                .get_note_detail(&format!("{path}{NOTE_ANCHOR}missing"))
+                .unwrap_err()
+                .code,
+            "SOURCE_UNAVAILABLE"
+        );
+
+        storage
+            .update_note(path, &detail.content_hash, "# 架构总览\n\n核心原则")
+            .unwrap();
+        assert!(storage.list_notes().unwrap().is_empty());
+        let (hits, _, _) = search.search_records("核心原则", None, None, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, path);
+        assert_eq!(
+            storage.get_note_detail(path).unwrap().body,
+            "# 架构总览\n\n核心原则\n"
+        );
+    }
+
+    #[test]
+    fn manually_organized_documents_remain_wiki_candidates() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        let path = "wiki.md";
+        fs::write(dir.0.join(path), "# 项目 Wiki").unwrap();
+        let id = storage.ensure_note_for_source(path).unwrap();
+
+        assert!(!storage.get_note_detail(&id).unwrap().is_capture);
+        assert!(!storage.is_capture_path(path));
+        assert!(storage.list_notes().unwrap().is_empty());
+        assert!(storage.list_recent_captures().unwrap().is_empty());
+        assert!(!storage.capture_paths().unwrap().contains(path));
+        let docs = storage.list_wiki_documents().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].path, path);
+        assert!(!docs[0].mapped);
+        storage.map_wiki_target("wiki", path).unwrap();
+        assert!(storage.list_wiki_documents().unwrap()[0].mapped);
+    }
+
+    #[test]
+    fn capture_subdirectory_cannot_be_used_for_wiki_or_task_targets() {
+        let dir = TestDir::new();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
+        fs::create_dir(dir.0.join("notes/sub")).unwrap();
+        let existing = "notes/sub/capture.md";
+        fs::write(dir.0.join(existing), "# 随手记").unwrap();
+        for kind in ["wiki", "tasks"] {
+            let error = storage.map_wiki_target(kind, existing).unwrap_err();
+            assert_eq!(
+                (error.code, error.safe_message),
+                ("INVALID_INPUT", CAPTURE_TARGET_MESSAGE)
+            );
+        }
+        let new_path = "notes/sub/new-wiki.md";
+        assert_eq!(
+            storage.create_wiki_target(new_path).unwrap_err().code,
+            "INVALID_INPUT"
+        );
+        assert!(!dir.0.join(new_path).exists());
+        assert!(storage.wiki_targets().unwrap().is_empty());
+    }
+
+    #[test]
     fn wiki_suggestions_apply_recompare_reject_undo_and_unmap_preserve_files() {
         let dir = TestDir::new();
         let mut storage = Storage::open(&dir.0, Path::new("."), ".flash-test").unwrap();
@@ -981,9 +1301,19 @@ mod tests {
         let b = storage
             .create_wiki_suggestion(None, "b.md", "尚待讨论", "补充说明")
             .unwrap();
+        let mut search = storage.search_reader().unwrap();
+        search.rebuild_search_index().unwrap();
 
         fs::write(dir.0.join("b.md"), "其他编辑器的意见").unwrap();
         assert_eq!(storage.apply_wiki_suggestion(&a.id).unwrap().1, "applied");
+        assert_eq!(
+            search
+                .search_records("采用的意见", None, None, 0)
+                .unwrap()
+                .0[0]
+                .0,
+            "a.md"
+        );
         assert_eq!(
             storage.apply_wiki_suggestion(&b.id).unwrap_err().code,
             "VERSION_CONFLICT"
@@ -1018,6 +1348,13 @@ mod tests {
         fs::write(dir.0.join("a.md"), format!("{applied_a}另一项手工补充\n")).unwrap();
         let reverted = storage.undo_wiki_suggestion(&a.id).unwrap();
         assert_eq!(reverted.status, "reverted");
+        assert!(
+            search
+                .search_records("采用的意见", None, None, 0)
+                .unwrap()
+                .0
+                .is_empty()
+        );
         assert_eq!(
             fs::read_to_string(dir.0.join("a.md")).unwrap(),
             "\u{feff}人工原稿\n另一项手工补充\n"

@@ -111,13 +111,10 @@ impl PreparedChat {
             }
             let same_daily_file = hit.kind == "ov_resource"
                 && hit.uri.strip_prefix(&daily_prefix).is_some_and(|file| {
-                    let capture_path = if self.capture_dir.is_empty() {
-                        file.to_owned()
-                    } else {
-                        format!("{}/{file}", self.capture_dir)
-                    };
+                    let capture_path = format!("{}/{file}", self.capture_dir);
                     self.citations.iter().any(|local| {
-                        local.kind == "local" && physical_path(&local.path) == capture_path
+                        let path = physical_path(&local.path);
+                        local.kind == "local" && (path == capture_path || path == file)
                     })
                 });
             if !same_daily_file {
@@ -972,6 +969,43 @@ mod tests {
     use super::*;
     use crate::storage::tests::TestDir;
     use std::fs;
+
+    #[test]
+    fn historical_root_daily_file_can_be_searched_read_and_deduplicated() {
+        const DAILY_PREFIX: &str = "viking://resources/flash-marking-down/fixture/daily/";
+        let dir = TestDir::new();
+        let legacy = "2025-04-02.md";
+        let body = "# 2025-04-02\n\n旧笔记兼容验证\n";
+        fs::write(dir.0.join(legacy), body).unwrap();
+        let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
+        let mut search = storage.search_reader().unwrap();
+        let hits = search
+            .search_records("旧笔记兼容", None, None, 0)
+            .unwrap()
+            .0;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, legacy);
+        assert_eq!(
+            search.read_record_source(legacy, &hits[0].2).unwrap().2,
+            body
+        );
+
+        let mut prepared = storage.prepare_chat_turn(None, "旧笔记兼容").unwrap();
+        prepared.add_openviking_recall(Ok(Some((
+            DAILY_PREFIX.into(),
+            vec![MemoryHit {
+                uri: format!("{DAILY_PREFIX}{legacy}"),
+                kind: "ov_resource".into(),
+                title: legacy.into(),
+                snippet: body.into(),
+                score: None,
+                updated_at: None,
+            }],
+        ))));
+        assert_eq!(prepared.citations.len(), 1);
+        assert_eq!(prepared.citations[0].path, legacy);
+        assert_eq!(prepared.citations[0].kind, "local");
+    }
 
     #[test]
     fn conflicts_support_git_three_way_decisions_and_tolerate_corrupt_rows() {

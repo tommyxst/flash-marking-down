@@ -32,6 +32,289 @@ fn unavailable_address() -> tauri::Url {
 }
 
 #[test]
+fn edited_capture_runs_organize_and_both_sync_lanes_on_the_new_body() {
+    let dir = TestDir::new();
+    let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
+    let versions = [
+        ("原始笔记", "原始整理摘要", "核对旧资料"),
+        ("修改后的笔记", "新版整理摘要", "跟进新资料"),
+    ];
+    let mut calls = 0;
+    let (url, server) = mock_http(12, move |request| {
+        let (title, summary, task) = versions[calls / 6];
+        let expected = [
+            "/api/v1/content/write",
+            "/api/v1/search/search",
+            "/v1/chat/completions",
+            "/api/v1/sessions",
+            "/api/v1/sessions/isolated/messages",
+            "/api/v1/sessions/isolated/commit",
+        ];
+        assert_eq!(request.target, expected[calls % 6]);
+        calls += 1;
+        let body = request.body.unwrap();
+        let result = match request.target.as_str() {
+            "/api/v1/content/write" => {
+                let content = body["content"].as_str().unwrap();
+                assert!(content.contains(title) && content.contains("同日相邻随手记"));
+                if calls > 6 {
+                    assert!(!content.contains("原始笔记"));
+                }
+                json!({"uri": body["uri"]})
+            }
+            "/api/v1/search/search" => json!({"memories": []}),
+            "/v1/chat/completions" => {
+                let input = body["messages"][1]["content"].as_str().unwrap();
+                assert!(input.contains(title) && input.contains(task));
+                let organized = json!({"summary": summary, "tasks": [{"text": task, "line": 2}]});
+                return (
+                    200,
+                    json!({"choices":[{"message":{"content": organized.to_string()}, "finish_reason":"stop"}]}),
+                );
+            }
+            "/api/v1/sessions" => json!({"session_id": "isolated"}),
+            "/api/v1/sessions/isolated/messages" => {
+                let content = body["content"].as_str().unwrap();
+                assert!(
+                    content.contains(title) && content.contains(summary) && content.contains(task)
+                );
+                json!({})
+            }
+            _ => json!({"task_id": "fixture-task"}),
+        };
+        (200, json!({"status": "ok", "result": result}))
+    });
+    configure_memory(&storage, url.as_str());
+    storage
+        .set_model_config(url.as_str().into(), "fixture".into(), true)
+        .unwrap();
+    let prefs = AppSettings::default();
+    let (old_title, old_summary, old_task) = versions[0];
+    let first = save_fixture(&mut storage, 1, &format!("{old_title}\n- [ ] {old_task}"));
+    let adjacent = save_fixture(&mut storage, 2, "同日相邻随手记");
+    assert!(queue_saved_note(&mut storage, &first.record_id, &prefs));
+    for organized in [false, true, false] {
+        assert_eq!(
+            run_background_job(&mut storage, |_| {}).unwrap(),
+            Some((first.record_id.clone(), organized))
+        );
+    }
+    let detail = storage.get_note_detail(&first.record_id).unwrap();
+    assert_eq!(detail.ov_resource_status, "synced");
+    assert_eq!(detail.ov_memory_status, "synced");
+    assert_eq!(
+        storage
+            .get_note_detail(&adjacent.record_id)
+            .unwrap()
+            .ov_resource_status,
+        "synced"
+    );
+    assert_eq!(detail.organize.as_ref().unwrap().summary, old_summary);
+
+    assert!(storage.enqueue_organize_job(&first.record_id).unwrap());
+    let running = storage.next_background_job(None).unwrap().unwrap();
+    let old_input = storage.prepare_organize_job(&running).unwrap();
+    let (new_title, new_summary, new_task) = versions[1];
+    let (updated, wake) = update_note_and_queue(
+        &mut storage,
+        &detail.locator,
+        &detail.content_hash,
+        &format!("{new_title}\n- [ ] {new_task}"),
+        true,
+        &prefs,
+    )
+    .unwrap();
+    assert!(wake);
+    assert_eq!(updated.locator, detail.locator);
+    assert_eq!(updated.title, new_title);
+    assert_eq!(updated.organize_status, "queued");
+    assert_eq!(updated.ov_resource_status, "pending");
+    assert_eq!(updated.ov_memory_status, "pending");
+    let old_result = updated.organize.unwrap();
+    assert!(old_result.source_changed);
+    assert_eq!(old_result.summary, old_summary);
+    assert_eq!(
+        storage
+            .get_note_detail(&adjacent.record_id)
+            .unwrap()
+            .ov_resource_status,
+        "pending"
+    );
+
+    storage
+        .complete_organize_job(&old_input, Ok(json!({"summary": "在途任务返回的旧摘要"})))
+        .unwrap();
+    let pending = storage.get_note_detail(&detail.locator).unwrap();
+    assert_eq!(pending.organize_status, "queued");
+    assert!(pending.organize.unwrap().source_changed);
+
+    for organized in [false, true, false] {
+        assert_eq!(
+            run_background_job(&mut storage, |_| {}).unwrap(),
+            Some((first.record_id.clone(), organized))
+        );
+    }
+    assert!(run_background_job(&mut storage, |_| {}).unwrap().is_none());
+    server.join().unwrap();
+    let done = storage.get_note_detail(&detail.locator).unwrap();
+    assert_eq!(done.organize_status, "done");
+    assert_eq!(done.ov_resource_status, "synced");
+    assert_eq!(done.ov_memory_status, "synced");
+    let organized = done.organize.unwrap();
+    assert!(!organized.source_changed);
+    assert_eq!(organized.summary, new_summary);
+    assert_eq!(organized.tasks.len(), 1);
+    assert_eq!(organized.tasks[0].text, new_task);
+}
+
+#[test]
+fn edit_during_sync_keeps_newer_resource_and_memory_work_pending() {
+    let dir = TestDir::new();
+    let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
+    configure_memory(&storage, "http://127.0.0.1:1933");
+    let config = memory_config(&storage).unwrap().unwrap();
+    let prefs = AppSettings::default();
+    let saved = save_fixture(&mut storage, 1, "最初正文");
+    assert!(queue_saved_note(&mut storage, &saved.record_id, &prefs));
+    let before = storage.get_note_detail(&saved.record_id).unwrap();
+    let (through_row, _) = storage.resource_batch(&saved.relative_path).unwrap();
+    let source = storage.read_note_markdown(&saved.relative_path).unwrap();
+    let resource = storage.next_background_job(Some(&config)).unwrap().unwrap();
+    assert_eq!(resource.kind, "ov_write_resource");
+
+    let (middle, wake) = update_note_and_queue(
+        &mut storage,
+        &before.locator,
+        &before.content_hash,
+        "资源在途时的修改",
+        true,
+        &prefs,
+    )
+    .unwrap();
+    assert!(wake);
+    storage
+        .complete_resource_job(
+            &resource,
+            through_row,
+            Some(&source),
+            Err("旧请求超时".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .get_note_detail(&before.locator)
+            .unwrap()
+            .ov_resource_status,
+        "pending"
+    );
+    let replacement = storage.next_background_job(Some(&config)).unwrap().unwrap();
+    assert_eq!(replacement.kind, "ov_write_resource");
+    assert_ne!(replacement.id, resource.id);
+    let source = storage.read_note_markdown(&saved.relative_path).unwrap();
+    storage
+        .complete_resource_job(
+            &replacement,
+            through_row,
+            Some(&source),
+            Ok("fixture-uri".into()),
+        )
+        .unwrap();
+
+    let memory = storage.next_background_job(Some(&config)).unwrap().unwrap();
+    assert_eq!(memory.kind, "ov_commit_memory");
+    let (_, wake) = update_note_and_queue(
+        &mut storage,
+        &middle.locator,
+        &middle.content_hash,
+        "记忆在途时的修改",
+        true,
+        &prefs,
+    )
+    .unwrap();
+    assert!(wake);
+    storage
+        .complete_memory_job(&memory, Ok(Some("old-task".into())))
+        .unwrap();
+    let updated = storage.get_note_detail(&middle.locator).unwrap();
+    assert_eq!(updated.ov_resource_status, "pending");
+    assert_eq!(updated.ov_memory_status, "pending");
+    let follow_ups = ["ov_write_resource", "ov_commit_memory"].map(|kind| {
+        let job = storage.next_background_job(Some(&config)).unwrap().unwrap();
+        assert_eq!(job.kind, kind);
+        job.id
+    });
+    assert_ne!(follow_ups[1], memory.id);
+    assert!(
+        storage
+            .next_background_job(Some(&config))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn wiki_edit_without_reorganize_only_syncs_an_existing_note() {
+    let dir = TestDir::new();
+    let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
+    configure_memory(&storage, "http://127.0.0.1:1933");
+    storage
+        .set_model_config("http://127.0.0.1:11434".into(), "fixture".into(), true)
+        .unwrap();
+    let config = memory_config(&storage).unwrap().unwrap();
+    let prefs = AppSettings::default();
+    let path = "wiki.md";
+    fs::write(dir.0.join(path), "原始文档\n").unwrap();
+    storage
+        .search_reader()
+        .unwrap()
+        .search_records("原始文档", None, None, 0)
+        .unwrap();
+    let original = storage.get_note_detail(path).unwrap();
+    let (updated, wake) = update_note_and_queue(
+        &mut storage,
+        path,
+        &original.content_hash,
+        "改写文档",
+        false,
+        &prefs,
+    )
+    .unwrap();
+    assert!(!wake);
+    assert_eq!(updated.id, original.id);
+    assert!(
+        storage
+            .next_background_job(Some(&config))
+            .unwrap()
+            .is_none()
+    );
+
+    let manual = storage.ensure_note_for_source(path).unwrap();
+    let (updated, wake) = update_note_and_queue(
+        &mut storage,
+        path,
+        &updated.content_hash,
+        "继续编辑文档",
+        false,
+        &prefs,
+    )
+    .unwrap();
+    assert!(wake);
+    assert!(!updated.is_capture);
+    assert_eq!(updated.id, manual);
+    for kind in ["ov_write_resource", "ov_commit_memory"] {
+        let job = storage.next_background_job(Some(&config)).unwrap().unwrap();
+        assert_eq!(job.kind, kind);
+        assert_eq!(job.note_id, manual);
+    }
+    assert!(
+        storage
+            .next_background_job(Some(&config))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn r3_syncs_daily_file_before_organize_and_memory_and_retries_after_disconnect() {
     let dir = TestDir::new();
     let mut storage = Storage::open(&dir.0, Path::new("."), ".state").unwrap();
@@ -190,7 +473,7 @@ fn r3_repushes_the_current_daily_file_after_a_checkbox_changes() {
             let mut round = 0;
             let daily = format!(
                 "viking://resources/flash-marking-down/r3-test/daily/{}",
-                first.relative_path
+                first.relative_path.rsplit('/').next().unwrap()
             );
             let (url, server) = mock_http(3, move |request| {
                 assert_eq!(request.target, "/api/v1/content/write");

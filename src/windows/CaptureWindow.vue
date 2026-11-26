@@ -39,7 +39,7 @@ const draftDebounceMs = 300
 const unlisteners: (() => void)[] = []
 let disposed = false
 
-const captureFolderLabel = computed(() => workspace.value?.captureDir || '工作区根目录')
+const captureFolderLabel = computed(() => workspace.value?.captureDir || 'notes')
 const canSave = computed(() => !opening.value && !saving.value && !closing.value && !composing.value
   && Boolean(pendingCapture.value || body.value.trim()))
 const showEscape = computed(() => Boolean(draftError.value || saveError.value || windowError.value || recoveryErrors.value.length))

@@ -191,6 +191,19 @@ pub struct WikiTargetDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct WikiDocumentDto {
+    pub path: String,
+    pub title: String,
+    pub preview: String,
+    pub folder: String,
+    pub mapped: bool,
+    pub pending_suggestions: usize,
+    pub conflict_suggestions: usize,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskEntryDto {
     pub id: String,
     pub path: String,

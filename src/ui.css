@@ -247,7 +247,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .pane-tabs {
   flex: none;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border-bottom: 1px solid var(--surface-raised);
   background: var(--inset);
 }
@@ -256,15 +256,22 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 0.4rem;
+  gap: 0.25rem;
+  min-width: 0;
   min-height: 2.5rem;
+  padding: 0.35rem 0.3rem;
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 0.9rem;
+  font-size: 0.84rem;
+  white-space: nowrap;
 }
+
+.pane-tabs button:focus-visible,
+.pane-scroll[role="tabpanel"]:focus-visible { outline-offset: -2px; }
+.pane-tabs .ui-icon { width: 0.9rem; height: 0.9rem; }
 
 .pane-tabs button.active {
   color: var(--text);
@@ -273,11 +280,14 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 }
 
 .tab-count {
-  padding: 0.05rem 0.38rem;
+  min-width: 0;
+  padding: 0.05rem 0.15rem;
   border-radius: 999px;
   background: var(--surface-raised);
   color: var(--muted);
   font: 0.74rem var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .left-toolbar {
@@ -287,6 +297,9 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
   gap: 8px;
   margin-bottom: 10px;
 }
+
+.wiki-toolbar { display: grid; justify-content: stretch; }
+.wiki-toolbar .compact-form { margin-bottom: 0; }
 
 .compact-notice {
   margin-bottom: 10px;
@@ -428,6 +441,10 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .search-results .record-excerpt { white-space: normal; }
 .record-path, .path-bar { padding: 0.45rem 0.6rem; background: var(--inset); border-radius: 4px; color: var(--muted); font-size: 0.8rem; }
 .record-path { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wiki-document-group .day-heading { gap: 0.45rem; margin-bottom: 0.45rem; font-size: 0.9rem; overflow-wrap: anywhere; }
+.wiki-document-group .day-heading .ui-icon { width: 1rem; height: 1rem; }
+.wiki-document-card { grid-template-columns: minmax(0, 1fr); gap: 0.4rem; padding: 0.6rem 0.7rem; }
+.wiki-document-status { display: flex; flex-wrap: wrap; gap: 0.25rem; }
 .detail-card h3 { font-size: 1.1rem; }
 .detail-card time, .detail-toolbar { color: var(--muted); font-size: 0.85rem; }
 .path-bar .ui-icon { color: var(--accent); }
@@ -566,6 +583,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
   background: var(--surface-active);
   color: var(--accent);
 }
+.view-switch button:focus-visible { outline-offset: -2px; }
 
 .empty-panel { justify-items: start; padding: 24px; color: var(--text-secondary); }
 .empty-panel.compact { padding: 12px; }
@@ -733,6 +751,29 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .source-pre {
   max-height: 28rem;
 }
+
+.detail-editor-panel {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.detail-editor-wrap {
+  display: flex;
+  min-width: 0;
+  min-height: 15rem;
+  height: clamp(15rem, 42dvh, 28rem);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--inset);
+  overflow: hidden;
+}
+
+.detail-editor-wrap:focus-within { border-color: var(--accent); }
+.detail-editor-wrap .cm-scroller { overflow-y: auto; }
+.detail-editor-actions { justify-content: flex-end; }
+.detail-editor-actions .hint { margin-inline-end: auto; }
+.detail-external-change { border-inline-start: 2px solid var(--accent); color: var(--text-secondary); }
 
 .inline-organize {
   display: grid;

@@ -5,9 +5,9 @@ import { defineAsyncComponent } from 'vue'
 import './ui.css'
 
 const isCapture = isTauri() && getCurrentWindow().label === 'capture'
-const ActiveWindow = defineAsyncComponent(() =>
-  isCapture ? import('./windows/CaptureWindow.vue') : import('./windows/WorkbenchShell.vue'),
-)
+const CaptureWindow = defineAsyncComponent(() => import('./windows/CaptureWindow.vue'))
+const WorkbenchShell = defineAsyncComponent(() => import('./windows/WorkbenchShell.vue'))
+const ActiveWindow = isCapture ? CaptureWindow : WorkbenchShell
 </script>
 
 <template>

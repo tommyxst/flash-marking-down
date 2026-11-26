@@ -10,6 +10,7 @@ pub(crate) struct BackgroundJob {
     pub note_id: String,
     pub path: String,
     pub block_id: Option<String>,
+    note_revision: String,
 }
 
 impl Storage {
@@ -18,6 +19,16 @@ impl Storage {
         note_id: &str,
         organize: bool,
         memory: Option<&MemoryConfig>,
+    ) -> Result<bool, StorageError> {
+        self.enqueue_note_jobs(note_id, organize, memory, false)
+    }
+
+    pub(crate) fn enqueue_note_jobs(
+        &mut self,
+        note_id: &str,
+        organize: bool,
+        memory: Option<&MemoryConfig>,
+        after_edit: bool,
     ) -> Result<bool, StorageError> {
         if !organize && memory.is_none() {
             return Ok(false);
@@ -28,9 +39,10 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
         // Publish both lanes together so an already-running worker can apply job priority.
-        let organized = organize && Self::queue_organize(&tx, note_id).map_err(db_err)?;
+        let organized =
+            organize && Self::queue_organize(&tx, note_id, after_edit).map_err(db_err)?;
         let synced = if let Some(config) = memory {
-            Self::queue_memory(&tx, config, Some(note_id), false).map_err(db_err)? > 0
+            Self::queue_memory(&tx, config, Some(note_id), false, after_edit).map_err(db_err)? > 0
         } else {
             false
         };
@@ -52,7 +64,8 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        let count = Self::queue_memory(&tx, config, note_id, captures_only).map_err(db_err)?;
+        let count =
+            Self::queue_memory(&tx, config, note_id, captures_only, false).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(count)
     }
@@ -62,6 +75,7 @@ impl Storage {
         config: &MemoryConfig,
         note_id: Option<&str>,
         captures_only: bool,
+        after_edit: bool,
     ) -> rusqlite::Result<usize> {
         let mut count = 0;
         if config.sync_resources {
@@ -78,12 +92,12 @@ impl Storage {
                        AND NOT EXISTS (
                            SELECT 1 FROM background_jobs j JOIN notes owner ON owner.id = j.note_id
                            WHERE j.kind = 'ov_write_resource' AND owner.relative_path = candidate.relative_path
-                             AND (j.status = 'queued' OR (j.status = 'running' AND j.note_id = candidate.id))
+                             AND (j.status = 'queued' OR (NOT ?3 AND j.status = 'running' AND j.note_id = candidate.id))
                        )
                      GROUP BY candidate.relative_path
                  )
                  ORDER BY n.rowid",
-                params![note_id, captures_only],
+                params![note_id, captures_only, after_edit],
             )?;
         }
         if config.commit_memories {
@@ -97,10 +111,11 @@ impl Storage {
                    AND (NOT ?2 OR n.draft_id <> 'manual')
                    AND NOT EXISTS (
                        SELECT 1 FROM background_jobs j
-                       WHERE j.kind = 'ov_commit_memory' AND j.note_id = n.id AND j.status IN ('queued', 'running')
+                       WHERE j.kind = 'ov_commit_memory' AND j.note_id = n.id
+                         AND (j.status = 'queued' OR (NOT ?3 AND j.status = 'running'))
                    )
                  ORDER BY n.rowid",
-                params![note_id, captures_only],
+                params![note_id, captures_only, after_edit],
             )?;
         }
         Ok(count)
@@ -117,7 +132,7 @@ impl Storage {
             .map_err(db_err)?;
         let job = tx
             .query_row(
-                "SELECT j.id, j.kind, j.note_id, n.relative_path, n.block_id
+                "SELECT j.id, j.kind, j.note_id, n.relative_path, n.block_id, n.content_hash
                  FROM background_jobs j JOIN notes n ON n.id = j.note_id
                  WHERE j.status = 'queued' AND (
                      j.kind = 'organize' OR (?1 AND j.kind = 'ov_write_resource')
@@ -135,6 +150,7 @@ impl Storage {
                     note_id: r.get(2)?,
                     path: r.get(3)?,
                     block_id: r.get(4)?,
+                    note_revision: r.get(5)?,
                 }),
             )
             .optional()
@@ -209,8 +225,9 @@ impl Storage {
         }
         let title = note_title(body);
         let mut markdown = format!("# {title}\n\n{body}");
-        if let Some(organize) =
-            organize.and_then(|raw| serde_json::from_str::<OrganizeResultDto>(&raw).ok())
+        if let Some(organize) = organize
+            .and_then(|raw| serde_json::from_str::<OrganizeResultDto>(&raw).ok())
+            .filter(|result| !result.source_changed)
         {
             if !organize.summary.trim().is_empty() {
                 markdown.push_str("\n\n## 摘要\n");
@@ -241,7 +258,8 @@ impl Storage {
         &mut self,
         job: &BackgroundJob,
         through_row: i64,
-        result: Result<(String, String), String>,
+        source: Option<&str>,
+        result: Result<String, String>,
     ) -> Result<(), StorageError> {
         let db_err = |e| database_error("memory_sync", Some(&job.note_id), e);
         let tx = self
@@ -249,18 +267,17 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
         let (job_status, note_status, uri, last_error) = match result {
-            Ok((uri, sent)) => {
-                // A checkbox can change the file while the HTTP request is in flight.
-                let unchanged = self
-                    .workspace
-                    .files
-                    .read_markdown(&job.path)
-                    .is_ok_and(|current| current == sent.as_bytes());
-                let status = if unchanged { "synced" } else { "pending" };
-                ("done", status, Some(uri), None)
-            }
+            Ok(uri) => ("done", "synced", Some(uri), None),
             Err(message) => ("failed", "failed", None, Some(message)),
         };
+        let changed = source.is_some_and(|source| {
+            !self
+                .workspace
+                .files
+                .read_markdown(&job.path)
+                .is_ok_and(|current| current == source.as_bytes())
+        });
+        let note_status = if changed { "pending" } else { note_status };
         tx.execute(
             "UPDATE notes SET ov_resource_status = ?3, ov_resource_uri = coalesce(?4, ov_resource_uri),
                               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -273,7 +290,7 @@ impl Storage {
              WHERE kind = 'ov_write_resource' AND status IN ('queued', 'running', 'failed')
                AND note_id IN (SELECT id FROM notes WHERE relative_path = ?1 AND rowid <= ?2)
                AND (?5 OR id = ?6)",
-            params![job.path, through_row, job_status, last_error, note_status != "pending", job.id],
+            params![job.path, through_row, job_status, last_error, note_status == "synced", job.id],
         ).map_err(db_err)?;
         tx.commit().map_err(db_err)
     }
@@ -297,8 +314,9 @@ impl Storage {
             params![job.id, job_status, last_error],
         ).map_err(db_err)?;
         tx.execute(
-            "UPDATE notes SET ov_memory_status = ?2, ov_task_id = ?3, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            params![job.note_id, note_status, task_id],
+            "UPDATE notes SET ov_memory_status = ?2, ov_task_id = ?3, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1 AND content_hash = ?4",
+            params![job.note_id, note_status, task_id, job.note_revision],
         ).map_err(db_err)?;
         tx.commit().map_err(db_err)
     }

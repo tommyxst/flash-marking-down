@@ -16,7 +16,7 @@ use crate::dto::{
 use crate::platform::ForegroundWindow;
 use crate::settings;
 use crate::storage::{SearchReader, Storage, StorageError, WorkspaceStorage};
-use crate::workspace::STATE_DIR;
+use crate::workspace::{DEFAULT_CAPTURE_DIR, STATE_DIR};
 
 const CAPTURE_DRAFT: &str = "quick-capture";
 const MAIN_WINDOW: &str = "main";
@@ -125,15 +125,15 @@ impl WorkspaceState {
         remember: bool,
     ) -> Result<OpenedWorkspaceDto, StorageError> {
         let root_path = Path::new(root);
-        let capture_path = Path::new(if capture_dir.is_empty() {
-            "."
+        let capture_path = Path::new(if capture_dir.trim().is_empty() {
+            DEFAULT_CAPTURE_DIR
         } else {
             capture_dir
         });
         let mut storage = Storage::open(root_path, capture_path, STATE_DIR)?;
         let generation = self.generation + 1;
         let view = workspace_view(&mut storage, generation.to_string(), root)?;
-        if remember {
+        if remember || capture_dir != storage.capture_dir() {
             settings::update(settings_file, |settings| {
                 settings.last_workspace_root = Some(root.to_owned());
                 settings.last_capture_dir = storage.capture_dir().to_owned();
@@ -959,6 +959,23 @@ mod tests {
     }
 
     #[test]
+    fn resume_normalizes_a_legacy_empty_capture_directory() {
+        let workspace = TestDir::new();
+        let data = TestDir::new();
+        let file = data.0.join(settings::FILE_NAME);
+        let legacy = serde_json::json!({
+            "lastWorkspaceRoot": workspace.0.to_str().unwrap(),
+            "lastCaptureDir": "",
+        });
+        fs::write(&file, legacy.to_string()).unwrap();
+
+        let opened = WorkspaceState::default().resume(&file).unwrap().unwrap();
+        assert_eq!(opened.capture_dir, "notes");
+        assert!(workspace.0.join("notes").is_dir());
+        assert_eq!(settings::read(&file).unwrap().last_capture_dir, "notes");
+    }
+
+    #[test]
     fn switching_revokes_old_sessions_and_resume_accepts_a_restored_directory() {
         let first = TestDir::new();
         let second = TestDir::new();
@@ -973,7 +990,11 @@ mod tests {
         let first_session = state.activate(&file, first_root, "", true).unwrap().session;
         let refreshed_session = state.activate(&file, first_root, "", true).unwrap().session;
         assert!(state.workspace(&first_session).is_err());
-        assert!(state.activate(&file, second_root, "missing", true).is_err());
+        assert!(
+            state
+                .activate(&file, second_root, "../outside", true)
+                .is_err()
+        );
         assert!(state.workspace(&refreshed_session).is_ok());
         let second_session = state
             .activate(&file, second_root, "", true)

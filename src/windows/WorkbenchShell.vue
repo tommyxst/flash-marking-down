@@ -29,6 +29,7 @@ import type {
   RecoveryErrorDto,
   TaskEntry,
   TaskList,
+  WikiDocument,
 } from '../m2'
 
 const M2Answers = defineAsyncComponent(() => import('../M2Answers.vue'))
@@ -62,6 +63,15 @@ const drawerCounts = ref<DrawerCounts>({ openConflicts: 0, pendingWiki: 0 })
 const wikiTargets = ref<DocumentMapping[]>([])
 const workspaceFiles = ref<string[]>([])
 const prefillConflict = ref<{ topic: string; incomingPath: string; incomingText: string } | null>(null)
+const wikiReviewId = ref<string>()
+
+const wikiDocuments = ref<WikiDocument[]>([])
+const wikiLoading = ref(false)
+const wikiError = ref<UiError | null>(null)
+const wikiCreateBusy = ref(false)
+const wikiCreateError = ref<UiError | null>(null)
+const wikiTargetBusy = ref(false)
+const wikiTargetError = ref<{ path: string; error: UiError }>()
 
 const query = ref('')
 const datePreset = ref<'all' | 'today' | '7d' | 'custom'>('all')
@@ -91,6 +101,8 @@ const taskBusyId = ref('')
 let searchRequest = 0
 let searchTimer: number | undefined
 let detailRequest = 0
+let wikiRequest = 0
+let drawerRequest = 0
 const unlisteners: (() => void)[] = []
 let disposed = false
 
@@ -146,10 +158,21 @@ function applyWorkspace(opened: OpenedWorkspace) {
   modelConfig.value = null
   memoryConfig.value = null
   clearSearch()
+  detailRequest++
   selectedLocator.value = ''
   activeDetail.value = undefined
+  detailLoading.value = false
+  detailError.value = null
   memoryPreview.value = undefined
   notes.value = []
+  wikiDocuments.value = []
+  wikiTargets.value = []
+  workspaceFiles.value = []
+  wikiCreateBusy.value = false
+  wikiCreateError.value = null
+  wikiTargetBusy.value = false
+  wikiTargetError.value = undefined
+  wikiReviewId.value = undefined
   taskList.value = undefined
   indexFeedback.value = undefined
   void refreshAllWorkspaceData(opened.session)
@@ -160,27 +183,50 @@ async function refreshAllWorkspaceData(session: string) {
     refreshIntegrationsConfig(session),
     refreshNotes(),
     refreshTasks(),
-    refreshDrawerData(),
+    refreshWikiData(),
   ])
 }
 
 async function refreshDrawerData() {
   const session = workspace.value?.session
   if (!session) return
+  const req = ++drawerRequest
+  const [counts, targets, files] = await Promise.allSettled([
+    api.drawerCounts(session),
+    api.wikiTargets(session),
+    api.listWorkspaceMarkdownFiles(session),
+  ])
+  if (workspace.value?.session !== session || req !== drawerRequest) return
+  if (counts.status === 'fulfilled') drawerCounts.value = counts.value
+  if (targets.status === 'fulfilled') wikiTargets.value = targets.value
+  if (files.status === 'fulfilled') workspaceFiles.value = files.value
+}
+
+async function refreshWikiDocuments() {
+  const session = workspace.value?.session
+  if (!session) return
+  const req = ++wikiRequest
+  const current = () => req === wikiRequest && workspace.value?.session === session
+  wikiLoading.value = true
+  wikiError.value = null
   try {
-    const [counts, targets, files] = await Promise.all([
-      api.drawerCounts(session),
-      api.wikiTargets(session),
-      api.listWorkspaceMarkdownFiles(session),
-    ])
-    if (workspace.value?.session === session) {
-      drawerCounts.value = counts
-      wikiTargets.value = targets
-      workspaceFiles.value = files
-    }
-  } catch {
-    // Non-blocking background refresh for drawer badges.
+    const documents = await api.listWikiDocuments(session)
+    if (current()) wikiDocuments.value = documents
+  } catch (error) {
+    if (current()) wikiError.value = parseAppError(error)
+  } finally {
+    if (current()) wikiLoading.value = false
   }
+}
+
+function refreshWikiData() {
+  return Promise.all([refreshWikiDocuments(), refreshDrawerData()])
+}
+
+function refreshAfterDrawerChange() {
+  void refreshWikiData()
+  void refreshNotes(false)
+  if (activeDetail.value) void reloadCurrentDetail()
 }
 
 onMounted(async () => {
@@ -192,16 +238,13 @@ onMounted(async () => {
         void refreshTasks()
       }))
       trackUnlisten(await desktopWindow.listen<{ noteId: string }>('note-updated', ({ payload }) => {
-        void refreshNotes()
+        void refreshNotes(false)
         void refreshTasks()
         if (activeDetail.value && (activeDetail.value.id === payload.noteId || activeDetail.value.locator === selectedLocator.value)) {
           void loadDetail(activeDetail.value.locator)
         }
       }))
-      trackUnlisten(await desktopWindow.listen('drawer-badge-updated', () => {
-        void refreshDrawerData()
-        if (activeDetail.value) void loadDetail(activeDetail.value.locator)
-      }))
+      trackUnlisten(await desktopWindow.listen('drawer-badge-updated', refreshAfterDrawerChange))
       trackUnlisten(await desktopWindow.onResized(() => { void syncMaximized() }))
       void syncMaximized()
       void updateHotkey()
@@ -230,6 +273,7 @@ watch(
     searchError.value = undefined
     searchLoading.value = Boolean(session && searchActive.value && !invalidDateRange.value)
     if (!searchLoading.value) return
+    leftTab.value = 'notes'
     searchTimer = window.setTimeout(() => { void refreshSearch() }, 200)
     onCleanup(() => window.clearTimeout(searchTimer))
   },
@@ -319,7 +363,7 @@ async function showCapture() {
   }
 }
 
-async function refreshNotes() {
+async function refreshNotes(refreshSelected = true) {
   const session = workspace.value?.session
   if (!session) return
   notesLoading.value = true
@@ -331,7 +375,7 @@ async function refreshNotes() {
     if (!selectedLocator.value && list.length) {
       selectedLocator.value = list[0].locator
       await loadDetail(selectedLocator.value)
-    } else if (selectedLocator.value && !searchActive.value) {
+    } else if (refreshSelected && selectedLocator.value && !detailLoading.value && !searchActive.value) {
       await loadDetail(selectedLocator.value)
     }
   } catch (error) {
@@ -351,6 +395,8 @@ async function loadDetail(locator: string) {
     const detail = await api.getNoteDetail(session, locator)
     if (req === detailRequest && workspace.value?.session === session) {
       activeDetail.value = detail
+      detailError.value = null
+      return detail
     }
   } catch (error) {
     if (req === detailRequest && workspace.value?.session === session) {
@@ -361,20 +407,84 @@ async function loadDetail(locator: string) {
   }
 }
 
+function reloadCurrentDetail() {
+  return loadDetail(activeDetail.value?.locator ?? selectedLocator.value)
+}
+
+function onNoteSaved(updated: NoteDetail) {
+  if (!updated.isCapture) {
+    void refreshWikiDocuments()
+    void refreshSearch()
+  }
+  const current = activeDetail.value
+  if (current?.locator !== updated.locator) return
+  if (current.contentHash !== updated.contentHash) activeDetail.value = updated
+  void reloadCurrentDetail()
+  void refreshNotes(false)
+  void refreshTasks()
+  void refreshDrawerData()
+}
+
 async function selectNote(locator: string, focusDetail: boolean) {
   const session = workspace.value?.session
   memoryPreview.value = undefined
   if (selectedLocator.value !== locator) activeDetail.value = undefined
   selectedLocator.value = locator
-  await loadDetail(locator)
-  if (focusDetail && !memoryPreview.value && selectedLocator.value === locator && workspace.value?.session === session) {
-    recordDetail.value?.focus()
+  const detail = await loadDetail(locator)
+  if (memoryPreview.value || selectedLocator.value !== locator || workspace.value?.session !== session) return
+  if (detail) selectedLocator.value = detail.locator
+  if (focusDetail) recordDetail.value?.focus()
+  return detail
+}
+
+async function openLocalSource(path: string) {
+  leftTab.value = wikiDocuments.value.some((doc) => doc.path === path) ? 'wiki' : 'notes'
+  const detail = await selectNote(path, true)
+  if (!detail) return
+  const captureDir = workspace.value?.captureDir
+  const isCapture = detail.isCapture || (captureDir && detail.path.startsWith(`${captureDir}/`)) ||
+    notes.value.some((note) => note.path === detail.path)
+  leftTab.value = isCapture ? 'notes' : 'wiki'
+}
+
+async function createWikiPage(path: string) {
+  const session = workspace.value?.session
+  if (!session || wikiCreateBusy.value) return
+  const normalizedPath = path.replaceAll('\\', '/')
+  wikiCreateBusy.value = true
+  wikiCreateError.value = null
+  try {
+    await api.createWikiTarget(session, normalizedPath)
+    if (workspace.value?.session !== session) return
+    await refreshWikiData()
+    if (workspace.value?.session !== session) return
+    leftTab.value = 'wiki'
+    const detail = await selectNote(normalizedPath, true)
+    await nextTick()
+    if (detail && workspace.value?.session === session && activeDetail.value?.locator === detail.locator) {
+      recordDetail.value?.startEditing()
+    }
+  } catch (error) {
+    if (workspace.value?.session === session) wikiCreateError.value = parseAppError(error)
+  } finally {
+    if (workspace.value?.session === session) wikiCreateBusy.value = false
   }
 }
 
-function openLocalSource(path: string) {
-  leftTab.value = 'notes'
-  void selectNote(path, true)
+async function toggleWikiTarget(path: string, mapped: boolean) {
+  const session = workspace.value?.session
+  if (!session || wikiTargetBusy.value) return
+  wikiTargetBusy.value = true
+  wikiTargetError.value = undefined
+  try {
+    if (mapped) await api.unmapWikiTarget(session, path)
+    else await api.mapWikiTarget(session, 'wiki', path)
+    if (workspace.value?.session === session) await refreshWikiData()
+  } catch (error) {
+    if (workspace.value?.session === session) wikiTargetError.value = { path, error: parseAppError(error) }
+  } finally {
+    if (workspace.value?.session === session) wikiTargetBusy.value = false
+  }
 }
 
 async function openMemoryPreview({ uri, kind, title }: MemorySource) {
@@ -408,13 +518,18 @@ function returnToNote() {
 async function triggerOrganize(idOrPath: string) {
   const session = workspace.value?.session
   if (!session || organizing.value) return
+  const locator = selectedLocator.value
   organizing.value = true
   detailError.value = null
   try {
-    activeDetail.value = await api.triggerNoteOrganize(session, idOrPath)
-    await refreshNotes()
+    await api.triggerNoteOrganize(session, idOrPath)
+    if (workspace.value?.session !== session) return
+    if (selectedLocator.value === locator) void reloadCurrentDetail()
+    await refreshNotes(false)
   } catch (error) {
-    detailError.value = parseAppError(error)
+    if (workspace.value?.session === session && selectedLocator.value === locator) {
+      detailError.value = parseAppError(error)
+    }
   } finally {
     organizing.value = false
   }
@@ -458,7 +573,7 @@ async function mapTaskTarget(path: string) {
   tasksError.value = null
   try {
     await api.mapWikiTarget(session, 'tasks', path)
-    await Promise.all([refreshTasks(), refreshDrawerData()])
+    await Promise.all([refreshTasks(), refreshWikiData()])
   } catch (error) {
     tasksError.value = parseAppError(error)
   }
@@ -521,7 +636,6 @@ async function refreshSearch(append = false) {
         hasMore: page.hasMore,
         skipped: page.skipped,
       }
-      leftTab.value = 'notes'
     }
   } catch (error) {
     if (req === searchRequest) searchError.value = { error: parseAppError(error), append }
@@ -539,6 +653,7 @@ async function rebuildSearchIndex() {
     if (workspace.value?.session === session) {
       indexFeedback.value = { state: 'ready', indexed, skipped }
       void refreshSearch()
+      void refreshWikiDocuments()
     }
   } catch (error) {
     if (workspace.value?.session === session) {
@@ -547,7 +662,8 @@ async function rebuildSearchIndex() {
   }
 }
 
-function openDrawer(tab: DrawerTab) {
+function openDrawer(tab: DrawerTab, suggestionId?: string) {
+  wikiReviewId.value = suggestionId
   drawerTab.value = tab
   drawerOpen.value = true
 }
@@ -669,6 +785,7 @@ function handleWindowKey(event: KeyboardEvent) {
 
     <main class="three-pane-grid" :class="{ 'chat-collapsed': !chatOpen || !workspace }">
       <RecordTimeline
+        :key="workspace?.session"
         v-model:left-tab="leftTab"
         :has-workspace="Boolean(workspace)"
         :opening="opening"
@@ -681,6 +798,11 @@ function handleWindowKey(event: KeyboardEvent) {
         :memory-config="memoryConfig"
         :notes-loading="notesLoading"
         :notes-error="notesError"
+        :wiki-documents="wikiDocuments"
+        :wiki-loading="wikiLoading"
+        :wiki-error="wikiError"
+        :wiki-create-busy="wikiCreateBusy"
+        :wiki-create-error="wikiCreateError"
         :search-page="searchPage"
         :search-loading="searchLoading"
         :search-error="searchError"
@@ -701,6 +823,8 @@ function handleWindowKey(event: KeyboardEvent) {
         @retry-search="refreshSearch($event)"
         @load-more="refreshSearch(true)"
         @select-note="selectNote"
+        @refresh-wiki="refreshWikiDocuments"
+        @create-wiki-page="createWikiPage"
         @toggle-task="(task: TaskEntry, done: boolean) => toggleTask(task.path, task.id, task.expectedLine, done)"
         @refresh-tasks="refreshTasks"
         @map-task-target="mapTaskTarget"
@@ -721,13 +845,18 @@ function handleWindowKey(event: KeyboardEvent) {
         :memory-config="memoryConfig"
         :memory-preview="memoryPreview"
         :wiki-targets="wikiTargets"
+        :wiki-target-busy="wikiTargetBusy"
+        :wiki-target-error="wikiTargetError && wikiTargetError.path === activeDetail?.path ? wikiTargetError.error : null"
         :task-busy-id="taskBusyId"
+        @note-saved="onNoteSaved"
+        @reload-detail="reloadCurrentDetail"
         @trigger-organize="triggerOrganize"
         @toggle-task="toggleTask"
         @open-conflicts="openDrawer('conflicts')"
-        @open-wiki="openDrawer('wiki')"
+        @open-wiki="openDrawer('wiki', $event)"
+        @toggle-wiki-target="toggleWikiTarget"
         @open-settings="showSettings"
-        @wiki-suggested="refreshDrawerData(); activeDetail && loadDetail(activeDetail.locator)"
+        @wiki-suggested="refreshAfterDrawerChange"
         @create-conflict-from-note="openConflictFromNote"
         @return-to-note="returnToNote"
         @retry-memory-preview="memoryPreview && openMemoryPreview(memoryPreview)"
@@ -756,9 +885,10 @@ function handleWindowKey(event: KeyboardEvent) {
       :workspace-files="workspaceFiles"
       :desktop="Boolean(desktopWindow)"
       :prefill-conflict="prefillConflict"
+      :wiki-review-id="wikiReviewId"
       @open-note="openLocalSource"
-      @changed="refreshDrawerData(); activeDetail && loadDetail(activeDetail.locator); refreshNotes()"
-      @targets-changed="refreshDrawerData()"
+      @changed="refreshAfterDrawerChange"
+      @targets-changed="refreshWikiData"
       @clear-prefill="prefillConflict = null"
     />
 

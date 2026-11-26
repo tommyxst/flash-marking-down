@@ -23,6 +23,7 @@ import type {
   RecordSource,
   SearchPage,
   TaskList,
+  WikiDocument,
   WikiSuggestion,
 } from '../m2'
 
@@ -105,6 +106,13 @@ export const api = {
     invoke<NoteSummary[]>('list_notes', { session }),
   getNoteDetail: (session: string, idOrPath: string) =>
     invoke<NoteDetail>('get_note_detail', { session, idOrPath }),
+  updateNote: (params: {
+    session: string
+    idOrPath: string
+    expectedHash: string
+    body: string
+    reorganize?: boolean
+  }) => invoke<NoteDetail>('update_note', params),
   triggerNoteOrganize: (session: string, idOrPath: string) =>
     invoke<NoteDetail>('trigger_note_organize', { session, idOrPath }),
 
@@ -130,6 +138,8 @@ export const api = {
     wikiTarget?: string
   }) => invoke<ConflictItem>('resolve_conflict', params),
 
+  listWikiDocuments: (session: string) =>
+    invoke<WikiDocument[]>('list_wiki_documents', { session }),
   wikiTargets: (session: string) =>
     invoke<DocumentMapping[]>('wiki_targets', { session }),
   mapWikiTarget: (session: string, kind: DocumentKind, path: string) =>

@@ -22,6 +22,7 @@ const props = defineProps<{
   wikiTargets: DocumentMapping[]
   workspaceFiles: string[]
   desktop: boolean
+  wikiReviewId?: string
   prefillConflict?: { topic: string; incomingPath: string; incomingText: string } | null
 }>()
 
@@ -74,6 +75,11 @@ function onUpdated() {
   void refresh()
   emit('changed')
 }
+
+function openNote(path: string) {
+  emit('openNote', path)
+  emit('update:open', false)
+}
 </script>
 
 <template>
@@ -117,7 +123,7 @@ function onUpdated() {
           :wiki-targets="wikiTargets"
           :prefill="prefillConflict"
           @updated="onUpdated"
-          @open-note="(path: string) => { emit('openNote', path); emit('update:open', false) }"
+          @open-note="openNote"
           @clear-prefill="emit('clearPrefill')"
         />
         <M2Documents
@@ -127,8 +133,10 @@ function onUpdated() {
           :wiki-targets="wikiTargets"
           :workspace-files="workspaceFiles"
           :desktop="desktop"
+          :wiki-review-id="wikiReviewId"
           @updated="onUpdated"
           @targets-changed="emit('targetsChanged')"
+          @open-note="openNote"
         />
       </div>
     </aside>

@@ -13,15 +13,15 @@
   {
     "version": 1,
     "lastWorkspaceRoot": "D:/Notes/my-workspace",
-    "lastCaptureDir": "inbox",
+    "lastCaptureDir": "notes",
     "hotkey": "win-alt-n",
     "autoOrganize": true,
     "autoSyncMemory": true
   }
   ```
 - **工作区目录**（用户选定的任意本地目录，允许位于 OneDrive/云盘同步目录、Junction 或移动盘，支持直接拷贝迁移）：
-  - `<capture_dir>/<YYYY-MM-DD>.md`：按本机日期归集的每日随手记文件；
-  - `<workspace>/**/*.md`：工作区内所有其他普通 Markdown 文件与历史一记一文件（均参与离线检索与对话召回）；
+  - `<capture_dir>/<YYYY-MM-DD>.md`：按本机日期归集的每日随手记文件。`lastCaptureDir` 为空字符串、`.` 或在旧配置中缺失时，打开工作区使用 `notes`。相对路径按需逐级创建，解析后的存放目录须为工作区内、应用状态目录以外的子目录。
+  - `<workspace>/**/*.md`：工作区内其他普通 Markdown 文件与历史笔记，包含留在根目录的旧每日文件，均参与离线检索与对话召回。
   - `<workspace>/.flash-marking-down/state.sqlite`：工作区应用状态与派生搜索索引（自动排除在扫描、整理与外部同步之外）。
 
 ### 1.2 每日随手记块格式
@@ -41,7 +41,7 @@
 ```
 
 - **块定位规则**：应用优先通过 `<!-- fmd-note:<8~16位短ID> -->` 识别单条随手记块；若用户在外部编辑器手动删除了注释或手动新增了普通小节，仍作为普通 Markdown 正常索引和阅读，不报错。
-- **历史兼容**：工作区内旧版一记一文件（带 `record_id` / `source_id` frontmatter 或无 frontmatter 的 `.md`）全部兼容读取、展示与搜索，不强迫迁移原文件。
+- **历史兼容**：旧每日文件和一记一文件（带 `record_id` / `source_id` frontmatter 或无 frontmatter 的 `.md`）均在原位置读取、展示与搜索。对话召回遇到同一 OpenViking 每日资源时，会同时匹配本地当前存放目录和根目录的历史路径去重。
 - R1 的最近记录返回物理 `path` 和可选 `blockId`。读取原文、整理及引用可使用 `<path>#fmd-note:<id>` 定位一条正文。全文索引仍按文件维护，被手动删除标记的内容仍可全文搜索。
 
 ### 1.3 务实写入约定
@@ -71,7 +71,7 @@
 | `search_documents` + `search_documents_fts` | `relative_path`, `captured_at`, `revision`, `body`, `mtime_ns`, `file_size` + FTS5 trigram 虚拟表与触发器 | 沿用已验证的高性能增量扫描 + FTS5/字面混合检索（AT-12 基线：5,000 篇单文件增量重建 ~108 ms，查询 p95 ~17.4 ms） |
 | `conflicts` | `id`, `topic`, `current_label`, `current_path`, `current_text`, `incoming_label`, `incoming_path`, `incoming_text`, `status` (`open` \| `keep_current` \| `accept_incoming` \| `keep_both`), `resolution_note`, `created_at`, `resolved_at` | **Git Conflict 风格分歧单表**；每条独立容错，无全局熔断 |
 | `wiki_targets` | `path`, `kind` (`wiki` \| `tasks`) | 映射的 Wiki 页面与唯一 Markdown 任务清单（支持添加与**解除映射**） |
-| `wiki_suggestions` | `id`, `note_id`, `target_path`, `base_hash`, `before_text`, `after_text`, `reason`, `status` (`pending` \| `applied` \| `rejected` \| `reverted`), `created_at` | 仅存真正的 Wiki 文档变更建议与撤销依据，**不混入任务勾选流水** |
+| `wiki_suggestions` | `id`, `note_id`, `target_path`, `base_hash`, `before_text`, `after_text`, `reason`, `status` (`pending` \| `conflict` \| `applied` \| `rejected` \| `reverted`), `created_at` | 仅存真正的 Wiki 文档变更建议与撤销依据，**不混入任务勾选流水** |
 | `conversations` / `chat_messages` | `conversations(id, title, created_at, updated_at)`；`chat_messages(id, conversation_id, role, content, citations_json, conflict_ids_json, created_at)` | 持久化多轮对话历史、引文、冲突关联和降级提示。`citations_json` 可读取现有引用数组，也支持含 `citations` 与 `notice` 的对象 |
 | `background_jobs` | `id`, `kind` (`organize` \| `ov_write_resource` \| `ov_commit_memory`), `note_id`, `payload_json`, `status` (`queued` \| `running` \| `done` \| `failed`), `attempts`, `last_error`, `updated_at` | 轻量单队列异步作业表，重启自动续跑或供界面一键重试 |
 
@@ -131,7 +131,12 @@ pub trait MemoryProvider: Send + Sync {
 | **工作区与设置** | `resume_workspace`, `open_workspace`, `get_app_settings`, `save_app_settings`, `get_hotkey`, `set_hotkey`, `pick_workspace_folder`, `pick_workspace_markdown` | 统一读写 `settings.json` 与工作区配置，快捷窗打开时切换工作区先自动落盘隐藏再切换 |
 | **模型与 OV 配置** | `get_integrations_config`, `save_model_config`, `test_model_connection`, `list_remote_models`, `save_memory_config`, `test_memory_connection` | `MemoryConfig` 与保存参数支持独立的 `syncResources`、`commitMemories`，旧配置缺省值均为 `true`。密钥走 Windows 凭据管理器，OV 凭据可以使用 `Bearer ` 前缀 |
 | **快记与草稿** | `show_capture_window`, `load_capture_workspace`, `persist_draft`, `commit_capture`, `confirm_capture`, `close_capture_window` | `commit_capture` 原子追加当日文件并更新索引，按全局自动偏好与工作区配置静默入队。队列优先级为 `ov_write_resource` → `organize` → `ov_commit_memory` |
-| **记录与检索** | `list_recent_captures`, `search_records`, `rebuild_search_index`, `open_record_source`, `open_workspace_file`, `list_notes`, `get_note_detail`, `read_workspace_image` | 详情含 `ovResourceStatus`、`ovResourceUri`、`ovMemoryStatus`、`ovError`，两路状态为 `pending`、`synced` 或 `failed` |
+| **记录与检索** | `list_recent_captures`, `search_records`, `rebuild_search_index`, `open_record_source`, `open_workspace_file`, `list_notes`, `get_note_detail`, `update_note`, `read_workspace_image` | 保存返回最新详情。详情含 `ovResourceStatus`、`ovResourceUri`、`ovMemoryStatus`、`ovError`，两路状态为 `pending`、`synced` 或 `failed` |
 | **后台整合与待办** | `trigger_note_organize`, `list_tasks`, `toggle_task`, `retry_memory_sync` | `retry_memory_sync` 接受可选的 `noteId`（记录 ID 或定位符），缺省扫描工作区记录并按文件合并原文同步，返回新增入队任务数。后台进度通过 `note-updated` / `drawer-badge-updated` 推送 |
-| **冲突与 Wiki 抽屉** | `drawer_counts`, `list_conflicts`, `create_conflict`, `resolve_conflict`（`keep_current \| accept_incoming \| keep_both`）, `wiki_targets`, `map_wiki_target`, `unmap_wiki_target`, `create_wiki_target`, `list_wiki_suggestions`, `create_wiki_suggestion`, `apply_wiki_suggestion`, `recompare_wiki_suggestion`, `reject_wiki_suggestion`, `undo_wiki_suggestion` | Git 冲突三选一处理；支持解除 Wiki 映射、行级 Diff 预览与防覆盖重比较；Wiki 建议列表不再混入任务勾选记录 |
+| **Wiki 浏览与映射** | `list_wiki_documents`, `wiki_targets`, `map_wiki_target`, `unmap_wiki_target`, `create_wiki_target` | 扫描工作区文档。新建空白页时按需创建父目录并映射。随手记文件和存放目录内的文件无法设为 Wiki 或待办目标。 |
+| **冲突与 Wiki 抽屉** | `drawer_counts`, `list_conflicts`, `create_conflict`, `resolve_conflict`（`keep_current \| accept_incoming \| keep_both`）, `list_wiki_suggestions`, `create_wiki_suggestion`, `apply_wiki_suggestion`, `recompare_wiki_suggestion`, `reject_wiki_suggestion`, `undo_wiki_suggestion` | Git 冲突三选一处理。支持行级 Diff、防覆盖重比较和撤销。 |
 | **多轮记忆对话** | `list_conversations`, `get_conversation`, `delete_conversation`, `send_chat_message`, `read_memory_item` | 引用按 `local`、`ov_memory`、`ov_resource` 区分，`path` 对 OV 引用保存 Viking URI，同工作区同日原文命中优先保留本地。助手消息可含降级 `notice`。流式事件为 `chat-chunk` / `chat-done`，远端预览返回 `uri`、`kind`、`title`、`content` |
+
+`update_note` 接收 `session`、`idOrPath`、`expectedHash`、`body` 和可选 `reorganize`。`expectedHash` 取自详情的 `contentHash`，每日块按正文校验，其他 Markdown 按整文件校验。基线失效时返回可重试的 `VERSION_CONFLICT`。普通 Markdown 可以保存为空，随手记要求非空正文。`reorganize` 默认开启，工作台对普通文档传 `false`，记录已有同步状态且启用自动同步时仍可入队补推。
+
+`list_wiki_documents(session)` 返回 `path`、`title`、`preview`、`folder`（根目录为空字符串）、`mapped`、`pendingSuggestions`、`conflictSuggestions` 和 `updatedAt`（磁盘修改时间的 UTC ISO 字符串，可为空）。已映射页面排在前面，其余顺序按目录和路径。`get_note_detail` 可直接按相对路径读取未索引 Markdown，普通文档的 `wikiSuggestions` 按目标路径关联。手动整理产生的 `draft_id = 'manual'` 记录仍属普通文档。新建、保存、采纳和撤销均更新 FTS5，索引重建保留扫描期间的 Wiki 写入。

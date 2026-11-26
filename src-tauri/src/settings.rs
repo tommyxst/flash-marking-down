@@ -30,7 +30,7 @@ impl Default for AppSettings {
         Self {
             version: 1,
             last_workspace_root: None,
-            last_capture_dir: String::new(),
+            last_capture_dir: crate::workspace::DEFAULT_CAPTURE_DIR.into(),
             hotkey: "win-alt-n".into(),
             auto_organize: true,
             auto_sync_memory: true,
@@ -228,12 +228,13 @@ mod tests {
         let partial = dir.0.join("partial-settings.json");
         fs::write(&partial, r#"{"lastWorkspaceRoot":"synthetic-root"}"#).unwrap();
         let loaded = read(&partial).unwrap();
+        assert_eq!(AppSettings::default().last_capture_dir, "notes");
         assert_eq!(loaded.version, 1);
         assert_eq!(
             loaded.last_workspace_root.as_deref(),
             Some("synthetic-root")
         );
-        assert_eq!(loaded.last_capture_dir, "");
+        assert_eq!(loaded.last_capture_dir, "notes");
         assert_eq!(loaded.hotkey, "win-alt-n");
         assert!(loaded.auto_organize && loaded.auto_sync_memory);
 

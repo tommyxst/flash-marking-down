@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use tauri::{WebviewWindow, async_runtime};
 use tauri_plugin_dialog::DialogExt;
@@ -6,11 +5,12 @@ use tauri_plugin_dialog::DialogExt;
 use crate::capture_commands::with_workspace;
 use crate::dto::AppError;
 use crate::platform::{display_local_path, open_file_default, reveal_file_in_explorer};
-use crate::storage::physical_path;
+use crate::storage::{is_in_capture_dir, physical_path, wiki::CAPTURE_TARGET_MESSAGE};
 use crate::workspace::{capture_picker_path, picked_capture_directory, workspace_root};
 
 const INVALID_ROOT: &str = "请选择可访问的工作区文件夹";
-const INVALID_CAPTURE: &str = "请选择工作区内可访问的文件夹，应用状态目录不可用";
+const INVALID_CAPTURE: &str =
+    "请选择工作区内的独立子文件夹存放笔记（不能直接选择根目录或应用状态目录）";
 const INVALID_MARKDOWN: &str =
     "请选择工作区内可访问的 UTF-8 Markdown 文件（不可选原始随手记或状态目录）";
 
@@ -192,10 +192,11 @@ pub(crate) async fn pick_workspace_markdown(
         "tasks" => "选择任务清单 Markdown 文件",
         _ => return Err(AppError::invalid("wiki", "无效的文件用途")),
     };
-    let (files, captured) = with_workspace(window.clone(), session, |storage| {
+    let (files, capture_dir, captured) = with_workspace(window.clone(), session, |storage| {
         Ok((
             storage.workspace_files(),
-            storage.capture_paths()?.into_iter().collect::<HashSet<_>>(),
+            storage.capture_dir().to_owned(),
+            storage.capture_paths()?,
         ))
     })
     .await?;
@@ -216,8 +217,8 @@ pub(crate) async fn pick_workspace_markdown(
         let invalid = || AppError::invalid("wiki", INVALID_MARKDOWN);
         let path = selected.as_path().ok_or_else(invalid)?;
         let (key, full) = files.picked_markdown(path).map_err(|_| invalid())?;
-        if captured.contains(&key) {
-            return Err(AppError::invalid("wiki", "原始随手记文件不能作为写入目标"));
+        if is_in_capture_dir(&key, &capture_dir) || captured.contains(&key) {
+            return Err(AppError::invalid("wiki", CAPTURE_TARGET_MESSAGE));
         }
         std::fs::read_to_string(full).map_err(|_| invalid())?;
         Ok(Some(key))
@@ -231,10 +232,11 @@ pub(crate) async fn list_workspace_markdown_files(
     window: WebviewWindow,
     session: String,
 ) -> Result<Vec<String>, AppError> {
-    let (files, captured) = with_workspace(window, session, |storage| {
+    let (files, capture_dir, captured) = with_workspace(window, session, |storage| {
         Ok((
             storage.workspace_files(),
-            storage.capture_paths()?.into_iter().collect::<HashSet<_>>(),
+            storage.capture_dir().to_owned(),
+            storage.capture_paths()?,
         ))
     })
     .await?;
@@ -250,7 +252,7 @@ pub(crate) async fn list_workspace_markdown_files(
         })?;
         let mut result: Vec<String> = paths
             .into_iter()
-            .filter(|path| !captured.contains(path))
+            .filter(|path| !is_in_capture_dir(path, &capture_dir) && !captured.contains(path))
             .collect();
         result.sort();
         Ok(result)

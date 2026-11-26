@@ -1,6 +1,17 @@
 export type WorkspacePage = 'records' | 'organize' | 'wiki' | 'tasks' | 'answers'
-export type LeftTab = 'notes' | 'tasks'
+export type LeftTab = 'notes' | 'wiki' | 'tasks'
 export type DrawerTab = 'conflicts' | 'wiki'
+
+export type WikiDocument = {
+  path: string
+  title: string
+  preview: string
+  folder: string
+  mapped: boolean
+  pendingSuggestions: number
+  conflictSuggestions: number
+  updatedAt: string | null
+}
 
 export type DraftDto = {
   revision: number

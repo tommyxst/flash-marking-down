@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from './api/client'
 import { parseAppError, type UiError } from './api/errors'
 import ErrorNotice from './components/ErrorNotice.vue'
@@ -18,13 +18,16 @@ const props = defineProps<{
   wikiTargets: DocumentMapping[]
   workspaceFiles: string[]
   desktop: boolean
+  wikiReviewId?: string
 }>()
 
 const emit = defineEmits<{
   updated: []
   targetsChanged: []
+  openNote: [path: string]
 }>()
 
+const rootEl = ref<HTMLElement>()
 const mappingPath = ref('')
 const mappingMode = ref<'existing' | 'new'>('existing')
 const mappingBusy = ref(false)
@@ -36,6 +39,17 @@ const feedback = ref('')
 const mappedWikis = computed(() =>
   props.wikiTargets.filter((item) => item.kind === 'wiki'),
 )
+const availableReviewId = computed(() => {
+  const id = props.wikiReviewId
+  return id && props.suggestions.some((item) => item.id === id) ? id : undefined
+})
+
+watch([rootEl, availableReviewId], ([root, id]) => {
+  if (!root || !id) return
+  const card = root.querySelector<HTMLElement>('[data-wiki-review]')
+  card?.focus({ preventScroll: true })
+  card?.scrollIntoView({ block: 'start' })
+}, { flush: 'post' })
 
 async function pickMarkdownFile() {
   if (pickingFile.value || mappingBusy.value) return
@@ -127,15 +141,16 @@ async function openExternal(path: string) {
 </script>
 
 <template>
-  <div class="m2-stack">
+  <div ref="rootEl" class="m2-stack">
     <details class="detail-card" :open="!mappedWikis.length">
       <summary>Wiki 目标页管理（{{ mappedWikis.length }}）</summary>
       <ul v-if="mappedWikis.length" class="m2-list wiki-target-list">
         <li v-for="item in mappedWikis" :key="item.path" class="wiki-target-row">
           <code>{{ item.path }}</code>
           <div class="actions">
+            <button type="button" class="quiet compact-btn" @click="emit('openNote', item.path)">工作台查看</button>
             <button v-if="desktop" type="button" class="quiet compact-btn" @click="openExternal(item.path)">
-              <UiIcon name="external" />打开
+              <UiIcon name="external" />外部打开
             </button>
             <button
               type="button"
@@ -190,15 +205,25 @@ async function openExternal(path: string) {
       <p>暂无待审阅的 Wiki 文档变更建议。后台整理或中栏「推送 Wiki 建议」后会在此列出。</p>
     </div>
 
-    <article v-for="item in suggestions" :key="item.id" class="detail-card">
+    <article
+      v-for="item in suggestions"
+      :key="item.id"
+      class="detail-card"
+      :data-wiki-review="item.id === availableReviewId ? '' : undefined"
+      :aria-label="`Wiki 变更 ${item.targetPath}`"
+      tabindex="-1"
+    >
       <header class="m2-card-header">
         <div class="actions">
           <code>{{ item.targetPath }}</code>
           <span class="badge" :class="wikiStatusTone[item.status]">{{ wikiStatusLabels[item.status] }}</span>
         </div>
-        <button v-if="desktop" type="button" class="quiet compact-btn" @click="openExternal(item.targetPath)">
-          <UiIcon name="external" />外部打开
-        </button>
+        <div class="actions">
+          <button type="button" class="quiet compact-btn" @click="emit('openNote', item.targetPath)">工作台查看</button>
+          <button v-if="desktop" type="button" class="quiet compact-btn" @click="openExternal(item.targetPath)">
+            <UiIcon name="external" />外部打开
+          </button>
+        </div>
       </header>
 
       <p v-if="item.reason" class="hint">{{ item.reason }}</p>
@@ -230,3 +255,8 @@ async function openExternal(path: string) {
     </article>
   </div>
 </template>
+
+<style scoped>
+[data-wiki-review] { scroll-margin-block-start: 0.75rem; }
+[data-wiki-review]:focus { border-color: var(--accent); }
+</style>

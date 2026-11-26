@@ -44,7 +44,8 @@ const emit = defineEmits<{
 const dialogEl = ref<HTMLDialogElement>()
 const hotkeySelect = ref<HTMLSelectElement>()
 const rootInput = ref('')
-const captureInput = ref('')
+const defaultCaptureDir = 'notes'
+const captureInput = ref(defaultCaptureDir)
 const pickingFolder = ref(false)
 const workspaceBusy = ref(false)
 const workspaceError = ref<UiError | null>(null)
@@ -89,7 +90,7 @@ watch([() => props.open, dialogEl], ([open, dialog]) => {
   if (!open && dialog?.open) dialog.close()
   if (open) {
     rootInput.value = props.workspace?.root ?? ''
-    captureInput.value = props.workspace?.captureDir ?? ''
+    captureInput.value = props.workspace?.captureDir || defaultCaptureDir
     workspaceError.value = props.initialWorkspaceError
     settingsWindowError.value = null
   }
@@ -133,7 +134,7 @@ async function pickFolder(kind: 'root' | 'capture') {
       captureInput.value = selection
     } else if (selection !== rootInput.value) {
       rootInput.value = selection
-      captureInput.value = ''
+      captureInput.value = defaultCaptureDir
     }
   } catch (error) {
     workspaceError.value = parseAppError(error)
@@ -284,18 +285,18 @@ defineExpose({
     </header>
 
     <form class="settings-form" @submit.prevent="openWorkspace">
-      <label for="workspace-root">工作区根目录（绝对路径）</label>
+      <label for="workspace-root">工作区 / Wiki 根目录（绝对路径）</label>
       <div class="folder-field">
         <input id="workspace-root" v-model="rootInput" required :disabled="isBusy || pickingFolder" aria-describedby="workspace-root-help" spellcheck="false" autofocus>
         <button v-if="desktop" type="button" aria-label="选择工作区根目录" :disabled="isBusy || pickingFolder" @click="pickFolder('root')">选择文件夹</button>
       </div>
       <p id="workspace-root-help" class="hint">搜索和重建索引会读取工作区及其子目录中的可访问 Markdown 文件。</p>
-      <label for="capture-dir">原文保存目录（相对于工作区）</label>
+      <label for="capture-dir">笔记存放目录（工作区内子文件夹，留空默认 notes）</label>
       <div class="folder-field">
-        <input id="capture-dir" v-model="captureInput" :disabled="isBusy || pickingFolder" aria-describedby="capture-dir-help" spellcheck="false">
-        <button v-if="desktop" type="button" aria-label="选择原文保存目录" :disabled="isBusy || pickingFolder || !rootInput.trim()" @click="pickFolder('capture')">选择文件夹</button>
+        <input id="capture-dir" v-model="captureInput" :disabled="isBusy || pickingFolder" aria-describedby="capture-dir-help" placeholder="notes" spellcheck="false">
+        <button v-if="desktop" type="button" aria-label="选择笔记存放目录" :disabled="isBusy || pickingFolder || !rootInput.trim()" @click="pickFolder('capture')">选择文件夹</button>
       </div>
-      <p id="capture-dir-help" class="hint">使用已有目录。留空时保存到工作区根目录。</p>
+      <p id="capture-dir-help" class="hint">笔记会专门存放在该子文件夹内（默认自动创建 notes 文件夹），避免直接散落在 Wiki 根目录下。</p>
       <ErrorNotice :error="workspaceError" suffix="。请检查路径和访问权限后重试。" />
       <ErrorNotice :error="settingsWindowError" />
       <div class="actions settings-actions">

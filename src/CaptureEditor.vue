@@ -6,11 +6,22 @@ import { EditorView, keymap, placeholder } from '@codemirror/view'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { captureMarkdown } from './captureMarkdown'
 
-const props = defineProps<{ readonly: boolean }>()
+const props = withDefaults(defineProps<{
+  readonly?: boolean
+  placeholderText?: string
+  autofocus?: boolean
+  editorId?: string
+}>(), {
+  readonly: false,
+  placeholderText: '记下现在想到的事…',
+  autofocus: false,
+  editorId: 'note',
+})
 const model = defineModel<string>({ required: true })
 const emit = defineEmits<{ ready: []; blur: []; 'composition-change': [composing: boolean] }>()
 const host = ref<HTMLElement>()
 const editable = new Compartment()
+const placeholderConfig = new Compartment()
 let view: EditorView | undefined
 let composing = false
 let compositionTimer: number | undefined
@@ -49,15 +60,15 @@ function finishComposition(event: CompositionEvent) {
 
 function newEditorState(doc: Text) {
   const enter = (editor: EditorView) => !editor.state.readOnly && insertNewline(editor)
-  const nonce = document.querySelector<HTMLStyleElement>('#capture-editor-style')!.nonce
+  const nonce = document.querySelector<HTMLStyleElement>('#capture-editor-style')?.nonce
   return EditorState.create({
     doc,
     selection: { anchor: doc.length },
     extensions: [
       nonce ? EditorView.cspNonce.of(nonce) : [],
-      EditorView.contentAttributes.of({ id: 'note', 'aria-label': 'Markdown 正文', tabindex: '0' }),
+      EditorView.contentAttributes.of({ id: props.editorId, 'aria-label': 'Markdown 正文', tabindex: '0' }),
       EditorView.lineWrapping,
-      placeholder('记下现在想到的事…'),
+      placeholderConfig.of(placeholder(props.placeholderText)),
       editable.of(editMode()),
       markdownLanguage,
       captureMarkdown,
@@ -80,6 +91,7 @@ function newEditorState(doc: Text) {
 onMounted(() => {
   const state = newEditorState(Text.of(model.value.split(/\r\n?|\n/)))
   view = new EditorView({ state, parent: host.value, scrollTo: EditorView.scrollIntoView(state.selection.main) })
+  if (props.autofocus) view.focus()
   emit('ready')
 })
 
@@ -90,6 +102,9 @@ onBeforeUnmount(() => {
 })
 
 watch(() => props.readonly, () => view?.dispatch({ effects: editable.reconfigure(editMode()) }))
+watch(() => props.placeholderText, (value) => {
+  view?.dispatch({ effects: placeholderConfig.reconfigure(placeholder(value)) })
+})
 watch(model, (value) => {
   if (!view) return
   const doc = view.state.toText(value)
@@ -120,12 +135,48 @@ defineExpose({ focus: () => view?.focus() })
 .capture-editor :deep(.cm-content) { padding: 16px 20px; caret-color: var(--accent); }
 .capture-editor :deep(.cm-line) { padding: 0; }
 .capture-editor :deep(.cm-placeholder) { color: var(--muted); }
-.capture-editor :deep(.cm-md-title) { font-size: 1.38em; font-weight: 600; }
-.capture-editor :deep(.cm-md-heading) { font-size: 1.17em; font-weight: 600; }
-.capture-editor :deep(.cm-md-strong) { font-weight: 600; }
+.capture-editor :deep(.cm-line.cm-md-h1) {
+  font-size: 1.45em;
+  font-weight: 700;
+  line-height: 1.38;
+  padding-top: 4px;
+  padding-bottom: 2px;
+  color: var(--text);
+}
+
+.capture-editor :deep(.cm-line.cm-md-h2) {
+  font-size: 1.25em;
+  font-weight: 660;
+  line-height: 1.42;
+  padding-top: 3px;
+  padding-bottom: 1px;
+  color: var(--text);
+}
+
+.capture-editor :deep(.cm-line.cm-md-h3) {
+  font-size: 1.12em;
+  font-weight: 640;
+  line-height: 1.48;
+  color: var(--text);
+}
+
+.capture-editor :deep(.cm-line.cm-md-h4) {
+  font-size: 1.04em;
+  font-weight: 620;
+  color: var(--text);
+}
+
+.capture-editor :deep(.cm-line.cm-md-quote-line) {
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-secondary);
+}
+
+.capture-editor :deep(.cm-md-strong) { font-weight: 700; color: var(--text); }
 .capture-editor :deep(.cm-md-emphasis) { font-style: italic; }
 .capture-editor :deep(.cm-md-strikethrough) { text-decoration: line-through; }
 .capture-editor :deep(.cm-md-code) { background: var(--surface); color: var(--text-secondary); }
 .capture-editor :deep(.cm-md-link) { color: var(--accent); text-decoration: underline; }
 .capture-editor :deep(.cm-md-marker) { color: var(--accent); }
+.capture-editor :deep(.cm-md-syntax) { color: var(--accent); opacity: 0.78; }
 </style>

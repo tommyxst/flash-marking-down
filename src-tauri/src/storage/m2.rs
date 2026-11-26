@@ -113,7 +113,7 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        let inserted = Self::queue_organize(&tx, note_id).map_err(db_err)?;
+        let inserted = Self::queue_organize(&tx, note_id, false).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(inserted)
     }
@@ -121,15 +121,17 @@ impl Storage {
     pub(super) fn queue_organize(
         tx: &rusqlite::Transaction<'_>,
         note_id: &str,
+        after_edit: bool,
     ) -> rusqlite::Result<bool> {
         let inserted = tx.execute(
             "INSERT INTO background_jobs (id, kind, note_id, payload_json, status, attempts, last_error, updated_at)
              SELECT lower(hex(randomblob(16))), 'organize', ?1, NULL, 'queued', 0, NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now')
              WHERE NOT EXISTS (
                  SELECT 1 FROM background_jobs
-                 WHERE note_id = ?1 AND kind = 'organize' AND status IN ('queued', 'running')
+                 WHERE note_id = ?1 AND kind = 'organize'
+                   AND (status = 'queued' OR (NOT ?2 AND status = 'running'))
              )",
-            [note_id],
+            params![note_id, after_edit],
         )? != 0;
         if inserted {
             tx.execute(
@@ -235,7 +237,9 @@ impl Storage {
         )
         .map_err(db_err)?;
         tx.execute(
-            "UPDATE notes SET organize_status = 'failed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            "UPDATE notes SET organize_status = CASE WHEN EXISTS (
+                SELECT 1 FROM background_jobs WHERE note_id = ?1 AND kind = 'organize' AND status = 'queued'
+             ) THEN 'queued' ELSE 'failed' END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             [note_id],
         )
         .map_err(db_err)?;
@@ -251,6 +255,11 @@ impl Storage {
             Ok(value) => value,
             Err(err) => return self.fail_organize_job(&job.job_id, &job.note_id, &err),
         };
+        let db_err = |e| database_error("organize_complete", Some(&job.note_id), e);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_err)?;
         let current_bytes = read_source_bytes(&self.workspace.files, &job.locator).ok();
         let current_body = current_bytes
             .as_deref()
@@ -274,7 +283,6 @@ impl Storage {
             &data,
         );
 
-        let db_err = |e| database_error("organize_complete", Some(&job.note_id), e);
         let serialized = serde_json::to_string(&parsed).map_err(|e| {
             error(
                 "WRITE_FAILED",
@@ -286,12 +294,11 @@ impl Storage {
             )
         })?;
 
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)?;
         tx.execute(
-            "UPDATE notes SET organize_status = 'done', organize_json = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            "UPDATE notes SET organize_status = CASE WHEN EXISTS (
+                SELECT 1 FROM background_jobs WHERE note_id = ?1 AND kind = 'organize' AND status = 'queued'
+             ) THEN 'queued' ELSE 'done' END,
+             organize_json = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             params![job.note_id, serialized],
         )
         .map_err(db_err)?;
