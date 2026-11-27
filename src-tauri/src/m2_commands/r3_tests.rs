@@ -95,7 +95,7 @@ fn edited_capture_runs_organize_and_both_sync_lanes_on_the_new_body() {
     assert!(queue_saved_note(&mut storage, &first.record_id, &prefs));
     for organized in [false, true, false] {
         assert_eq!(
-            run_background_job(&mut storage, |_| {}).unwrap(),
+            run_background_job(&mut storage, true, |_| {}).unwrap(),
             Some((first.record_id.clone(), organized))
         );
     }
@@ -150,11 +150,15 @@ fn edited_capture_runs_organize_and_both_sync_lanes_on_the_new_body() {
 
     for organized in [false, true, false] {
         assert_eq!(
-            run_background_job(&mut storage, |_| {}).unwrap(),
+            run_background_job(&mut storage, true, |_| {}).unwrap(),
             Some((first.record_id.clone(), organized))
         );
     }
-    assert!(run_background_job(&mut storage, |_| {}).unwrap().is_none());
+    assert!(
+        run_background_job(&mut storage, true, |_| {})
+            .unwrap()
+            .is_none()
+    );
     server.join().unwrap();
     let done = storage.get_note_detail(&detail.locator).unwrap();
     assert_eq!(done.organize_status, "done");
@@ -379,9 +383,17 @@ fn r3_syncs_daily_file_before_organize_and_memory_and_retries_after_disconnect()
     assert!(queue_saved_note(&mut storage, &second.record_id, &prefs));
     assert_eq!(first.relative_path, second.relative_path);
     for _ in 0..5 {
-        assert!(run_background_job(&mut storage, |_| {}).unwrap().is_some());
+        assert!(
+            run_background_job(&mut storage, true, |_| {})
+                .unwrap()
+                .is_some()
+        );
     }
-    assert!(run_background_job(&mut storage, |_| {}).unwrap().is_none());
+    assert!(
+        run_background_job(&mut storage, true, |_| {})
+            .unwrap()
+            .is_none()
+    );
     for id in [&first.record_id, &second.record_id] {
         let detail = storage.get_note_detail(id).unwrap();
         assert_eq!(detail.organize_status, "done");
@@ -411,7 +423,11 @@ fn r3_syncs_daily_file_before_organize_and_memory_and_retries_after_disconnect()
     assert!(queue_saved_note(&mut storage, &third.record_id, &prefs));
     assert!(dir.0.join(&third.relative_path).is_file());
     for _ in 0..3 {
-        assert!(run_background_job(&mut storage, |_| {}).unwrap().is_some());
+        assert!(
+            run_background_job(&mut storage, true, |_| {})
+                .unwrap()
+                .is_some()
+        );
     }
     model_server.join().unwrap();
     let failed = storage.get_note_detail(&third.record_id).unwrap();
@@ -448,7 +464,11 @@ fn r3_syncs_daily_file_before_organize_and_memory_and_retries_after_disconnect()
         0
     );
     for _ in 0..2 {
-        assert!(run_background_job(&mut storage, |_| {}).unwrap().is_some());
+        assert!(
+            run_background_job(&mut storage, true, |_| {})
+                .unwrap()
+                .is_some()
+        );
     }
     restored_server.join().unwrap();
     let retried = storage.get_note_detail(&third.record_id).unwrap();
@@ -511,17 +531,17 @@ fn r3_repushes_the_current_daily_file_after_a_checkbox_changes() {
                 }
             };
             assert_eq!(storage.enqueue_memory_sync(&config, None, true)?, 1);
-            assert!(run_background_job(storage, |_| {})?.is_some());
+            assert!(run_background_job(storage, true, |_| {})?.is_some());
             assert_status(storage, "synced");
 
             assert!(storage.toggle_task(&locator, "line:1", "- [ ] 回环待办", true)?);
             assert_status(storage, "pending");
             assert_eq!(storage.enqueue_memory_sync(&config, None, true)?, 1);
-            assert!(run_background_job(storage, |_| {})?.is_some());
+            assert!(run_background_job(storage, true, |_| {})?.is_some());
             assert_status(storage, "pending");
 
             assert_eq!(storage.enqueue_memory_sync(&config, None, true)?, 1);
-            assert!(run_background_job(storage, |_| {})?.is_some());
+            assert!(run_background_job(storage, true, |_| {})?.is_some());
             assert_status(storage, "synced");
             assert_eq!(storage.enqueue_memory_sync(&config, None, true)?, 0);
             server.join().unwrap();

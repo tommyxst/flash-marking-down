@@ -9,6 +9,7 @@ src-tauri/gen/
 .env.*
 !.env.example
 .flash-marking-down/
+.wikra/
 
 # Local coordination and trial materials
 /AGENTS.md

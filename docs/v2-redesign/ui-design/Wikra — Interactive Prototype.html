@@ -1,0 +1,81 @@
+<!doctype html>
+<!--
+  Wikra v2.0 — Interactive Hi-Fi Desktop Prototype (DESIGN-02 Rev.3)
+  Low-Cognitive-Load Architecture (Obsidian + Readwise Reader + NotebookLM + Linear):
+  - Default Dark (A: Cognitive Slate) + Paired Light (C: Paper Daylight) 1-click toggle
+  - Default Landing = Unified Knowledge Base Document Viewer (both organized Wiki pages AND original raw notes/articles in one transparent file tree)
+  - Wide-screen utilization (1920px fluid layouts + 920px comfortable / 100% full-width document toggle + 50/50 split-pane original comparison)
+  - Readwise Reader-style Inbox: clean full-article reading view + "打开原网页" + click-paragraph highlight-to-distill + right summary sidebar
+  - Progressive disclosure: obscure 5-card ops dashboard & review-budget progress bar removed; simplified plain-Chinese "整理" view for conflicts & activity
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wikra v2.0 — 个人知识库与 AI 整理工作台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23cbbeff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='22' height='22' x='1' y='1' rx='5' fill='%23111316' stroke='%23484553'/%3E%3Cpath d='M13 4 6 13h5.5l-.8 7L18 11h-5.5L13 4Z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body data-theme="slate" data-density="standard" data-width="readable">
+  <div id="app" class="app-shell" aria-label="Wikra v2.0 工作台"></div>
+
+  <!-- Quick Capture HUD overlay (simulates frameless always-on-top Windows window) -->
+  <div id="hud-layer" class="overlay-layer hidden" role="dialog" aria-modal="true" aria-label="随手记浮窗"></div>
+
+  <!-- Settings, Buffer Queue & Onboarding modal layer -->
+  <div id="modal-layer" class="overlay-layer hidden" role="dialog" aria-modal="true" aria-label="设置与向导"></div>
+
+  <!-- Toast feedback region (top-right below topbar) -->
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+
+  <!-- Collapsible prototype helper panel (formal release moves theme & density into Settings -> 外观) -->
+  <aside id="tweaks-panel" class="tweaks-panel" aria-label="原型评审工具">
+    <div class="tweaks-head">
+      <span class="tweaks-title">原型预览工具 · 仅评审用</span>
+      <button type="button" class="icon-btn" id="tweaks-close" aria-label="收起预览工具">&times;</button>
+    </div>
+    <div class="tweak-group">
+      <span class="tweak-label">明暗主题（正式版在左侧底栏与设置切换）</span>
+      <div class="tweak-pills" role="radiogroup" aria-label="明暗主题">
+        <button type="button" data-tweak-theme="slate">深色 · Cognitive Slate（默认）</button>
+        <button type="button" data-tweak-theme="paper">浅色 · Paper Daylight</button>
+      </div>
+    </div>
+    <div class="tweak-group">
+      <label class="tweak-label" for="tweak-width">正文宽度模式</label>
+      <select id="tweak-width" class="tweak-select">
+        <option value="readable">适读宽度（920px，默认）</option>
+        <option value="full">铺满整栏（适合宽屏表格与代码）</option>
+      </select>
+    </div>
+    <div class="tweak-group">
+      <label class="tweak-label" for="tweak-density">界面密度（模拟 Windows DPI）</label>
+      <select id="tweak-density" class="tweak-select">
+        <option value="compact">紧凑（125%–150% DPI）</option>
+        <option value="standard">标准（默认）</option>
+        <option value="reading">舒展（大字精读）</option>
+      </select>
+    </div>
+    <div class="tweak-group">
+      <span class="tweak-label">独立弹窗预览</span>
+      <div class="tweak-actions">
+        <button type="button" class="tweak-action-btn" id="tweak-open-hud">唤出随手记窗</button>
+        <button type="button" class="tweak-action-btn" id="tweak-open-onboard">首次接库向导</button>
+      </div>
+    </div>
+  </aside>
+  <button type="button" id="tweaks-toggle" class="tweaks-toggle" title="原型预览工具（切换主题、宽屏与弹窗场景）">
+    <span>预览</span>
+  </button>
+
+  <script>
+    window.FMD_TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "theme": "slate",
+      "density": "standard",
+      "width": "readable"
+    }/*EDITMODE-END*/;
+  </script>
+  <script src="./data.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

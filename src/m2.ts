@@ -27,6 +27,7 @@ export type OpenedWorkspace = {
   session: string
   root: string
   captureDir: string
+  rawDir: string
   draft: DraftDto
   recovered: string[]
   recoveryErrors: RecoveryErrorDto[]
@@ -371,3 +372,217 @@ export function useSourcePresentation() {
     sourceMarkdown: (text: string) => presentSourceMarkdown(text),
   }
 }
+
+// ============================================================================
+// Wikra v2.0 Frozen DTO Contracts (§2–§3)
+// ============================================================================
+
+export type ThemeName = 'slate' | 'paper'
+export type DocWidthMode = 'readable' | 'full'
+export type CaptureCommitMode = 'only' | 'queue' | 'now'
+
+export interface LibraryDocSummary {
+  path: string
+  title: string
+  folder: string
+  docType: 'decision' | 'concept' | 'synthesis' | 'entity' | 'note' | string
+  typeLabel: string
+  tags: string[]
+  updatedAt: string | null
+  citationCount: number
+  pendingConflictCount: number
+  wikraCore: boolean
+}
+
+export interface RawFileSummary {
+  id: string
+  path: string
+  title: string
+  kind: 'note' | 'clip'
+  kindLabel: '随手笔记' | '收藏原文' | string
+  createdAt: string | null
+  sourceUrl: string | null
+  linkedPagePaths: string[]
+}
+
+export interface LibraryTree {
+  rawDir: string
+  wikiPages: LibraryDocSummary[]
+  rawFiles: RawFileSummary[]
+}
+
+export interface DocCitation {
+  id: string
+  refLabel: string
+  rawPath: string
+  label: string
+  quote: string
+}
+
+export interface DocBacklink {
+  pagePath: string
+  title: string
+  excerpt: string
+}
+
+export interface DocTaskItem {
+  id: string
+  lineNumber: number
+  expectedLine: string
+  text: string
+  done: boolean
+}
+
+export interface DocumentDetail {
+  kind: 'wiki' | 'raw'
+  path: string
+  title: string
+  body: string
+  contentHash: string
+  updatedAt: string | null
+  docType: string
+  typeLabel: string
+  aliases: string[]
+  tags: string[]
+  wikraCore: boolean
+  sourceUrl: string | null
+  pendingConflictIds: string[]
+  outline: string[]
+  tasks: DocTaskItem[]
+  citations: DocCitation[]
+  backlinks: DocBacklink[]
+  linkedWikiPaths: string[]
+  hasProtectedSection: boolean
+}
+
+export interface InboxParagraph {
+  id: string
+  heading: string
+  text: string
+  highlighted: boolean
+  compiled: boolean
+}
+
+export interface InboxItemSummary {
+  id: string
+  title: string
+  domain: string
+  sourceType: string
+  url: string | null
+  rawPath: string
+  savedAt: string
+  readTime: string
+  fetchStatus: 'full' | 'stub'
+  state: 'unread' | 'reading' | 'compiled' | 'archived'
+  wordCount: number
+  highlightCount: number
+}
+
+export interface InboxItemDetail extends InboxItemSummary {
+  summaryPoints: string[]
+  relatedPagePaths: string[]
+  paragraphs: InboxParagraph[]
+}
+
+export interface ChangesetOp {
+  label: string
+  targetPath: string
+  targetTitle: string
+  outcome: 'applied' | 'pending_review' | 'reverted' | string
+}
+
+export interface ChangesetItem {
+  id: string
+  time: string
+  trigger: string
+  modelAlias: string
+  status: 'applied' | 'partial' | 'reverted'
+  summary: string
+  pagePaths: string[]
+  ops: ChangesetOp[]
+}
+
+export interface BufferQueueItem {
+  id: string
+  noteId: string
+  path: string
+  title: string
+  preview: string
+  queuedAt: string
+}
+
+export interface OrganizeSuggestion {
+  id: string
+  kind: 'review' | 'orphan' | string
+  kindLabel: string
+  title: string
+  detail: string
+  actionLabel: string
+  pagePath: string
+}
+
+export interface OrganizeOverview {
+  conflicts: ConflictItem[]
+  changesets: ChangesetItem[]
+  suggestions: OrganizeSuggestion[]
+  bufferQueue: BufferQueueItem[]
+  bufferSecondsLeft: number
+}
+
+export interface CaptureCommitResult {
+  path: string
+  noteId: string
+  queued: boolean
+  bufferSecondsLeft: number
+}
+
+export interface TeachbackTurn {
+  step: number
+  totalSteps: number
+  prompt: string
+  feedback: string
+  suggestedInsight: string | null
+}
+
+export interface GraphNode {
+  id: string
+  title: string
+  docType: string
+  degree: number
+  isHub: boolean
+  isOrphan: boolean
+}
+
+export interface GraphEdge {
+  id: string
+  from: string
+  to: string
+  kind: 'link' | 'citation'
+  label: string
+  snippet: string
+}
+
+export interface GraphGap {
+  id: string
+  title: string
+  reason: string
+  question: string
+  fromPath: string
+  toPath: string
+}
+
+export interface KnowledgeGraph {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  gaps: GraphGap[]
+}
+
+export interface GlobalSearchHit {
+  kind: 'wiki' | 'raw' | 'citation'
+  kindLabel: '知识页' | '随手笔记' | '收藏原文' | '原文引文' | string
+  title: string
+  subtitle: string
+  targetPath: string
+  citationId: string | null
+}
+

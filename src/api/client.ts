@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  CaptureCommitMode,
+  CaptureCommitResult,
+  ChangesetItem,
   ChatTurn,
   ConflictItem,
   ConflictStatus,
@@ -7,22 +10,32 @@ import type {
   ConversationSummary,
   CredentialReference,
   CredentialSlot,
+  DocumentDetail,
   DocumentKind,
   DocumentMapping,
+  DocWidthMode,
   DrawerCounts,
+  GlobalSearchHit,
   HotkeyStatus,
+  InboxItemDetail,
+  InboxItemSummary,
   IndexRebuildResult,
   IntegrationsConfig,
+  KnowledgeGraph,
+  LibraryTree,
   MemoryConfig,
   MemoryItem,
   ModelConfig,
   NoteDetail,
   NoteSummary,
   OpenedWorkspace,
+  OrganizeOverview,
   RecentCapture,
   RecordSource,
   SearchPage,
   TaskList,
+  TeachbackTurn,
+  ThemeName,
   WikiDocument,
   WikiSuggestion,
 } from '../m2'
@@ -34,14 +47,34 @@ export interface AppSettings {
   hotkey: string
   autoOrganize: boolean
   autoSyncMemory: boolean
+  theme: ThemeName
+  docWidth: DocWidthMode
+  allowNoteFulltextToModel: boolean
+  quietOrganize: boolean
+  bufferSeconds: number
 }
+
+export type AppSettingsPatch = Partial<
+  Pick<
+    AppSettings,
+    | 'autoOrganize'
+    | 'autoSyncMemory'
+    | 'theme'
+    | 'docWidth'
+    | 'allowNoteFulltextToModel'
+    | 'quietOrganize'
+    | 'bufferSeconds'
+  >
+>
 
 export const api = {
   getAppSettings: () => invoke<AppSettings>('get_app_settings'),
-  saveAppSettings: (changes: Partial<Pick<AppSettings, 'autoOrganize' | 'autoSyncMemory'>>) =>
+  saveAppSettings: (changes: AppSettingsPatch) =>
     invoke<AppSettings>('save_app_settings', changes),
   openWorkspace: (root: string, captureDir: string) =>
     invoke<OpenedWorkspace>('open_workspace', { root, captureDir }),
+  initStandardVault: (root: string) =>
+    invoke<OpenedWorkspace>('init_standard_vault', { root }),
   resumeWorkspace: () =>
     invoke<OpenedWorkspace | null>('resume_workspace'),
   loadCaptureWorkspace: () =>
@@ -54,19 +87,80 @@ export const api = {
     invoke<number>('persist_draft', { session, revision, body }),
   commitCapture: (session: string, requestId: string, revision: number, body: string) =>
     invoke<string>('commit_capture', { session, requestId, revision, body }),
+  commitCaptureV2: (
+    session: string,
+    requestId: string,
+    revision: number,
+    body: string,
+    mode: CaptureCommitMode,
+  ) => invoke<CaptureCommitResult>('commit_capture_v2', { session, requestId, revision, body, mode }),
   confirmCapture: (session: string, requestId: string) =>
     invoke<boolean>('confirm_capture', { session, requestId }),
   listRecentCaptures: (session: string) =>
     invoke<RecentCapture[]>('list_recent_captures', { session }),
   searchRecords: (params: { session: string; query: string; fromUtc?: string; untilUtc?: string; offset: number }) =>
     invoke<SearchPage>('search_records', params),
+  globalSearch: (session: string, query: string, limit?: number) =>
+    invoke<GlobalSearchHit[]>('global_search', { session, query, limit }),
   rebuildSearchIndex: (session: string) =>
     invoke<IndexRebuildResult>('rebuild_search_index', { session }),
   openRecordSource: (session: string, relativePath: string, contentHash: string) =>
     invoke<RecordSource>('open_record_source', { session, relativePath, contentHash }),
 
-  pickWorkspaceFolder: (kind: 'root' | 'capture', root: string, captureDir: string) =>
+  // Unified Library & Document Viewer (Wikra v2.0)
+  listLibraryTree: (session: string) =>
+    invoke<LibraryTree>('list_library_tree', { session }),
+  readDocumentDetail: (session: string, relativePath: string) =>
+    invoke<DocumentDetail>('read_document_detail', { session, relativePath }),
+  saveMarkdownDocument: (session: string, relativePath: string, expectedHash: string, body: string) =>
+    invoke<DocumentDetail>('save_markdown_document', { session, relativePath, expectedHash, body }),
+  createMarkdownDocument: (session: string, relativePath: string, initialBody: string) =>
+    invoke<DocumentDetail>('create_markdown_document', { session, relativePath, initialBody }),
+  appendHumanUnderstanding: (session: string, relativePath: string, insightText: string) =>
+    invoke<DocumentDetail>('append_human_understanding', { session, relativePath, insightText }),
+
+  // Inbox Reader & Compilation (Wikra v2.0)
+  listInboxItems: (session: string) =>
+    invoke<InboxItemSummary[]>('list_inbox_items', { session }),
+  getInboxItem: (session: string, id: string) =>
+    invoke<InboxItemDetail>('get_inbox_item', { session, id }),
+  ingestInboxInput: (session: string, input: string, titleHint?: string) =>
+    invoke<InboxItemDetail>('ingest_inbox_input', { session, input, titleHint }),
+  completeInboxStub: (session: string, id: string, pastedBody: string) =>
+    invoke<InboxItemDetail>('complete_inbox_stub', { session, id, pastedBody }),
+  toggleInboxParagraph: (session: string, id: string, paragraphId: string) =>
+    invoke<InboxItemDetail>('toggle_inbox_paragraph', { session, id, paragraphId }),
+  compileInboxItem: (session: string, id: string, mode: 'excerpt' | 'full' | 'archive') =>
+    invoke<InboxItemDetail>('compile_inbox_item', { session, id, mode }),
+  openExternalUrl: (url: string) =>
+    invoke<void>('open_external_url', { url }),
+
+  // Organize Overview, 60s Buffer Queue, Reversible Changesets & Active Recall
+  listOrganizeOverview: (session: string) =>
+    invoke<OrganizeOverview>('list_organize_overview', { session }),
+  cancelBufferItem: (session: string, itemId: string) =>
+    invoke<OrganizeOverview>('cancel_buffer_item', { session, itemId }),
+  flushBufferNow: (session: string) =>
+    invoke<OrganizeOverview>('flush_buffer_now', { session }),
+  revertChangeset: (session: string, changesetId: string) =>
+    invoke<ChangesetItem>('revert_changeset', { session, changesetId }),
+  dismissSuggestion: (session: string, suggestionId: string) =>
+    invoke<void>('dismiss_suggestion', { session, suggestionId }),
+  teachbackTurn: (session: string, pagePath: string, step: number, userAnswer?: string) =>
+    invoke<TeachbackTurn>('teachback_turn', { session, pagePath, step, userAnswer }),
+  saveAnswerToWiki: (session: string, conversationId: string, messageId: string, targetPath?: string) =>
+    invoke<DocumentDetail>('save_answer_to_wiki', { session, conversationId, messageId, targetPath }),
+
+  // Interactive Knowledge Graph
+  getKnowledgeGraph: (session: string, includeMetaPages: boolean) =>
+    invoke<KnowledgeGraph>('get_knowledge_graph', { session, includeMetaPages }),
+  dismissGraphGap: (session: string, gapId: string) =>
+    invoke<void>('dismiss_graph_gap', { session, gapId }),
+
+  pickWorkspaceFolder: (kind: 'root' | 'capture' | 'raw', root: string, captureDir: string) =>
     invoke<string | null>('pick_workspace_folder', { kind, root, captureDir }),
+  updateWorkspaceDirs: (session: string, rawDir: string, captureDir?: string) =>
+    invoke<OpenedWorkspace>('update_workspace_dirs', { session, rawDir, captureDir }),
   pickWorkspaceMarkdown: (session: string, kind: DocumentKind) =>
     invoke<string | null>('pick_workspace_markdown', { session, kind }),
   listWorkspaceMarkdownFiles: (session: string) =>

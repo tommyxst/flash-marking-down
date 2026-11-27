@@ -351,9 +351,49 @@ fn request_json_inner(
 
 #[cfg(windows)]
 pub(crate) use windows::{
-    ForegroundWindow, credential_exists, open_file_default, read_credential,
-    reveal_file_in_explorer, write_credential,
+    ForegroundWindow, credential_exists, open_file_default, open_url_default, read_credential,
+    rename_new_file, reveal_file_in_explorer, write_credential,
 };
+
+#[cfg(windows)]
+pub(crate) fn parse_http_url(value: &str) -> Option<Url> {
+    let value = value.trim();
+    let authority = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))?
+        .split(['/', '?', '#'])
+        .next()?;
+    if authority.is_empty()
+        || authority.contains('@')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    url.host_str()?;
+    Some(url)
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn validates_browser_urls_before_opening_any_handler() {
+    assert!(parse_http_url("https://example.test/note?q=read#1").is_some());
+    assert!(parse_http_url("http://localhost:8000/").is_some());
+    for input in [
+        "file:///C:/note.md",
+        "javascript:alert(1)",
+        "ms-settings:apps",
+        "//example.test",
+        "https:example.test",
+        "https:///example.test",
+        "https://user:secret@example.test",
+        "https://example.test\\unexpected",
+        "http://exa\nmple.test",
+    ] {
+        assert!(parse_http_url(input).is_none(), "{input}");
+    }
+}
 
 pub(crate) fn display_local_path(path: &Path) -> String {
     let text = path.to_string_lossy();

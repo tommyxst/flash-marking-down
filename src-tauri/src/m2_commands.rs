@@ -16,7 +16,7 @@ use crate::model::MemoryConfig;
 use crate::platform::default_http_transport;
 use crate::settings::{self, AppSettings};
 use crate::storage::m2_answer::{OpenVikingRecall, validate_chat_question};
-use crate::storage::{Storage, m2::ModelConfig, m2::ORGANIZE_PROMPT};
+use crate::storage::{Storage, m2::ModelConfig, m2::ORGANIZE_PROMPT, physical_path};
 
 type CommandResult<T> = Result<T, AppError>;
 
@@ -109,8 +109,9 @@ fn enabled_memory_provider(storage: &Storage) -> CommandResult<Option<OpenViking
 }
 
 pub(crate) fn queue_saved_note(storage: &mut Storage, note_id: &str, prefs: &AppSettings) -> bool {
-    let organize =
-        prefs.auto_organize && storage.model_config().ok().flatten().is_some_and(|c| c.2);
+    let organize = prefs.auto_organize
+        && prefs.allow_note_fulltext_to_model
+        && storage.model_config().ok().flatten().is_some_and(|c| c.2);
     let memory = if prefs.auto_sync_memory {
         memory_config(storage)
             .ok()
@@ -133,11 +134,11 @@ fn process_background_job(app: &AppHandle, backfill: bool) -> CommandResult<bool
     };
     // Hold no app-state lock during network I/O or while settling the original workspace's job.
     workspace.with_storage(|storage| {
+        let preferences = settings::settings_path(app).and_then(|path| settings::read(&path));
         if backfill
-            && settings::settings_path(app)
-                .and_then(|path| settings::read(&path))
-                .unwrap_or_default()
-                .auto_sync_memory
+            && preferences
+                .as_ref()
+                .map_or(true, |prefs| prefs.auto_sync_memory)
             && let Ok(Some(config)) = memory_config(storage)
             && let Err(error) = storage.enqueue_memory_sync(&config, None, true)
         {
@@ -146,7 +147,11 @@ fn process_background_job(app: &AppHandle, backfill: bool) -> CommandResult<bool
         let emit_note = |note_id: &str| {
             let _ = app.emit_to("main", "note-updated", json!({ "noteId": note_id }));
         };
-        let Some((note_id, organized)) = run_background_job(storage, emit_note)? else {
+        let can_send_capture = preferences
+            .as_ref()
+            .is_ok_and(|prefs| prefs.allow_note_fulltext_to_model);
+        let Some((note_id, organized)) = run_background_job(storage, can_send_capture, emit_note)?
+        else {
             return Ok(false);
         };
         emit_note(&note_id);
@@ -159,6 +164,7 @@ fn process_background_job(app: &AppHandle, backfill: bool) -> CommandResult<bool
 
 fn run_background_job(
     storage: &mut Storage,
+    can_send_capture: bool,
     started_organizing: impl FnOnce(&str),
 ) -> CommandResult<Option<(String, bool)>> {
     let config = memory_config(storage).ok().flatten().filter(|c| c.enabled);
@@ -167,6 +173,17 @@ fn run_background_job(
     };
     if job.kind == "organize" {
         started_organizing(&job.note_id);
+        if !can_send_capture
+            && (storage.is_capture_path(&job.path)
+                || storage.is_in_capture_dir(physical_path(&job.path)))
+        {
+            storage.fail_organize_job(
+                &job.id,
+                &job.note_id,
+                "随手记全文发送已关闭，可在设置中启用后重新整理",
+            )?;
+            return Ok(Some((job.note_id, true)));
+        }
         match storage.prepare_organize_job(&job) {
             Ok(mut input) => {
                 let result = (|| {

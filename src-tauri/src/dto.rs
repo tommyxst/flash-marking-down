@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::StorageError;
 
+#[cfg(windows)]
+pub(crate) mod wikra;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
@@ -95,6 +98,7 @@ pub struct RecoveryErrorDto {
 pub struct OpenedWorkspaceDto {
     pub session: String,
     pub root: String,
+    pub raw_dir: String,
     pub capture_dir: String,
     pub draft: DraftDto,
     pub recovered: Vec<String>,

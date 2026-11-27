@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::dto::wikra::DocTaskItemDto;
 use crate::dto::{TaskEntryDto, WikiDocumentDto, WikiSuggestionDto};
 
 use super::*;
@@ -52,7 +53,11 @@ fn utf8(bytes: Vec<u8>) -> Result<String, StorageError> {
     String::from_utf8(bytes).map_err(|_| invalid("目标文件不是有效的 UTF-8 Markdown"))
 }
 
-fn update_wiki_index(conn: &Connection, path: &str, body: &str) -> Result<(), StorageError> {
+pub(super) fn update_wiki_index(
+    conn: &Connection,
+    path: &str,
+    body: &str,
+) -> Result<(), StorageError> {
     let captured_at: Option<String> = conn
         .query_row(
             "SELECT captured_at FROM search_documents WHERE relative_path = ?1",
@@ -277,6 +282,7 @@ impl Storage {
         if self.is_in_capture_dir(&target) || self.is_capture_path(&target) {
             return Err(invalid(CAPTURE_TARGET_MESSAGE));
         }
+        wikra::ensure_editable(&self.connection, &target, "wiki")?;
         utf8(fs::read(full_path).map_err(file_error)?)?;
         let tx = self
             .connection
@@ -321,6 +327,7 @@ impl Storage {
     }
 
     fn check_wiki_target(&self, target: &str, kind: &str) -> Result<(), StorageError> {
+        wikra::ensure_editable(&self.connection, target, "wiki")?;
         let mapped: bool = self
             .connection
             .query_row(
@@ -799,11 +806,12 @@ impl Storage {
         let (physical, block_id) = target
             .split_once(NOTE_ANCHOR)
             .map_or((target, None), |(path, marker)| (path, Some(marker)));
-        let path = self
+        let (key, path) = self
             .workspace
             .files
-            .markdown_full_path(physical)
+            .markdown_file(physical)
             .map_err(file_error)?;
+        wikra::ensure_editable(&self.connection, &key, "tasks")?;
         let before = utf8(fs::read(&path).map_err(file_error)?)?;
         let (mut anchored, manual, _) = parse_tasks(&before);
         let file_line = if let Some(number) = task_id.strip_prefix("line:") {
@@ -916,6 +924,7 @@ struct ParsedTask {
     state: &'static str,
     checkbox: usize,
     line: String,
+    line_number: usize,
     source_path: Option<String>,
 }
 
@@ -928,15 +937,49 @@ fn task_lines(markdown: &str, block_id: Option<&str>) -> Option<Range<u32>> {
     Some(first..first + body.lines().count() as u32)
 }
 
-fn parse_manual_task(content: &str) -> Option<(&str, &'static str)> {
-    let state = match content.as_bytes().get(..6) {
-        Some(b"- [ ] " | b"* [ ] ") => "open",
-        Some(b"- [x] " | b"- [X] " | b"* [x] " | b"* [X] ") => "done",
-        Some(b"- [-] " | b"* [-] ") => "cancelled",
+fn parse_manual_task(content: &str) -> Option<(&str, &'static str, usize)> {
+    let rest = if let Some(rest) = content.strip_prefix(['-', '*', '+']) {
+        rest
+    } else {
+        let digits = content.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=9).contains(&digits) {
+            return None;
+        }
+        content[digits..].strip_prefix(['.', ')'])?
+    };
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let state = match rest.as_bytes().get(..4) {
+        Some(b"[ ] " | b"[ ]\t") => "open",
+        Some(b"[x] " | b"[X] " | b"[x]\t" | b"[X]\t") => "done",
+        Some(b"[-] " | b"[-]\t") => "cancelled",
         _ => return None,
     };
-    let title = content[6..].trim();
-    (!title.is_empty()).then_some((title, state))
+    let title = rest[4..].trim();
+    (!title.is_empty()).then_some((title, state, content.len() - rest.len() + 1))
+}
+
+pub(super) fn document_tasks(body: &str) -> Vec<DocTaskItemDto> {
+    let (anchored, manual, _) = parse_tasks(body);
+    let mut tasks: Vec<_> = manual
+        .into_iter()
+        .map(|(line, task)| (format!("line:{line}"), task))
+        .chain(anchored.into_iter().filter_map(|(id, mut tasks)| {
+            (tasks.len() == 1).then(|| (id, tasks.pop().expect("one anchored task")))
+        }))
+        .filter(|(_, task)| matches!(task.state, "open" | "done"))
+        .map(|(id, task)| DocTaskItemDto {
+            id,
+            line_number: task.line_number,
+            expected_line: task.line,
+            text: task.text,
+            done: task.state == "done",
+        })
+        .collect();
+    tasks.sort_unstable_by_key(|task| task.line_number);
+    tasks
 }
 
 fn extract_source_path(tail: &str) -> Option<String> {
@@ -1017,7 +1060,7 @@ fn parse_tasks(
         if in_comment || content.starts_with("<!--") {
             continue;
         }
-        let checkbox = line_start + original.len() - content.len() + 3;
+        let content_start = line_start + original.len() - content.len();
         let parsed = (line.len() - content.len() <= 3 && !content.starts_with('\t'))
             .then_some(content)
             .and_then(|content| {
@@ -1042,21 +1085,23 @@ fn parse_tasks(
                             state: "invalid",
                             checkbox: 0,
                             line: original.to_owned(),
+                            line_number: number + 1,
                             source_path: None,
                         });
                     }
                 }
             } else if line.len() - content.len() <= 3
                 && !content.starts_with('\t')
-                && let Some((title, state)) = parse_manual_task(content)
+                && let Some((title, state, checkbox)) = parse_manual_task(content)
             {
                 manual.push((
                     number as u32 + 1,
                     ParsedTask {
                         text: title.to_owned(),
                         state,
-                        checkbox,
+                        checkbox: content_start + checkbox,
                         line: original.to_owned(),
+                        line_number: number + 1,
                         source_path: None,
                     },
                 ));
@@ -1081,8 +1126,9 @@ fn parse_tasks(
         found.entry(id.into()).or_default().push(ParsedTask {
             text: text.into(),
             state,
-            checkbox,
+            checkbox: content_start + 3,
             line: original.to_owned(),
+            line_number: number + 1,
             source_path,
         });
     }

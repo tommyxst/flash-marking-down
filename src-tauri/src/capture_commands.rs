@@ -9,14 +9,16 @@ use tauri::{
     AppHandle, Emitter, Listener, Manager, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
 
+use crate::dto::wikra::CaptureCommitResultDto;
 use crate::dto::{
     AppError, DraftDto, IndexRebuildDto, OpenedWorkspaceDto, RecentCaptureDto, RecordSourceDto,
     RecoveryErrorDto, SearchHitDto, SearchPageDto,
 };
 use crate::platform::ForegroundWindow;
 use crate::settings;
-use crate::storage::{SearchReader, Storage, StorageError, WorkspaceStorage};
-use crate::workspace::{DEFAULT_CAPTURE_DIR, STATE_DIR};
+use crate::storage::wikra::organize::CaptureMode;
+use crate::storage::{SearchReader, Storage, StorageError, WorkspaceStorage, error};
+use crate::workspace::{DEFAULT_CAPTURE_DIR, STANDARD_CAPTURE_DIR, STATE_DIR};
 
 const CAPTURE_DRAFT: &str = "quick-capture";
 const MAIN_WINDOW: &str = "main";
@@ -130,7 +132,18 @@ impl WorkspaceState {
         } else {
             capture_dir
         });
-        let mut storage = Storage::open(root_path, capture_path, STATE_DIR)?;
+        let storage = Storage::open(root_path, capture_path, STATE_DIR)?;
+        self.activate_storage(settings_file, root, capture_dir, remember, storage)
+    }
+
+    fn activate_storage(
+        &mut self,
+        settings_file: &Path,
+        root: &str,
+        capture_dir: &str,
+        remember: bool,
+        mut storage: Storage,
+    ) -> Result<OpenedWorkspaceDto, StorageError> {
         let generation = self.generation + 1;
         let view = workspace_view(&mut storage, generation.to_string(), root)?;
         if remember || capture_dir != storage.capture_dir() {
@@ -168,6 +181,29 @@ impl WorkspaceState {
             })
     }
 
+    fn update_dirs(
+        &mut self,
+        settings_file: &Path,
+        session: &str,
+        raw_dir: &str,
+        capture_dir: Option<&str>,
+    ) -> Result<OpenedWorkspaceDto, AppError> {
+        if raw_dir.trim().is_empty() {
+            return Err(AppError::invalid("workspace", "请填写原始文件目录"));
+        }
+        let capture_dir = capture_dir
+            .filter(|dir| !dir.trim().is_empty())
+            .map(Path::new);
+        let active = self.workspace(session)?;
+        let (raw_dir, capture_dir) = active
+            .with_storage(|storage| storage.set_workspace_dirs(Path::new(raw_dir), capture_dir))?;
+        active.update_dirs(raw_dir, capture_dir.clone());
+        settings::update(settings_file, |settings| {
+            settings.last_capture_dir = capture_dir;
+        })?;
+        self.read_active()
+    }
+
     fn load_capture(&mut self) -> Result<OpenedWorkspaceDto, AppError> {
         let storage = self
             .active
@@ -189,6 +225,7 @@ impl WorkspaceState {
             Ok(OpenedWorkspaceDto {
                 session: self.generation.to_string(),
                 root: self.root.clone(),
+                raw_dir: storage.raw_dir().to_owned(),
                 capture_dir: storage.capture_dir().to_owned(),
                 draft: DraftDto { revision, body },
                 recovered: Vec::new(),
@@ -223,6 +260,7 @@ fn workspace_view(
     Ok(OpenedWorkspaceDto {
         session,
         root: root.to_owned(),
+        raw_dir: storage.raw_dir().to_owned(),
         capture_dir: storage.capture_dir().to_owned(),
         draft: DraftDto { revision, body },
         recovered,
@@ -302,6 +340,16 @@ pub(crate) async fn with_workspace<T: Send + 'static>(
     .await
 }
 
+pub(crate) async fn workspace_for_session(
+    window: WebviewWindow,
+    session: String,
+) -> Result<WorkspaceStorage, AppError> {
+    in_main_window(window, move |state, _| {
+        Ok(state.workspace(&session)?.clone())
+    })
+    .await
+}
+
 async fn with_draft_workspace<T: Send + 'static>(
     window: WebviewWindow,
     session: String,
@@ -326,6 +374,23 @@ pub(crate) async fn open_workspace(
     window: WebviewWindow,
     root: String,
     capture_dir: String,
+) -> Result<OpenedWorkspaceDto, AppError> {
+    open_selected_workspace(window, root, capture_dir, false).await
+}
+
+#[tauri::command]
+pub(crate) async fn init_standard_vault(
+    window: WebviewWindow,
+    root: String,
+) -> Result<OpenedWorkspaceDto, AppError> {
+    open_selected_workspace(window, root, STANDARD_CAPTURE_DIR.to_owned(), true).await
+}
+
+async fn open_selected_workspace(
+    window: WebviewWindow,
+    root: String,
+    capture_dir: String,
+    standard_vault: bool,
 ) -> Result<OpenedWorkspaceDto, AppError> {
     if window.label() == MAIN_WINDOW
         && window.state::<DesktopWindows>().capture_active()
@@ -353,13 +418,59 @@ pub(crate) async fn open_workspace(
         app.state::<DesktopWindows>()
             .allow_workspace_switch()
             .map_err(|msg| AppError::from_message("WINDOW_BUSY", "workspace", true, msg))?;
-        state
-            .activate(&settings::settings_path(app)?, &root, &capture_dir, true)
-            .map_err(AppError::from)
+        let settings_file = settings::settings_path(app)?;
+        if standard_vault {
+            let storage = Storage::open(Path::new(&root), Path::new(&capture_dir), STATE_DIR)?;
+            storage
+                .workspace_files()
+                .initialize_standard_layout()
+                .map_err(|err| {
+                    error(
+                        "WRITE_FAILED",
+                        "workspace",
+                        None,
+                        true,
+                        "无法初始化标准知识库",
+                        err,
+                    )
+                })?;
+            Ok(state.activate_storage(&settings_file, &root, &capture_dir, true, storage)?)
+        } else {
+            Ok(state.activate(&settings_file, &root, &capture_dir, true)?)
+        }
     })
     .await?;
     crate::m2_commands::wake_memory_backfill(&app);
+    crate::wikra_commands::wake_active_buffer(&app);
     Ok(opened)
+}
+
+#[tauri::command]
+pub(crate) async fn update_workspace_dirs(
+    window: WebviewWindow,
+    session: String,
+    raw_dir: String,
+    capture_dir: Option<String>,
+) -> Result<OpenedWorkspaceDto, AppError> {
+    in_main_window(window, move |state, app| {
+        app.state::<DesktopWindows>()
+            .allow_workspace_switch()
+            .map_err(|_| {
+                AppError::from_message(
+                    "WINDOW_BUSY",
+                    "workspace",
+                    true,
+                    "请先关闭快捷窗，再修改工作区目录",
+                )
+            })?;
+        state.update_dirs(
+            &settings::settings_path(app)?,
+            &session,
+            &raw_dir,
+            capture_dir.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -378,6 +489,7 @@ pub(crate) async fn resume_workspace(
     .await?;
     if opened.is_some() {
         crate::m2_commands::wake_memory_backfill(&app);
+        crate::wikra_commands::wake_active_buffer(&app);
     }
     Ok(opened)
 }
@@ -404,7 +516,7 @@ pub(crate) fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::new()
         .menu(&menu)
         .icon(icon.clone())
-        .tooltip(&app.package_info().name)
+        .tooltip("Wikra")
         .on_menu_event(on_tray_menu)
         .build(app)?;
     Ok(())
@@ -544,6 +656,7 @@ async fn open_capture(
     let Some(create) = create else {
         return show_workbench(app);
     };
+    crate::wikra_commands::wake_active_buffer(app);
     if !create {
         let capture = app.get_webview_window(CAPTURE_WINDOW).ok_or_else(|| {
             AppError::from_message(
@@ -815,6 +928,37 @@ pub(crate) async fn commit_capture(
 }
 
 #[tauri::command]
+pub(crate) async fn commit_capture_v2(
+    window: WebviewWindow,
+    session: String,
+    request_id: String,
+    revision: i64,
+    body: String,
+    mode: String,
+) -> Result<CaptureCommitResultDto, AppError> {
+    let app = window.app_handle().clone();
+    let preferences = settings::settings_path(&app)
+        .and_then(|path| settings::read(&path))
+        .unwrap_or_default();
+    let mode = CaptureMode::parse(&mode, preferences.buffer_seconds)?;
+    let (receipt, workspace) = with_draft_workspace(window, session, move |storage| {
+        let record = storage.save_record_with_buffer(
+            &request_id,
+            CAPTURE_DRAFT,
+            revision,
+            &body,
+            Some(mode),
+        )?;
+        Ok((storage.capture_receipt(record)?, storage.workspace_handle()))
+    })
+    .await?;
+    if receipt.queued {
+        crate::wikra_commands::wake_buffer(&app, workspace, receipt.buffer_seconds_left);
+    }
+    Ok(receipt)
+}
+
+#[tauri::command]
 pub(crate) async fn confirm_capture(
     window: WebviewWindow,
     session: String,
@@ -973,6 +1117,49 @@ mod tests {
         assert_eq!(opened.capture_dir, "notes");
         assert!(workspace.0.join("notes").is_dir());
         assert_eq!(settings::read(&file).unwrap().last_capture_dir, "notes");
+    }
+
+    #[test]
+    fn updates_workspace_dirs_without_reopening_the_session() {
+        let workspace = TestDir::new();
+        let data = TestDir::new();
+        let file = data.0.join(settings::FILE_NAME);
+        let root = workspace.0.to_str().unwrap();
+        let mut state = WorkspaceState::default();
+        let opened = state.activate(&file, root, "", true).unwrap();
+        let session = opened.session;
+
+        assert_eq!(
+            state
+                .update_dirs(&file, &session, " \t", None)
+                .unwrap_err()
+                .code,
+            "INVALID_INPUT",
+        );
+        let updated = state
+            .update_dirs(&file, &session, "sources", Some("journal/daily"))
+            .unwrap();
+        assert_eq!(updated.session, session);
+        assert_eq!(updated.raw_dir, "sources");
+        assert_eq!(updated.capture_dir, "journal/daily");
+        assert!(workspace.0.join("sources").is_dir());
+        assert!(workspace.0.join("journal/daily").is_dir());
+        assert_eq!(
+            settings::read(&file).unwrap().last_capture_dir,
+            "journal/daily"
+        );
+
+        state
+            .update_dirs(&file, &session, "library/sources", Some(" \t"))
+            .unwrap();
+        let capture = state.load_capture().unwrap();
+        assert_eq!(capture.session, session);
+        assert_eq!(capture.raw_dir, "library/sources");
+        assert_eq!(capture.capture_dir, "journal/daily");
+
+        let resumed = WorkspaceState::default().resume(&file).unwrap().unwrap();
+        assert_eq!(resumed.raw_dir, capture.raw_dir);
+        assert_eq!(resumed.capture_dir, capture.capture_dir);
     }
 
     #[test]

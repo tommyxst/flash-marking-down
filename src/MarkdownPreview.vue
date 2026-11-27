@@ -2,7 +2,7 @@
 import { markdownLanguage } from '@codemirror/lang-markdown'
 import { computed, defineComponent, h, ref, watch, type PropType, type VNodeChild } from 'vue'
 import { api } from './api/client'
-import { citationKindLabels, type CitationItem } from './m2'
+import { citationKindLabels, type CitationItem, type DocCitation, type DocTaskItem } from './m2'
 
 type MdNode = ReturnType<typeof markdownLanguage.parser.parse>['topNode']
 
@@ -15,6 +15,8 @@ const SKIP_MARKS = new Set([
   'CodeMark',
   'LinkMark',
 ])
+
+const HIDDEN_COMMENTS = /^<!--\s*(?:wikra|fmd)-(?:protect|note|source|revision|managed)[^>]*-->$/i
 
 function imagePlaceholder(src: string, alt: string, note: string) {
   return h('span', { class: 'md-image-stub', title: src || undefined }, `[图片：${alt || '未命名'} · ${note}]`)
@@ -97,35 +99,87 @@ type RenderCtx = {
   session?: string
   basePath?: string
   citations?: CitationItem[]
+  docCitations?: DocCitation[]
+  docTasks?: DocTaskItem[]
+  taskCursor: number
+  usedTaskIds: Set<string>
   onCite: (citation: CitationItem) => void
+  onDocCite: (citation: DocCitation) => void
+  onWikilink: (target: string) => void
+  onToggleTask: (task: DocTaskItem) => void
 }
 
-function pushTextWithCitations(out: VNodeChild[], raw: string, ctx: RenderCtx) {
-  if (!ctx.citations?.length) {
-    out.push(raw)
-    return
-  }
+const INLINE_TOKEN_RE = /\[\^([^\]]+)\]|\[(\d+)\]|\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g
+
+function pushRichText(out: VNodeChild[], raw: string, ctx: RenderCtx) {
   let last = 0
-  for (const match of raw.matchAll(/\[(\d+)\]/g)) {
-    const citation = ctx.citations.find((item) => item.index === Number(match[1]))
-    if (!citation) continue
+  for (const match of raw.matchAll(INLINE_TOKEN_RE)) {
     const start = match.index ?? 0
-    if (start > last) out.push(raw.slice(last, start))
-    const label = `查看 ${citationKindLabels[citation.kind]} 引用 ${match[0]}`
-    out.push(
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'cite-pill',
-          title: label,
-          'aria-label': label,
-          onClick: () => ctx.onCite(citation),
-        },
-        match[0],
-      ),
-    )
-    last = start + match[0].length
+    const full = match[0]
+    const footnoteRef = match[1]
+    const numericRef = match[2]
+    const wikiTarget = match[3]
+    const wikiLabel = match[4]
+
+    if (footnoteRef) {
+      const docCit = ctx.docCitations?.find((c) => c.refLabel === footnoteRef || c.id === footnoteRef)
+      if (!docCit) continue
+      if (start > last) out.push(raw.slice(last, start))
+      out.push(
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'footnote-ref',
+            title: `对照原文：${docCit.label}`,
+            onClick: () => ctx.onDocCite(docCit),
+          },
+          `[^${docCit.refLabel}]`,
+        ),
+      )
+      last = start + full.length
+      continue
+    }
+
+    if (numericRef) {
+      const citation = ctx.citations?.find((item) => item.index === Number(numericRef))
+      if (!citation) continue
+      if (start > last) out.push(raw.slice(last, start))
+      const label = `查看 ${citationKindLabels[citation.kind]} 引用 ${full}`
+      out.push(
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'cite-pill',
+            title: label,
+            'aria-label': label,
+            onClick: () => ctx.onCite(citation),
+          },
+          full,
+        ),
+      )
+      last = start + full.length
+      continue
+    }
+
+    if (wikiTarget) {
+      if (start > last) out.push(raw.slice(last, start))
+      const display = (wikiLabel || wikiTarget).trim()
+      out.push(
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'wikilink',
+            title: `打开知识页：${wikiTarget.trim()}`,
+            onClick: () => ctx.onWikilink(wikiTarget.trim()),
+          },
+          `[[${display}]]`,
+        ),
+      )
+      last = start + full.length
+    }
   }
   if (last < raw.length) out.push(raw.slice(last))
 }
@@ -144,7 +198,7 @@ function renderChildren(
   const pushText = (raw: string) => {
     const value = needTrim ? raw.replace(/^\s+/, '') : raw
     if (value) {
-      pushTextWithCitations(out, value, ctx)
+      pushRichText(out, value, ctx)
       needTrim = false
     }
   }
@@ -176,6 +230,7 @@ function renderNode(node: MdNode, src: string, ctx: RenderCtx): VNodeChild {
     case 'SetextHeading2':
       return h('h2', renderChildren(node, src, ctx, SKIP_MARKS, true))
     case 'ATXHeading3':
+    case 'SetextHeading3':
       return h('h3', renderChildren(node, src, ctx, SKIP_MARKS, true))
     case 'ATXHeading4':
       return h('h4', renderChildren(node, src, ctx, SKIP_MARKS, true))
@@ -199,6 +254,23 @@ function renderNode(node: MdNode, src: string, ctx: RenderCtx): VNodeChild {
       const raw = src.slice(from, to)
       const done = raw === '[x]' || raw === '[X]'
       const cancelled = raw === '[-]'
+      const lineStart = src.lastIndexOf('\n', from) + 1
+      const lineEndIdx = src.indexOf('\n', to)
+      const currentLine = src.slice(lineStart, lineEndIdx < 0 ? src.length : lineEndIdx).trim()
+      const matchedTask =
+        ctx.docTasks?.find((t) => !ctx.usedTaskIds.has(t.id) && t.expectedLine.trim() === currentLine)
+        ?? ctx.docTasks?.[ctx.taskCursor]
+      if (matchedTask) {
+        ctx.usedTaskIds.add(matchedTask.id)
+        ctx.taskCursor += 1
+        return h('input', {
+          type: 'checkbox',
+          class: 'md-task-checkbox',
+          checked: matchedTask.done,
+          'aria-label': matchedTask.text,
+          onChange: () => ctx.onToggleTask(matchedTask),
+        })
+      }
       const glyph = done ? '☑' : cancelled ? '☒' : '☐'
       const label = done ? '已完成' : cancelled ? '已取消' : '未完成'
       return h('span', { class: 'md-task-box', role: 'img', 'aria-label': label }, glyph)
@@ -221,11 +293,10 @@ function renderNode(node: MdNode, src: string, ctx: RenderCtx): VNodeChild {
       return h('code', { class: 'md-inline-code' }, renderChildren(node, src, ctx))
     case 'Link': {
       const raw = src.slice(from, to)
-      // The parser treats bare [n] citation markers as shortcut links.
-      if (/^(?:\[\d+\])+$/.test(raw)) {
-        const citations: VNodeChild[] = []
-        pushTextWithCitations(citations, raw, ctx)
-        return citations
+      if (/^(?:\[\d+\]|\[\^[^\]]+\]|\[\[[^\]]+\]\])$/.test(raw)) {
+        const inline: VNodeChild[] = []
+        pushRichText(inline, raw, ctx)
+        return inline
       }
       const url = childText(node, src, 'URL').trim()
       const labelExclude = new Set([...SKIP_MARKS, 'URL', 'LinkTitle'])
@@ -254,8 +325,11 @@ function renderNode(node: MdNode, src: string, ctx: RenderCtx): VNodeChild {
     case 'HTMLBlock':
     case 'HTMLTag':
     case 'CommentBlock':
-    case 'Comment':
-      return h('code', { class: 'md-raw-html' }, src.slice(from, to))
+    case 'Comment': {
+      const raw = src.slice(from, to).trim()
+      if (HIDDEN_COMMENTS.test(raw)) return null
+      return h('code', { class: 'md-raw-html' }, raw)
+    }
     case 'Table':
       return h('pre', { class: 'md-code-block' }, src.slice(from, to))
     default:
@@ -271,9 +345,17 @@ export default defineComponent({
     session: { type: String, default: '' },
     basePath: { type: String, default: undefined },
     compact: { type: Boolean, default: false },
+    hideFrontmatter: { type: Boolean, default: false },
     citations: { type: Array as PropType<CitationItem[]> },
+    docCitations: { type: Array as PropType<DocCitation[]> },
+    docTasks: { type: Array as PropType<DocTaskItem[]> },
   },
-  emits: { cite: (_citation: CitationItem) => true },
+  emits: {
+    cite: (_citation: CitationItem) => true,
+    docCite: (_citation: DocCitation) => true,
+    wikilink: (_target: string) => true,
+    toggleTask: (_task: DocTaskItem) => true,
+  },
   setup(props, { emit }) {
     const parsed = computed(() => {
       const { frontmatter, body } = splitFrontmatter(props.source)
@@ -287,10 +369,17 @@ export default defineComponent({
         session: props.session,
         basePath: props.basePath,
         citations: props.citations,
+        docCitations: props.docCitations,
+        docTasks: props.docTasks,
+        taskCursor: 0,
+        usedTaskIds: new Set<string>(),
         onCite: (citation) => emit('cite', citation),
+        onDocCite: (citation) => emit('docCite', citation),
+        onWikilink: (target) => emit('wikilink', target),
+        onToggleTask: (task) => emit('toggleTask', task),
       }
       const children: VNodeChild[] = []
-      if (frontmatter) {
+      if (frontmatter && !props.hideFrontmatter) {
         children.push(h('pre', { class: 'md-frontmatter', 'aria-label': '文档元数据' }, frontmatter))
       }
       if (body.trim()) {

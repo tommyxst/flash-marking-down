@@ -6,7 +6,10 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const STATE_DIR: &str = ".flash-marking-down";
+pub(crate) const STATE_DIR: &str = ".wikra";
+pub(crate) const LEGACY_STATE_DIR: &str = ".flash-marking-down";
+pub(crate) const DEFAULT_RAW_DIR: &str = "raw";
+pub(crate) const STANDARD_CAPTURE_DIR: &str = "raw/notes";
 pub(crate) const DEFAULT_CAPTURE_DIR: &str = "notes";
 const STATE_DB_NAME: &str = "state.sqlite";
 const REPARSE_POINT: u32 = 0x0400;
@@ -27,6 +30,14 @@ impl WorkspaceFiles {
     pub(crate) fn open(root: &Path, state_dir_name: &str) -> io::Result<Self> {
         validate_component(OsStr::new(state_dir_name))?;
         let root = workspace_root(root)?;
+        let state_dir_name = if state_dir_name == STATE_DIR
+            && existing_path(&root.join(STATE_DIR))?.is_none()
+            && existing_path(&root.join(LEGACY_STATE_DIR))?.is_some()
+        {
+            LEGACY_STATE_DIR
+        } else {
+            state_dir_name
+        };
         let state = root.join(state_dir_name);
         match fs::create_dir(&state) {
             Ok(()) => (),
@@ -77,21 +88,44 @@ impl WorkspaceFiles {
 
     pub(crate) fn capture_key(&self, relative: &Path) -> io::Result<String> {
         validate_relative(relative)?;
-        let relative = if relative.as_os_str().is_empty() || relative == Path::new(".") {
-            Path::new(DEFAULT_CAPTURE_DIR)
-        } else {
-            relative
-        };
         let current = self.ensure_directory(relative)?;
         if current == self.root {
             return Err(scope_error(
-                "capture directory must be a subfolder inside the workspace",
+                "directory must be a subfolder inside the workspace",
             ));
         }
         self.key(&current)
     }
 
+    pub(crate) fn initialize_standard_layout(&self) -> io::Result<()> {
+        for dir in [
+            "wiki/decisions",
+            "wiki/concepts",
+            "wiki/syntheses",
+            "wiki/entities",
+            STANDARD_CAPTURE_DIR,
+            "raw/clips",
+        ] {
+            self.ensure_directory(Path::new(dir))?;
+        }
+        let (_, schema) = self.markdown_target("SCHEMA.md")?;
+        if schema.try_exists()? {
+            return Ok(());
+        }
+        match replace_markdown(
+            &schema,
+            None,
+            "# Wikra 知识库\n\n- `wiki/` 保存决策、概念、综述和实体。\n- `raw/` 保存随手记和收藏原文。\n- 知识页可用双链和脚注关联原文。\n".as_bytes(),
+        ) {
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            result => result,
+        }
+    }
+
     fn ensure_directory(&self, relative: &Path) -> io::Result<PathBuf> {
+        if self.root.canonicalize()? != self.root {
+            return Err(scope_error("workspace path changed"));
+        }
         let mut current = self.root.clone();
         for component in relative.components() {
             let Component::Normal(segment) = component else {
@@ -153,7 +187,7 @@ impl WorkspaceFiles {
         for result in fs::read_dir(directory)? {
             let result = result.and_then(|entry| {
                 let name = entry.file_name();
-                if name.eq_ignore_ascii_case(STATE_DIR) {
+                if is_state_directory_name(&name) {
                     return Ok(());
                 }
                 let path = entry.path();
@@ -217,7 +251,7 @@ impl WorkspaceFiles {
         for component in rel.components() {
             match component {
                 Component::CurDir | Component::ParentDir => (),
-                Component::Normal(name) if !name.eq_ignore_ascii_case(STATE_DIR) => {
+                Component::Normal(name) if !is_state_directory_name(name) => {
                     validate_component(name)?;
                 }
                 _ => return Err(scope_error("image path is outside the document scope")),
@@ -227,8 +261,8 @@ impl WorkspaceFiles {
             Some(base) if !base.trim().is_empty() => {
                 let physical = base.split_once("#fmd-note:").map_or(base, |(path, _)| path);
                 let mut parent = self.root.clone();
+                validate_relative(Path::new(physical))?;
                 if let Some(dir) = Path::new(physical).parent() {
-                    validate_relative(dir)?;
                     parent.push(dir);
                 }
                 parent
@@ -302,9 +336,6 @@ impl WorkspaceFiles {
         let requested = self.markdown_input(relative_path)?;
         if let Some(path) = existing_path(&requested)? {
             return Ok((self.checked_markdown(&path)?, path));
-        }
-        if self.root.canonicalize()? != self.root {
-            return Err(scope_error("workspace path changed"));
         }
         let parent = Path::new(relative_path)
             .parent()
@@ -398,17 +429,33 @@ fn relative_key(path: &Path) -> io::Result<String> {
     Ok(relative.replace('\\', "/"))
 }
 
+pub(crate) fn normalize_workspace_subdir(relative: &Path) -> io::Result<String> {
+    validate_relative(relative)?;
+    let relative: PathBuf = relative
+        .components()
+        .filter(|component| *component != Component::CurDir)
+        .collect();
+    if relative.as_os_str().is_empty() {
+        return Err(scope_error(
+            "directory must be a subfolder inside the workspace",
+        ));
+    }
+    relative_key(&relative)
+}
+
 fn validate_relative(path: &Path) -> io::Result<()> {
     for component in path.components() {
         match component {
             Component::CurDir => (),
-            Component::Normal(name) if !name.eq_ignore_ascii_case(STATE_DIR) => {
-                validate_component(name)?
-            }
+            Component::Normal(name) if !is_state_directory_name(name) => validate_component(name)?,
             _ => return Err(scope_error("path is outside the document scope")),
         }
     }
     Ok(())
+}
+
+fn is_state_directory_name(name: &OsStr) -> bool {
+    name.eq_ignore_ascii_case(STATE_DIR) || name.eq_ignore_ascii_case(LEGACY_STATE_DIR)
 }
 
 fn validate_component(name: &OsStr) -> io::Result<()> {
@@ -442,7 +489,7 @@ fn scope_error(message: &'static str) -> io::Error {
 }
 
 pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> io::Result<()> {
-    replace_file(path, body, || Ok(()))
+    replace_file(path, body, |temp| fs::rename(temp, path))
 }
 
 pub(crate) fn replace_markdown(
@@ -450,14 +497,17 @@ pub(crate) fn replace_markdown(
     expected: Option<&[u8]>,
     body: &[u8],
 ) -> io::Result<()> {
-    replace_file(path, body, || {
+    replace_file(path, body, |temp| {
+        if expected.is_none() {
+            return crate::platform::rename_new_file(temp, path);
+        }
         let matching = match fs::read(path) {
             Ok(current) => expected == Some(current.as_slice()),
-            Err(error) if error.kind() == ErrorKind::NotFound => expected.is_none(),
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
         if matching {
-            Ok(())
+            fs::rename(temp, path)
         } else {
             Err(io::Error::new(
                 ErrorKind::AlreadyExists,
@@ -470,7 +520,7 @@ pub(crate) fn replace_markdown(
 fn replace_file(
     path: &Path,
     body: &[u8],
-    before_rename: impl FnOnce() -> io::Result<()>,
+    rename: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let stamp = std::time::SystemTime::now()
@@ -490,8 +540,7 @@ fn replace_file(
         file.write_all(body)?;
         file.sync_all()?;
         drop(file);
-        before_rename()?;
-        fs::rename(&temp, path)
+        rename(&temp)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp);

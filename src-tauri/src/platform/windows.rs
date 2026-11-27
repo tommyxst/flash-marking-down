@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
@@ -121,9 +122,27 @@ pub(crate) fn read_credential(target: &str, allow_bearer: bool) -> io::Result<Op
 }
 
 pub(crate) fn open_file_default(path: &Path) -> Result<(), String> {
-    let clean = display_local_path(path);
+    shell_open(&display_local_path(path))
+        .map_err(|_| "无法使用系统默认程序打开该 Markdown 文件".into())
+}
+
+pub(crate) fn open_url_default(url: &str) -> Result<(), crate::dto::AppError> {
+    let url = super::parse_http_url(url).ok_or_else(|| {
+        crate::dto::AppError::invalid("url_open", "请输入有效的 HTTP 或 HTTPS 网址")
+    })?;
+    shell_open(url.as_str()).map_err(|_| {
+        crate::dto::AppError::from_message(
+            "OPERATION_FAILED",
+            "url_open",
+            true,
+            "无法通过系统默认浏览器打开网页",
+        )
+    })
+}
+
+fn shell_open(target: &str) -> Result<(), ()> {
     let operation = wide("open");
-    let target = wide(&clean);
+    let target = wide(target);
     let handle = unsafe {
         ShellExecuteW(
             null_mut(),
@@ -135,10 +154,20 @@ pub(crate) fn open_file_default(path: &Path) -> Result<(), String> {
         )
     };
     if (handle as usize) <= 32 {
-        Err("无法使用系统默认程序打开该 Markdown 文件".into())
+        Err(())
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn rename_new_file(from: &Path, to: &Path) -> io::Result<()> {
+    let from: Vec<_> = from.as_os_str().encode_wide().chain([0]).collect();
+    let to: Vec<_> = to.as_os_str().encode_wide().chain([0]).collect();
+    // std::fs::rename can replace a concurrent creator's destination on Windows.
+    if unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(crate) fn reveal_file_in_explorer(path: &Path) -> Result<(), String> {
@@ -207,6 +236,11 @@ unsafe extern "system" {
         directory: *const u16,
         show_cmd: i32,
     ) -> *mut c_void;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileW(from: *const u16, to: *const u16) -> i32;
 }
 
 #[link(name = "user32")]

@@ -1,5 +1,5 @@
 [package]
-name = "flash-marking-down"
+name = "wikra"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"

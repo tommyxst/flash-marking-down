@@ -12,7 +12,37 @@ use crate::storage::{StorageError, error};
 use crate::workspace::atomic_write;
 
 pub(crate) const FILE_NAME: &str = "settings.json";
+const APP_ID: &str = "app.wikra.desktop";
+const LEGACY_APP_ID: &str = "com.flash-marking-down.desktop";
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Theme {
+    #[default]
+    Slate,
+    Paper,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DocWidth {
+    #[default]
+    Readable,
+    Full,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_buffer_seconds() -> u32 {
+    60
+}
+
+fn deserialize_buffer_seconds<'de, D: serde::Deserializer<'de>>(input: D) -> Result<u32, D::Error> {
+    i64::deserialize(input).map(|value| value.clamp(0, 300) as u32)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -23,6 +53,19 @@ pub(crate) struct AppSettings {
     pub(crate) hotkey: String,
     pub(crate) auto_organize: bool,
     pub(crate) auto_sync_memory: bool,
+    #[serde(default)]
+    theme: Theme,
+    #[serde(default)]
+    doc_width: DocWidth,
+    #[serde(default = "default_true")]
+    pub(crate) allow_note_fulltext_to_model: bool,
+    #[serde(default = "default_true")]
+    pub(crate) quiet_organize: bool,
+    #[serde(
+        default = "default_buffer_seconds",
+        deserialize_with = "deserialize_buffer_seconds"
+    )]
+    pub(crate) buffer_seconds: u32,
 }
 
 impl Default for AppSettings {
@@ -34,6 +77,11 @@ impl Default for AppSettings {
             hotkey: "win-alt-n".into(),
             auto_organize: true,
             auto_sync_memory: true,
+            theme: Theme::default(),
+            doc_width: DocWidth::default(),
+            allow_note_fulltext_to_model: default_true(),
+            quiet_organize: default_true(),
+            buffer_seconds: default_buffer_seconds(),
         }
     }
 }
@@ -84,6 +132,18 @@ fn legacy_row<T>(
 }
 
 fn import_settings(dir: &Path) -> io::Result<AppSettings> {
+    if dir.file_name().is_some_and(|name| name == APP_ID)
+        && let Some(parent) = dir.parent()
+        && !dir.join("last-workspace.sqlite").try_exists()?
+        && !dir.join("quick-entry-hotkey.sqlite").try_exists()?
+    {
+        let legacy = parent.join(LEGACY_APP_ID);
+        match fs::read(legacy.join(FILE_NAME)) {
+            Ok(data) => return Ok(serde_json::from_slice(&data)?),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return import_settings(&legacy),
+            Err(err) => return Err(err),
+        }
+    }
     let mut settings = AppSettings::default();
     if let Some((root, capture_dir)) = legacy_row(
         dir.join("last-workspace.sqlite"),
@@ -127,6 +187,7 @@ fn access(path: &Path, change: Option<impl FnOnce(&mut AppSettings)>) -> io::Res
     if let Some(change) = change {
         change(&mut settings);
     }
+    settings.buffer_seconds = settings.buffer_seconds.min(300);
     if write {
         fs::create_dir_all(dir)?;
         atomic_write(path, &serde_json::to_vec_pretty(&settings)?)?;
@@ -161,17 +222,55 @@ pub(crate) async fn get_app_settings(window: WebviewWindow) -> Result<AppSetting
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn save_app_settings(
     window: WebviewWindow,
     auto_organize: Option<bool>,
     auto_sync_memory: Option<bool>,
+    theme: Option<String>,
+    doc_width: Option<String>,
+    allow_note_fulltext_to_model: Option<bool>,
+    quiet_organize: Option<bool>,
+    buffer_seconds: Option<i64>,
 ) -> Result<AppSettings, AppError> {
+    let theme = match theme.as_deref() {
+        Some("slate") => Some(Theme::Slate),
+        Some("paper") => Some(Theme::Paper),
+        None => None,
+        _ => return Err(AppError::invalid("settings", "主题必须为 slate 或 paper")),
+    };
+    let doc_width = match doc_width.as_deref() {
+        Some("readable") => Some(DocWidth::Readable),
+        Some("full") => Some(DocWidth::Full),
+        None => None,
+        _ => {
+            return Err(AppError::invalid(
+                "settings",
+                "文档宽度必须为 readable 或 full",
+            ));
+        }
+    };
     let updated = update(&main_settings_path(&window)?, |settings| {
         if let Some(value) = auto_organize {
             settings.auto_organize = value;
         }
         if let Some(value) = auto_sync_memory {
             settings.auto_sync_memory = value;
+        }
+        if let Some(value) = theme {
+            settings.theme = value;
+        }
+        if let Some(value) = doc_width {
+            settings.doc_width = value;
+        }
+        if let Some(value) = allow_note_fulltext_to_model {
+            settings.allow_note_fulltext_to_model = value;
+        }
+        if let Some(value) = quiet_organize {
+            settings.quiet_organize = value;
+        }
+        if let Some(value) = buffer_seconds {
+            settings.buffer_seconds = value.clamp(0, 300) as u32;
         }
     })?;
     if auto_sync_memory == Some(true) {
@@ -237,9 +336,47 @@ mod tests {
         assert_eq!(loaded.last_capture_dir, "notes");
         assert_eq!(loaded.hotkey, "win-alt-n");
         assert!(loaded.auto_organize && loaded.auto_sync_memory);
+        let json = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(json["theme"], "slate");
+        assert_eq!(json["docWidth"], "readable");
+        assert_eq!(json["allowNoteFulltextToModel"], true);
+        assert_eq!(json["quietOrganize"], true);
+        assert_eq!(json["bufferSeconds"], 60);
 
         let invalid_ver = dir.0.join("invalid-ver.json");
         fs::write(&invalid_ver, r#"{"version":2}"#).unwrap();
         assert!(read(&invalid_ver).is_err());
+    }
+
+    #[test]
+    fn brand_change_imports_old_config_and_keeps_new_preferences() {
+        let dir = TestDir::new();
+        let legacy = dir.0.join(LEGACY_APP_ID);
+        fs::create_dir(&legacy).unwrap();
+        fs::write(
+            legacy.join(FILE_NAME),
+            r#"{"version":1,"lastWorkspaceRoot":"old-root","bufferSeconds":-1}"#,
+        )
+        .unwrap();
+        let path = dir.0.join(APP_ID).join(FILE_NAME);
+        let imported = read(&path).unwrap();
+        assert_eq!(imported.last_workspace_root.as_deref(), Some("old-root"));
+        assert_eq!(imported.buffer_seconds, 0);
+        update(&path, |saved| {
+            saved.theme = Theme::Paper;
+            saved.doc_width = DocWidth::Full;
+            saved.buffer_seconds = 600;
+            saved.allow_note_fulltext_to_model = false;
+            saved.quiet_organize = false;
+        })
+        .unwrap();
+        let json = serde_json::to_value(read(&path).unwrap()).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["theme"], "paper");
+        assert_eq!(json["docWidth"], "full");
+        assert_eq!(json["bufferSeconds"], 300);
+        assert_eq!(json["allowNoteFulltextToModel"], false);
+        assert_eq!(json["quietOrganize"], false);
+        assert_eq!(json["lastWorkspaceRoot"], "old-root");
     }
 }

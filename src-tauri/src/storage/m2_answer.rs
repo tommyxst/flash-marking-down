@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v3_workspace_to_v6_with_conflicts_and_fts5_losslessly() {
+    fn migrates_v3_workspace_with_conflicts_and_fts5_losslessly() {
         let dir = TestDir::new();
         let a = "# 架构决策 A\n采用本地 SQLite WAL 与增量索引。";
         let b = "# 架构决策 B\n保持单连接直写并全量扫描。";
@@ -1159,7 +1159,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         let hits = migrated
             .search_reader()
             .unwrap()

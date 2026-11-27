@@ -11,8 +11,17 @@ use crate::workspace::{capture_picker_path, picked_capture_directory, workspace_
 const INVALID_ROOT: &str = "请选择可访问的工作区文件夹";
 const INVALID_CAPTURE: &str =
     "请选择工作区内的独立子文件夹存放笔记（不能直接选择根目录或应用状态目录）";
+const INVALID_RAW: &str =
+    "请选择工作区内的独立子文件夹作为原始文件目录（不能直接选择根目录或应用状态目录）";
 const INVALID_MARKDOWN: &str =
     "请选择工作区内可访问的 UTF-8 Markdown 文件（不可选原始随手记或状态目录）";
+
+#[tauri::command]
+pub(crate) async fn open_external_url(url: String) -> Result<(), AppError> {
+    async_runtime::spawn_blocking(move || crate::platform::open_url_default(&url))
+        .await
+        .map_err(|_| AppError::from_message("CANCELLED", "url_open", true, "打开网页操作中断"))?
+}
 
 #[tauri::command]
 pub(crate) async fn pick_workspace_folder(
@@ -24,16 +33,17 @@ pub(crate) async fn pick_workspace_folder(
     if window.label() != "main" {
         return Err(AppError::invalid("workspace", "请在主窗口选择工作区目录"));
     }
-    let (capture, title) = match kind.as_str() {
-        "root" => (false, "选择工作区目录"),
-        "capture" => (true, "选择保存目录"),
+    let (title, subdir_error) = match kind.as_str() {
+        "root" => ("选择工作区目录", None),
+        "capture" => ("选择保存目录", Some(INVALID_CAPTURE)),
+        "raw" => ("选择原始文件目录（raw）", Some(INVALID_RAW)),
         _ => return Err(AppError::invalid("workspace", "无效的目录选择类型")),
     };
 
     async_runtime::spawn_blocking(move || {
         let root_path = Path::new(&root);
         let checked_root = workspace_root(root_path);
-        let start = match (capture, &checked_root) {
+        let start = match (subdir_error.is_some(), &checked_root) {
             (false, Ok(root)) => Some(root.clone()),
             (false, Err(_)) => None,
             (true, Ok(root)) => Some(
@@ -52,9 +62,9 @@ pub(crate) async fn pick_workspace_folder(
         };
         let path = selected
             .as_path()
-            .ok_or_else(|| AppError::invalid("workspace", INVALID_ROOT))?;
-        if capture {
-            let checked_root = checked_root.expect("capture branch requires valid root");
+            .ok_or_else(|| AppError::invalid("workspace", subdir_error.unwrap_or(INVALID_ROOT)))?;
+        if let Some(message) = subdir_error {
+            let checked_root = checked_root.expect("subdirectory requires valid root");
             return picked_capture_directory(&checked_root, &capture_dir, path)
                 .map(Some)
                 .map_err(|e| {
@@ -62,7 +72,7 @@ pub(crate) async fn pick_workspace_folder(
                         "OUT_OF_SCOPE",
                         "workspace",
                         false,
-                        INVALID_CAPTURE,
+                        message,
                         Some(e.to_string()),
                     )
                 });

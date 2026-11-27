@@ -17,6 +17,8 @@ mod settings;
 #[cfg(windows)]
 pub mod storage;
 #[cfg(windows)]
+mod wikra_commands;
+#[cfg(windows)]
 mod workspace;
 
 pub fn run() {
@@ -33,10 +35,13 @@ pub fn run() {
             capture_commands::init_tray(app.handle())?;
             hotkeys::init(app.handle());
             m2_commands::init_organize_worker(app.handle());
+            wikra_commands::init_buffer_worker(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             capture_commands::open_workspace,
+            capture_commands::init_standard_vault,
+            capture_commands::update_workspace_dirs,
             capture_commands::resume_workspace,
             capture_commands::show_capture_window,
             capture_commands::load_capture_workspace,
@@ -47,11 +52,13 @@ pub fn run() {
             capture_commands::open_record_source,
             capture_commands::persist_draft,
             capture_commands::commit_capture,
+            capture_commands::commit_capture_v2,
             capture_commands::confirm_capture,
             desktop_commands::pick_workspace_folder,
             desktop_commands::desktop_window_action,
             desktop_commands::is_main_maximized,
             desktop_commands::open_workspace_file,
+            desktop_commands::open_external_url,
             desktop_commands::pick_workspace_markdown,
             desktop_commands::list_workspace_markdown_files,
             desktop_commands::read_workspace_image,
@@ -92,6 +99,27 @@ pub fn run() {
             m2_commands::read_memory_item,
             settings::get_app_settings,
             settings::save_app_settings,
+            wikra_commands::list_library_tree,
+            wikra_commands::read_document_detail,
+            wikra_commands::save_markdown_document,
+            wikra_commands::create_markdown_document,
+            wikra_commands::append_human_understanding,
+            wikra_commands::list_inbox_items,
+            wikra_commands::get_inbox_item,
+            wikra_commands::ingest_inbox_input,
+            wikra_commands::complete_inbox_stub,
+            wikra_commands::toggle_inbox_paragraph,
+            wikra_commands::compile_inbox_item,
+            wikra_commands::list_organize_overview,
+            wikra_commands::cancel_buffer_item,
+            wikra_commands::flush_buffer_now,
+            wikra_commands::revert_changeset,
+            wikra_commands::dismiss_suggestion,
+            wikra_commands::teachback_turn,
+            wikra_commands::save_answer_to_wiki,
+            wikra_commands::get_knowledge_graph,
+            wikra_commands::dismiss_graph_gap,
+            wikra_commands::global_search,
             hotkeys::get_hotkey,
             hotkeys::set_hotkey,
         ]);
@@ -105,7 +133,10 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested {
                     code: None, api, ..
                 } => api.prevent_exit(),
-                tauri::RunEvent::Exit => hotkeys::shutdown(app),
+                tauri::RunEvent::Exit => {
+                    wikra_commands::stop_buffer_worker(app);
+                    hotkeys::shutdown(app);
+                }
                 _ => {}
             }
             #[cfg(not(windows))]

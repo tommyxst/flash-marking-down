@@ -7,7 +7,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 
 use crate::dto::{NoteDetailDto, NoteSummaryDto, OrganizeResultDto};
-use crate::workspace::{WorkspaceFiles, replace_markdown};
+use crate::workspace::{
+    DEFAULT_CAPTURE_DIR, DEFAULT_RAW_DIR, WorkspaceFiles, normalize_workspace_subdir,
+    replace_markdown,
+};
 
 mod search;
 pub(crate) use search::SearchReader;
@@ -15,9 +18,12 @@ pub(crate) mod m2;
 pub(crate) mod m2_answer;
 pub(crate) mod memory_sync;
 pub(crate) mod wiki;
+pub(crate) mod wikra;
 
 const RECENT_CAPTURE_LIMIT: i64 = 50;
 const NOTE_LIST_LIMIT: i64 = 200;
+const UPSERT_WORKSPACE_SETTING: &str = "INSERT INTO workspace_settings (key, value) VALUES (?1, ?2)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value";
 
 pub(crate) type RecentCapture = (String, String, String, String, Option<String>);
 pub(crate) const NOTE_ANCHOR: &str = "#fmd-note:";
@@ -100,11 +106,21 @@ pub struct Storage {
 pub(crate) struct WorkspaceStorage {
     files: Arc<WorkspaceFiles>,
     search_build: Arc<Mutex<()>>,
+    raw_dir: String,
     capture_dir: String,
     workspace_id: String,
 }
 
 impl WorkspaceStorage {
+    pub(crate) fn database_path(&self) -> &Path {
+        self.files.database_path()
+    }
+
+    pub(crate) fn update_dirs(&mut self, raw_dir: String, capture_dir: String) {
+        self.raw_dir = raw_dir;
+        self.capture_dir = capture_dir;
+    }
+
     pub(crate) fn with_storage<T, E: From<StorageError>>(
         &self,
         action: impl FnOnce(&mut Storage) -> Result<T, E>,
@@ -162,6 +178,11 @@ impl Storage {
     ) -> Result<Self, StorageError> {
         let open_error = |e| error("WRITE_FAILED", "workspace", None, true, "无法打开工作区", e);
         let files = WorkspaceFiles::open(root, state_dir_name).map_err(open_error)?;
+        let capture_dir = if capture_dir.as_os_str().is_empty() || capture_dir == Path::new(".") {
+            Path::new(DEFAULT_CAPTURE_DIR)
+        } else {
+            capture_dir
+        };
         let capture_dir = files.capture_key(capture_dir).map_err(open_error)?;
         let mut connection = connect(files.database_path(), true)?;
 
@@ -227,6 +248,7 @@ impl Storage {
                 tx.execute_batch(m2_answer::SCHEMA)
                     .map_err(migration_error)?;
                 tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(wikra::SCHEMA).map_err(migration_error)?;
                 tx.pragma_update(None, "application_id", APPLICATION_ID)
                     .map_err(migration_error)?;
                 tx.execute(
@@ -243,8 +265,11 @@ impl Storage {
                     tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
                     migrate_captures(&tx)?;
                 }
-                if version < SCHEMA_VERSION {
+                if version < 6 {
                     migrate_to_v6(&tx)?;
+                }
+                if version < SCHEMA_VERSION {
+                    tx.execute_batch(wikra::SCHEMA).map_err(migration_error)?;
                     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                         .map_err(migration_error)?;
                 }
@@ -261,11 +286,26 @@ impl Storage {
             }
         }
         tx.execute(
-            "INSERT INTO workspace_settings VALUES ('capture_dir', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value",
-            [&capture_dir],
+            UPSERT_WORKSPACE_SETTING,
+            params!["capture_dir", &capture_dir],
         )
         .map_err(migration_error)?;
+        let raw_dir = tx
+            .query_row(
+                "SELECT value FROM workspace_settings WHERE key = 'raw_dir'",
+                [],
+                |row| {
+                    Ok(row
+                        .get_ref(0)?
+                        .as_str()
+                        .ok()
+                        .and_then(|value| normalize_workspace_subdir(Path::new(value)).ok()))
+                },
+            )
+            .optional()
+            .map_err(migration_error)?
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_RAW_DIR.to_owned());
         let workspace_id = tx
             .query_row(
                 "SELECT value FROM workspace_settings WHERE key = 'id'",
@@ -285,6 +325,7 @@ impl Storage {
             workspace: WorkspaceStorage {
                 files: Arc::new(files),
                 search_build: Arc::default(),
+                raw_dir,
                 capture_dir,
                 workspace_id,
             },
@@ -299,8 +340,62 @@ impl Storage {
         &self.workspace.workspace_id
     }
 
+    pub(crate) fn raw_dir(&self) -> &str {
+        &self.workspace.raw_dir
+    }
+
+    pub(crate) fn clips_dir(&self) -> String {
+        format!("{}/clips", self.raw_dir())
+    }
+
     pub(crate) fn capture_dir(&self) -> &str {
         &self.workspace.capture_dir
+    }
+
+    pub(crate) fn set_workspace_dirs(
+        &mut self,
+        raw_dir: &Path,
+        capture_dir: Option<&Path>,
+    ) -> Result<(String, String), StorageError> {
+        let dir_error = |err| {
+            error(
+                "WRITE_FAILED",
+                "workspace",
+                None,
+                true,
+                "无法使用指定的工作区子目录，请检查路径和访问权限",
+                err,
+            )
+        };
+        let raw_dir = self
+            .workspace
+            .files
+            .capture_key(raw_dir)
+            .map_err(dir_error)?;
+        let capture_dir = capture_dir
+            .map(|path| self.workspace.files.capture_key(path))
+            .transpose()
+            .map_err(dir_error)?
+            .unwrap_or_else(|| self.workspace.capture_dir.clone());
+
+        let db = |err| database_error("workspace", None, err);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db)?;
+        tx.execute(UPSERT_WORKSPACE_SETTING, params!["raw_dir", &raw_dir])
+            .map_err(db)?;
+        if capture_dir != self.workspace.capture_dir {
+            tx.execute(
+                UPSERT_WORKSPACE_SETTING,
+                params!["capture_dir", &capture_dir],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        self.workspace
+            .update_dirs(raw_dir.clone(), capture_dir.clone());
+        Ok((raw_dir, capture_dir))
     }
 
     pub(crate) fn workspace_files(&self) -> Arc<WorkspaceFiles> {
@@ -900,11 +995,12 @@ impl Storage {
                 None,
             ),
         };
-        let full_path = self
+        let (key, full_path) = self
             .workspace
             .files
-            .markdown_full_path(&path)
+            .markdown_file(&path)
             .map_err(source_error)?;
+        wikra::ensure_editable(&self.connection, &key, "update_note")?;
         let before_bytes = fs::read(&full_path).map_err(source_error)?;
         let before_text = std::str::from_utf8(&before_bytes).map_err(|e| {
             error(
@@ -1135,6 +1231,17 @@ impl Storage {
         draft_revision: i64,
         body: &str,
     ) -> Result<SavedRecord, StorageError> {
+        self.save_record_with_buffer(request_id, draft_id, draft_revision, body, None)
+    }
+
+    pub(crate) fn save_record_with_buffer(
+        &mut self,
+        request_id: &str,
+        draft_id: &str,
+        draft_revision: i64,
+        body: &str,
+        mode: Option<wikra::organize::CaptureMode>,
+    ) -> Result<SavedRecord, StorageError> {
         if request_id.is_empty()
             || draft_id.is_empty()
             || draft_revision < 0
@@ -1196,25 +1303,41 @@ impl Storage {
             }
             return Ok(saved);
         }
-        let persisted: Option<(i64, String)> = tx
+        let persisted: Option<(i64, Option<String>)> = tx
             .query_row(
-                "SELECT persisted_revision, body FROM drafts WHERE id = ?1 AND body IS NOT NULL",
+                "SELECT persisted_revision, body FROM drafts WHERE id = ?1",
                 [draft_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(db_error)?;
-        if persisted.as_ref().map(|(rev, text)| (*rev, text.as_str()))
+        if persisted
+            .as_ref()
+            .and_then(|(rev, text)| text.as_deref().map(|text| (*rev, text)))
             != Some((draft_revision, body))
         {
-            return Err(error(
-                "VERSION_CONFLICT",
-                "capture",
-                Some(request_id),
-                false,
-                "请先保存当前草稿",
-                "persisted draft does not match capture",
-            ));
+            if mode.is_some()
+                && persisted
+                    .as_ref()
+                    .is_none_or(|(rev, _)| *rev < draft_revision)
+            {
+                tx.execute(
+                    "INSERT INTO drafts (id, body, edit_revision, persisted_revision, updated_at)
+                     VALUES (?1, ?2, ?3, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                     ON CONFLICT(id) DO UPDATE SET body = excluded.body, edit_revision = excluded.edit_revision,
+                     persisted_revision = excluded.persisted_revision, updated_at = excluded.updated_at",
+                    params![draft_id, body, draft_revision],
+                ).map_err(db_error)?;
+            } else {
+                return Err(error(
+                    "VERSION_CONFLICT",
+                    "capture",
+                    Some(request_id),
+                    false,
+                    "请先保存当前草稿",
+                    "persisted draft does not match capture",
+                ));
+            }
         }
 
         let (date, time, captured_at, saved_at): (String, String, String, String) = tx
@@ -1296,6 +1419,9 @@ impl Storage {
             params![record_id, request_id, relative_path, marker, captured_at, title, preview,
                 revision, draft_id, draft_revision, body_hash, saved_at],
         ).map_err(db_error)?;
+        if let Some(mode) = mode {
+            wikra::organize::schedule_capture(&tx, record_id, &saved_at, mode)?;
+        }
         search::upsert_document(
             &tx,
             &relative_path,
@@ -1473,7 +1599,7 @@ fn revision_hash(bytes: &[u8]) -> String {
 }
 
 const APPLICATION_ID: i64 = i64::from_be_bytes(*b"\0\0\0\0FMD1");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = "
 CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE drafts (id TEXT PRIMARY KEY, body TEXT, edit_revision INTEGER NOT NULL CHECK(edit_revision >= 0), persisted_revision INTEGER NOT NULL CHECK(persisted_revision = edit_revision), updated_at TEXT NOT NULL);";
@@ -2163,7 +2289,7 @@ pub(crate) mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            SCHEMA_VERSION
         );
         for dropped in [
             "capture_intents",

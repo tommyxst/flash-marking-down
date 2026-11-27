@@ -7,9 +7,16 @@ import { parseAppError, type UiError } from '../api/errors'
 import CaptureEditor from '../CaptureEditor.vue'
 import ErrorNotice from '../components/ErrorNotice.vue'
 import UiIcon from '../UiIcon.vue'
-import type { OpenedWorkspace, RecoveryErrorDto } from '../m2'
+import type { CaptureCommitMode, OpenedWorkspace, RecoveryErrorDto } from '../m2'
+import {
+  WIKRA_PREFS_STORAGE_KEY,
+  WIKRA_WIKI_CACHE_KEY,
+  applyBodyPreferences,
+  readCachedPreferences,
+} from '../utils/wikra'
 
-type PendingCapture = { requestId: string; revision: number; body: string }
+type PendingCapture = { requestId: string; revision: number; body: string; mode: CaptureCommitMode }
+type WikiCandidate = { path: string; title: string; typeLabel: string }
 
 const desktopWindow = isTauri() ? getCurrentWindow() : undefined
 const workspace = ref<{ session: string; root: string; captureDir: string }>()
@@ -25,7 +32,7 @@ const persistedRevision = ref(0)
 const draftError = ref<UiError | null>(null)
 const saving = ref(false)
 const pendingCapture = ref<PendingCapture | null>(null)
-const savedPath = ref('')
+const savedMessage = ref('')
 const saveError = ref<UiError | null>(null)
 const closing = ref(false)
 const exitRequested = ref(false)
@@ -33,27 +40,106 @@ const composing = ref(false)
 const windowError = ref<UiError | null>(null)
 const copyStatus = ref('')
 
+// [[ wikilink autocomplete state
+const wikiPages = ref<WikiCandidate[]>([])
+const acDismissedAt = ref(-1)
+const acActiveIdx = ref(0)
+
 let draftWrite: Promise<boolean> | undefined
 let draftTimer: number | undefined
 const draftDebounceMs = 300
 const unlisteners: (() => void)[] = []
 let disposed = false
 
-const captureFolderLabel = computed(() => workspace.value?.captureDir || 'notes')
-const canSave = computed(() => !opening.value && !saving.value && !closing.value && !composing.value
-  && Boolean(pendingCapture.value || body.value.trim()))
+const captureFolderLabel = computed(() => workspace.value?.captureDir || 'raw/notes')
+const canSave = computed(
+  () =>
+    !opening.value
+    && !saving.value
+    && !closing.value
+    && !composing.value
+    && Boolean(pendingCapture.value || body.value.trim()),
+)
+const hasWriteError = computed(() => Boolean(draftError.value || saveError.value))
 const showEscape = computed(() => Boolean(draftError.value || saveError.value || windowError.value || recoveryErrors.value.length))
 
+const acMatch = computed(() => {
+  const m = body.value.match(/\[\[([^\]\n]{0,40})$/)
+  if (!m) return null
+  const start = body.value.length - m[0].length
+  if (acDismissedAt.value === start) return null
+  return { start, query: m[1].trim().toLowerCase() }
+})
+
+const acSuggestions = computed(() => {
+  if (!acMatch.value) return []
+  const q = acMatch.value.query
+  const filtered = wikiPages.value.filter(
+    (p) => !q || p.title.toLowerCase().includes(q) || p.path.toLowerCase().includes(q),
+  )
+  return filtered.slice(0, 6)
+})
+
+const showAc = computed(() => Boolean(acMatch.value && acSuggestions.value.length > 0 && !composing.value))
+
 const draftStatus = computed(() => {
+  if (composing.value) return '中文组词期：Enter 与 Esc 优先交给输入法'
   if (saving.value) return '正在保存原文…'
+  if (savedMessage.value) return savedMessage.value
   if (revision.value !== persistedRevision.value) {
-    return draftError.value ? '最新编辑尚未落盘' : '正在保留草稿…'
+    return draftError.value ? '最新编辑暂存内存（写盘失败）' : '正在保留草稿…'
   }
-  return body.value ? '草稿已保留' : '等待输入'
+  return body.value ? 'Esc 仅收起并保留草稿，绝不误提交' : '支持 Markdown 与输入 [[ 关联已有知识页'
 })
 
 function focusCaptureEditor() {
   editor.value?.focus()
+}
+
+function syncThemeFromCache() {
+  const cached = readCachedPreferences()
+  document.body.dataset.theme = cached.theme
+  document.body.dataset.width = cached.docWidth
+  if (!document.body.dataset.density) document.body.dataset.density = 'standard'
+}
+
+function loadCachedWikiCandidates() {
+  try {
+    const raw = window.localStorage.getItem(WIKRA_WIKI_CACHE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) wikiPages.value = parsed
+    }
+  } catch {
+    // Ignore invalid cache.
+  }
+}
+
+async function syncThemeFromSettings() {
+  syncThemeFromCache()
+  try {
+    const s = await api.getAppSettings()
+    applyBodyPreferences(s.theme === 'paper' ? 'paper' : 'slate', s.docWidth === 'full' ? 'full' : 'readable')
+  } catch {
+    // Main-window-only settings command falls back cleanly to shared localStorage theme cache.
+  }
+}
+
+async function loadWikiCandidates(session: string) {
+  loadCachedWikiCandidates()
+  try {
+    const tree = await api.listLibraryTree(session)
+    if (workspace.value?.session === session) {
+      wikiPages.value = tree.wikiPages.map((p) => ({ path: p.path, title: p.title, typeLabel: p.typeLabel }))
+    }
+  } catch {
+    // Cached candidates from main window remain active.
+  }
+}
+
+function handleStorageSync(event: StorageEvent) {
+  if (event.key === WIKRA_PREFS_STORAGE_KEY) syncThemeFromCache()
+  if (event.key === WIKRA_WIKI_CACHE_KEY) loadCachedWikiCandidates()
 }
 
 function scheduleDraftPersist() {
@@ -75,28 +161,42 @@ const editorBody = computed({
   set: (value: string) => {
     if (value === body.value) return
     pendingCapture.value = null
-    savedPath.value = ''
+    savedMessage.value = ''
+    saveError.value = null
+    acDismissedAt.value = -1
+    acActiveIdx.value = 0
     body.value = value
     revision.value += 1
     scheduleDraftPersist()
   },
 })
 
+function insertWikilink(page: WikiCandidate) {
+  const m = acMatch.value
+  if (!m) return
+  const next = `${body.value.slice(0, m.start)}[[${page.title}]]`
+  editorBody.value = next
+  void nextTick(focusCaptureEditor)
+}
+
 function applyWorkspace(opened: OpenedWorkspace) {
   window.clearTimeout(draftTimer)
   draftWrite = undefined
   closing.value = composing.value = false
   windowError.value = null
+  acDismissedAt.value = -1
+  acActiveIdx.value = 0
   workspace.value = { session: opened.session, root: opened.root, captureDir: opened.captureDir }
   revision.value = persistedRevision.value = opened.draft.revision
   body.value = opened.draft.body ?? ''
   recoveredPaths.value = opened.recovered
   recoveryErrors.value = opened.recoveryErrors
   pendingCapture.value = opened.pendingRequestId
-    ? { requestId: opened.pendingRequestId, revision: opened.draft.revision, body: body.value }
+    ? { requestId: opened.pendingRequestId, revision: opened.draft.revision, body: body.value, mode: 'queue' }
     : null
-  savedPath.value = ''
+  savedMessage.value = ''
   saveError.value = draftError.value = null
+  void loadWikiCandidates(opened.session)
   void nextTick(focusCaptureEditor)
 }
 
@@ -106,7 +206,9 @@ function trackUnlisten(unlisten: () => void) {
 }
 
 onMounted(async () => {
-  window.addEventListener('keydown', handleWindowKey)
+  window.addEventListener('keydown', handleWindowKey, true)
+  window.addEventListener('storage', handleStorageSync)
+  await syncThemeFromSettings()
   try {
     if (desktopWindow) {
       trackUnlisten(await desktopWindow.onCloseRequested(async (event) => {
@@ -118,6 +220,7 @@ onMounted(async () => {
         exitRequested.value = false
         workspaceError.value = null
         copyStatus.value = ''
+        void syncThemeFromSettings()
         applyWorkspace(payload)
       }))
       trackUnlisten(await desktopWindow.listen('capture-focus-editor', focusCaptureEditor))
@@ -138,7 +241,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true
-  window.removeEventListener('keydown', handleWindowKey)
+  window.removeEventListener('keydown', handleWindowKey, true)
+  window.removeEventListener('storage', handleStorageSync)
   window.clearTimeout(draftTimer)
   for (const unlisten of unlisteners.splice(0)) unlisten()
 })
@@ -177,32 +281,41 @@ async function flushDraft(current: NonNullable<typeof workspace.value>) {
   }
 }
 
-async function save() {
+async function commitWithMode(mode: CaptureCommitMode) {
   const current = workspace.value
   if (!current || !canSave.value) return
   saving.value = true
   saveError.value = null
-  savedPath.value = ''
+  savedMessage.value = ''
+  let succeeded = false
   try {
     if (!(await flushDraftNow())) return
-    const capture = pendingCapture.value ?? {
-      requestId: `${Date.now()}-${crypto.randomUUID()}`,
-      revision: revision.value,
-      body: body.value,
-    }
+    const capture: PendingCapture = pendingCapture.value && pendingCapture.value.body === body.value
+      ? { ...pendingCapture.value, mode }
+      : {
+          requestId: `${Date.now()}-${crypto.randomUUID()}`,
+          revision: revision.value,
+          body: body.value,
+          mode,
+        }
     pendingCapture.value = capture
-    const path = await api.commitCapture(current.session, capture.requestId, capture.revision, capture.body)
-    await api.confirmCapture(current.session, capture.requestId)
+    const res = await api.commitCaptureV2(current.session, capture.requestId, capture.revision, capture.body, mode)
+    await api.confirmCapture(current.session, capture.requestId).catch(() => false)
     recoveryErrors.value = recoveryErrors.value.filter(({ requestId }) => requestId !== capture.requestId)
     pendingCapture.value = null
     if (revision.value === capture.revision) body.value = ''
-    savedPath.value = path
+    savedMessage.value = mode === 'only'
+      ? '已保存为原文笔记'
+      : mode === 'now'
+        ? '已保存并立即整理'
+        : `已保存原文（${res.bufferSecondsLeft} 秒后自动整理）`
+    succeeded = true
   } catch (error) {
     saveError.value = parseAppError(error)
   } finally {
     saving.value = false
   }
-  if (savedPath.value) await closeCapture()
+  if (succeeded) await closeCapture(true)
 }
 
 async function closeCapture(ignoreDraft = false) {
@@ -219,7 +332,7 @@ async function closeCapture(ignoreDraft = false) {
   windowError.value = null
   try {
     window.clearTimeout(draftTimer)
-    if (!ignoreDraft && workspace.value && !(await flushDraftNow())) return
+    if (!ignoreDraft && workspace.value && body.value.trim() && !(await flushDraftNow())) return
     opening.value = true
     await nextTick()
     await api.closeCaptureWindow(exitRequested.value)
@@ -235,20 +348,60 @@ async function copyMarkdown(text: string) {
   copyStatus.value = ''
   try {
     await navigator.clipboard.writeText(text)
-    copyStatus.value = '已复制 Markdown'
+    copyStatus.value = '已复制全文到剪贴板'
   } catch {
     copyStatus.value = '无法访问剪贴板，请选中正文后手动复制。'
   }
 }
 
 function handleWindowKey(event: KeyboardEvent) {
+  // Level 1: IME composing priority — never intercept Enter or Esc during IME composition!
   if (composing.value || event.isComposing || event.keyCode === 229) return
+
+  // Handle [[ autocomplete navigation & selection
+  if (showAc.value) {
+    if (event.key === 'Escape') {
+      // Level 2: Close [[ autocomplete popup first
+      event.preventDefault()
+      event.stopPropagation()
+      if (acMatch.value) acDismissedAt.value = acMatch.value.start
+      return
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      acActiveIdx.value = (acActiveIdx.value + 1) % acSuggestions.value.length
+      return
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      acActiveIdx.value = (acActiveIdx.value - 1 + acSuggestions.value.length) % acSuggestions.value.length
+      return
+    }
+    if (event.key === 'Enter' && !event.ctrlKey && !event.shiftKey) {
+      event.preventDefault()
+      event.stopPropagation()
+      const picked = acSuggestions.value[acActiveIdx.value] || acSuggestions.value[0]
+      if (picked) insertWikilink(picked)
+      return
+    }
+  }
+
   if (event.key === 'Escape') {
     event.preventDefault()
-    void closeCapture()
-  } else if (event.ctrlKey && event.key === 'Enter') {
+    // Level 3 (empty -> close immediately) & Level 4 (non-empty -> persist draft and hide, never submit)
+    void closeCapture(!body.value.trim())
+    return
+  }
+
+  if (event.ctrlKey && event.shiftKey && event.key === 'Enter') {
     event.preventDefault()
-    void save()
+    void commitWithMode('now')
+    return
+  }
+
+  if (event.ctrlKey && event.key === 'Enter') {
+    event.preventDefault()
+    void commitWithMode('queue')
   }
 }
 </script>
@@ -257,56 +410,126 @@ function handleWindowKey(event: KeyboardEvent) {
   <main class="capture-shell">
     <header class="capture-header">
       <div class="capture-identity">
-        <UiIcon name="terminal" />
-        <h1>随手记</h1>
+        <span class="pill accent">随手记</span>
+        <span style="font-size:11.5px;color:var(--muted);">
+          存为本地 Markdown 原文（<span class="mono">{{ captureFolderLabel }}</span>）
+        </span>
       </div>
-      <code v-if="workspace" class="destination" :title="workspace.captureDir || workspace.root">
-        <UiIcon name="folder" /> {{ captureFolderLabel }}
-      </code>
-      <div class="window-drag" aria-hidden="true" @mousedown.left="dragWindow" />
+      <div class="capture-drag" aria-hidden="true" @mousedown.left="dragWindow" />
+      <button
+        type="button"
+        class="icon-btn"
+        title="收起浮窗并保留草稿 (Esc)"
+        aria-label="收起浮窗"
+        :disabled="saving || closing"
+        @click="closeCapture(!body.trim())"
+      >&times;</button>
     </header>
 
-    <form v-if="workspace && !opening" class="capture-form" @submit.prevent="save">
+    <form v-if="workspace && !opening" class="capture-form" @submit.prevent="commitWithMode('queue')">
       <div class="capture-content">
         <CaptureEditor
           ref="editor"
           v-model="editorBody"
           :readonly="saving || closing"
+          placeholder-text="记下想法，支持 Markdown 语法与输入 [[ 关联已有知识页…"
           @composition-change="composing = $event"
           @blur="!draftError && !closing && !composing && flushDraftNow()"
           @ready="nextTick(focusCaptureEditor)"
         />
-        <div v-if="draftError || saveError || windowError || recoveredPaths.length || recoveryErrors.length || copyStatus" class="capture-notices">
-          <ErrorNotice :error="draftError" suffix="。请重试保留草稿，或复制正文。" />
-          <ErrorNotice :error="saveError" suffix="。可以继续编辑、重试保存或复制正文。" />
+
+        <div v-if="showAc" class="hud-autocomplete" role="listbox" aria-label="双链补全候选">
+          <button
+            v-for="(p, idx) in acSuggestions"
+            :key="p.path"
+            type="button"
+            class="hud-ac-item"
+            :class="{ active: idx === acActiveIdx }"
+            @mousedown.prevent="insertWikilink(p)"
+          >
+            <span>[[{{ p.title }}]]</span>
+            <span style="color:var(--muted);">{{ p.typeLabel }}</span>
+          </button>
+        </div>
+
+        <div v-if="hasWriteError" class="hud-error-bar" role="alert">
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <strong>写入磁盘失败：内容仅暂存内存（退出程序前有效），请先复制全文备份。</strong>
+            <span style="font-size:11.5px;color:var(--text-secondary);">
+              {{ (saveError || draftError)?.safeMessage }}
+            </span>
+          </div>
+          <div style="display:flex;gap:6px;flex:none;">
+            <button type="button" class="btn primary sm" :disabled="!body" @click="copyMarkdown(body)">
+              复制全文
+            </button>
+            <button v-if="draftError" type="button" class="btn sm" :disabled="saving || closing" @click="flushDraftNow">
+              重试落盘
+            </button>
+            <button type="button" class="btn sm" :disabled="saving || closing" @click="closeCapture(true)">
+              {{ exitRequested ? '忽略草稿并退出' : '暂存内存并收起' }}
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="windowError || recoveredPaths.length || recoveryErrors.length || copyStatus"
+          style="padding:8px 14px;display:flex;flex-direction:column;gap:6px;background:var(--surface);border-top:1px solid var(--line-subtle);"
+        >
           <ErrorNotice :error="windowError" />
-          <p v-if="recoveredPaths.length" class="notice success" role="status">已恢复 {{ recoveredPaths.length }} 条随手记</p>
-          <p v-for="item in recoveryErrors" :key="item.requestId" class="notice error" role="alert">恢复遇到问题。{{ item.message }}</p>
-          <p v-if="copyStatus" class="notice" role="status">{{ copyStatus }}</p>
-          <div v-if="showEscape" class="actions">
-            <button v-if="draftError" type="button" :disabled="saving || closing" @click="flushDraftNow">重试保留草稿</button>
-            <button type="button" :disabled="!body" @click="copyMarkdown(body)">复制正文</button>
-            <button type="button" :disabled="saving || closing" @click="closeCapture(true)">{{ exitRequested ? '忽略草稿并退出应用' : '忽略草稿强制关闭' }}</button>
+          <p v-if="recoveredPaths.length" class="notice success" role="status">
+            已恢复 {{ recoveredPaths.length }} 条随手记
+          </p>
+          <p v-for="item in recoveryErrors" :key="item.requestId" class="notice error" role="alert">
+            恢复遇到问题：{{ item.message }}
+          </p>
+          <p v-if="copyStatus" class="notice success" role="status">{{ copyStatus }}</p>
+          <div v-if="showEscape && !hasWriteError" style="display:flex;gap:6px;">
+            <button type="button" class="btn primary sm" :disabled="!body" @click="copyMarkdown(body)">复制全文</button>
+            <button type="button" class="btn sm" :disabled="saving || closing" @click="closeCapture(true)">
+              {{ exitRequested ? '忽略草稿并退出应用' : '忽略草稿强制关闭' }}
+            </button>
           </div>
         </div>
       </div>
+
       <footer class="capture-footer">
-        <p class="draft-state" role="status">
-          <span class="status-dot" :class="{ good: savedPath || (body && !draftError && revision === persistedRevision) }" />
-          {{ savedPath ? '已保存原文' : draftStatus }}
-        </p>
-        <div class="actions">
-          <button type="button" class="quiet" :disabled="saving || closing" @click="closeCapture()">{{ exitRequested ? '保留草稿并退出' : '关闭' }} <kbd>Esc</kbd></button>
-          <button type="submit" class="primary" :disabled="!canSave">
-            {{ pendingCapture ? '重试保存' : '保存并返回' }} <kbd>Ctrl+Enter</kbd>
+        <span style="font-size:11.5px;color:var(--muted);" role="status">
+          <span
+            class="status-dot"
+            :class="{ off: !body || Boolean(draftError) || revision !== persistedRevision }"
+          />
+          {{ draftStatus }}
+        </span>
+
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <button
+            type="button"
+            class="btn quiet sm"
+            :disabled="!canSave"
+            @click="commitWithMode('only')"
+          >仅保存原文</button>
+          <button
+            type="button"
+            class="btn sm"
+            :disabled="!canSave"
+            @click="commitWithMode('now')"
+          >立即整理 <kbd>Ctrl+Shift+Enter</kbd></button>
+          <button
+            type="submit"
+            class="btn primary sm"
+            :disabled="!canSave"
+          >
+            {{ pendingCapture ? '重试保存' : '保存并整理' }} <kbd class="hud-kbd-inline">Ctrl+Enter</kbd>
           </button>
         </div>
       </footer>
     </form>
+
     <div v-else class="capture-placeholder">
-      <p v-if="opening" role="status">正在读取草稿…</p>
+      <p v-if="opening" role="status" class="hint">正在读取草稿…</p>
       <ErrorNotice v-else :error="workspaceError" />
-      <button v-if="!opening" type="button" @click="closeCapture()">关闭</button>
+      <button v-if="!opening" type="button" class="btn sm" @click="closeCapture(true)">关闭</button>
     </div>
   </main>
 </template>
