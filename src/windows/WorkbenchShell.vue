@@ -18,6 +18,8 @@ import SettingsModal from '../components/wikra/SettingsModal.vue'
 import VaultOnboardingModal from '../components/wikra/VaultOnboardingModal.vue'
 import WikiDocumentView from '../components/wikra/WikiDocumentView.vue'
 import type {
+  ChangesetItem,
+  ConflictItem,
   ConflictStatus,
   DocCitation,
   DocTaskItem,
@@ -31,14 +33,15 @@ import type {
   IntegrationsConfig,
   KnowledgeGraph,
   LibraryTree,
+  LintReport,
   MemoryConfig,
   ModelConfig,
   OpenedWorkspace,
   OrganizeOverview,
   ThemeName,
+  WikilinkCandidate,
 } from '../m2'
 import {
-  WIKRA_WIKI_CACHE_KEY,
   applyBodyPreferences,
   formatCountdown,
   isUserTypingInEditor,
@@ -159,6 +162,15 @@ const revertingId = ref('')
 const resolvingConflict = ref(false)
 const conflictError = ref<UiError | null>(null)
 
+// P0: Structure Lint cache, Wikilink candidates, Rollback & child-revert feedback
+const wikilinkCandidates = ref<WikilinkCandidate[]>([])
+const lintReport = ref<LintReport | null>(null)
+const lintLoading = ref(false)
+const lintError = ref<UiError | null>(null)
+const lintFilterPagePath = ref<string | null>(null)
+const rollbackFeedbackByCs = ref<Record<string, string>>({})
+const revertBlockedByCs = ref<Record<string, { message: string; childIds: string[] }>>({})
+
 const knowledgeGraph = ref<KnowledgeGraph | null>(null)
 const graphLoading = ref(false)
 const graphError = ref<UiError | null>(null)
@@ -223,6 +235,26 @@ const showRightPane = computed(() => Boolean(workspace.value) && isRightOpen.val
 const openConflicts = computed(() =>
   (organizeOverview.value?.conflicts || []).filter((c) => c.status === 'open'),
 )
+const pendingReviewPageCount = computed(() => {
+  const keys = new Set<string>()
+  for (const cs of organizeOverview.value?.changesets || []) {
+    if (cs.status === 'reverted') continue
+    for (const op of cs.ops || []) {
+      if (op.outcome === 'pending_review') {
+        keys.add(`${cs.id}::${op.targetPath}`)
+      }
+    }
+  }
+  return keys.size
+})
+const organizeAttentionCount = computed(() => openConflicts.value.length + pendingReviewPageCount.value)
+const activePageLintFindings = computed(() => {
+  const docPath = activeDoc.value?.kind === 'wiki' ? activeDoc.value.path : ''
+  if (!docPath || !lintReport.value) return []
+  return lintReport.value.findings.filter(
+    (f) => !f.dismissed && f.pagePath === docPath && (f.severity === 'error' || f.severity === 'warn'),
+  )
+})
 const inboxPendingCount = computed(() =>
   inboxItems.value.filter((i) => i.state === 'unread' || i.state === 'reading').length,
 )
@@ -423,6 +455,12 @@ function applyWorkspace(opened: OpenedWorkspace) {
   searchQuery.value = ''
   searchOpen.value = false
   searchHits.value = []
+  wikilinkCandidates.value = []
+  lintReport.value = null
+  lintError.value = null
+  lintFilterPagePath.value = null
+  rollbackFeedbackByCs.value = {}
+  revertBlockedByCs.value = {}
 
   if (opened.recovered.length > 0) {
     showToast(`已自动恢复 ${opened.recovered.length} 条未完成随手记`)
@@ -436,7 +474,46 @@ async function refreshAllData(session: string, openInitialDoc = false) {
     refreshLibraryTree(openInitialDoc),
     refreshInboxList(),
     refreshOrganizeOverview(),
+    refreshWikilinkCandidates(session),
   ])
+  // Background L1 structure lint cache so wiki toolbar badge appears without blocking open.
+  void refreshLintReport(true)
+}
+
+async function refreshWikilinkCandidates(sessionOverride?: string) {
+  const session = sessionOverride || workspace.value?.session
+  if (!session) return
+  try {
+    const list = await api.listWikilinkCandidates(session)
+    if (workspace.value?.session === session) {
+      wikilinkCandidates.value = list
+    }
+  } catch {
+    // Non-fatal: keep existing candidates.
+  }
+}
+
+async function refreshLintReport(fromBackground = false) {
+  const session = workspace.value?.session
+  if (!session) return
+  if (!fromBackground) {
+    lintLoading.value = true
+    lintError.value = null
+  }
+  try {
+    const report = await api.runStructureLint(session)
+    if (workspace.value?.session === session) {
+      lintReport.value = report
+    }
+  } catch (err) {
+    if (!fromBackground && workspace.value?.session === session) {
+      lintError.value = parseAppError(err)
+    }
+  } finally {
+    if (!fromBackground && workspace.value?.session === session) {
+      lintLoading.value = false
+    }
+  }
 }
 
 async function refreshIntegrations(session: string) {
@@ -463,14 +540,7 @@ async function refreshLibraryTree(openInitial = false) {
     if (tree.rawDir && workspace.value && workspace.value.rawDir !== tree.rawDir) {
       workspace.value = { ...workspace.value, rawDir: tree.rawDir }
     }
-    try {
-      window.localStorage.setItem(
-        WIKRA_WIKI_CACHE_KEY,
-        JSON.stringify(tree.wikiPages.map((p) => ({ path: p.path, title: p.title, typeLabel: p.typeLabel }))),
-      )
-    } catch {
-      // Ignore storage restrictions.
-    }
+    void refreshWikilinkCandidates(session)
     if (openInitial && !openDocTabs.value.length) {
       if (tree.wikiPages.length > 0) {
         void openWikiPage(tree.wikiPages[0].path)
@@ -694,6 +764,7 @@ function switchWorkspace(ws: 'library' | 'inbox' | 'organize' | 'graph') {
     activeWorkspace.value = 'organize'
     resetRecallIfDifferentPage(undefined)
     void refreshOrganizeOverview()
+    void refreshLintReport(!lintReport.value ? false : true)
     return
   }
   if (ws === 'graph') {
@@ -760,7 +831,16 @@ function handleDocumentSaved(updated: DocumentDetail) {
   activeDoc.value = updated
   externalChangedPaths.value = { ...externalChangedPaths.value, [updated.path]: false }
   void refreshLibraryTree()
+  void refreshLintReport(true)
   showToast('已保存修改至本地 Markdown 文件')
+}
+
+function handleOpenPageLint(path: string) {
+  lintFilterPagePath.value = path
+  activeWorkspace.value = 'organize'
+  resetRecallIfDifferentPage(undefined)
+  void refreshOrganizeOverview()
+  void refreshLintReport(false)
 }
 
 async function handleToggleTask(task: DocTaskItem) {
@@ -928,12 +1008,22 @@ async function handleCompileInbox(mode: 'excerpt' | 'full' | 'archive') {
     const updated = await api.compileInboxItem(session, item.id, mode)
     activeInbox.value = updated
     await Promise.all([refreshInboxList(), refreshLibraryTree(), refreshOrganizeOverview(true)])
-    showToast(
-      mode === 'archive'
-        ? '已存档，原文仍保留在知识库「原文」中可随时阅读'
-        : '已完成提炼并更新知识库',
-      mode === 'archive' ? undefined : [{ label: '查看整理记录', onClick: () => switchWorkspace('organize') }],
-    )
+    void refreshLintReport(true)
+    if (mode === 'archive') {
+      showToast('已存档，原文仍保留在知识库「原文」中可随时阅读')
+    } else if (updated.compileSummary) {
+      const s = updated.compileSummary
+      const parts = [`已写入 ${s.applied} 处`]
+      if (s.pending > 0) parts.push(`${s.pending} 处等待你确认`)
+      if (s.remainingParagraphs > 0) parts.push(`剩余 ${s.remainingParagraphs} 段可继续提炼`)
+      showToast(`已完成提炼：${parts.join('，')}`, [
+        { label: '查看整理记录', onClick: () => switchWorkspace('organize') },
+      ])
+    } else {
+      showToast('已完成提炼并更新知识库', [
+        { label: '查看整理记录', onClick: () => switchWorkspace('organize') },
+      ])
+    }
   } catch (err) {
     inboxError.value = parseAppError(err)
   } finally {
@@ -1003,26 +1093,91 @@ async function handleRevertChangeset(id: string) {
   if (!session || revertingId.value) return
   revertingId.value = id
   try {
-    await api.revertChangeset(session, id)
+    const res = await api.revertChangeset(session, id)
+
+    // Clear blocked error for this changeset and any parent changeset unblocked by reverting this child.
+    const nextBlocked = { ...revertBlockedByCs.value }
+    delete nextBlocked[id]
+    for (const [parentId, entry] of Object.entries(nextBlocked)) {
+      const remaining = entry.childIds.filter((cid) => cid !== id)
+      if (remaining.length !== entry.childIds.length) {
+        if (remaining.length === 0) delete nextBlocked[parentId]
+        else nextBlocked[parentId] = { ...entry, childIds: remaining }
+      }
+    }
+    revertBlockedByCs.value = nextBlocked
+
+    const restoredUnique = Array.from(new Set(res.restored || []))
+    const keptUnique = Array.from(new Set(res.keptModified || []))
+    const pageTitleMap = new Map<string, string>()
+    for (const p of res.changeset.pages || []) pageTitleMap.set(p.path, p.title)
+    const resolveTitle = (path: string) =>
+      pageTitleMap.get(path)
+      || wikiTitleMap.value[path]
+      || path.split('/').pop()?.replace(/\.md$/i, '')
+      || path
+
+    let feedback = ''
+    if (restoredUnique.length > 0 && keptUnique.length > 0) {
+      const keptLabels = keptUnique.map((p) => `《${resolveTitle(p)}》`).join('、')
+      feedback = `已还原 ${restoredUnique.length} 篇；${keptLabels}因你后续手动修改，已原样保留。`
+    } else if (restoredUnique.length === 0 && keptUnique.length > 0) {
+      const keptLabels = keptUnique.map((p) => `《${resolveTitle(p)}》`).join('、')
+      feedback = `${keptLabels}因你后续手动修改，已原样保留。`
+    } else if (restoredUnique.length > 0) {
+      feedback = `已还原 ${restoredUnique.length} 篇知识页（你手动写的内容保持不动）。`
+    } else {
+      feedback = '已撤销此次整理并清理待确认项。'
+    }
+
+    rollbackFeedbackByCs.value = { ...rollbackFeedbackByCs.value, [id]: feedback }
     await Promise.all([refreshOrganizeOverview(), refreshLibraryTree()])
+    void refreshLintReport(true)
     if (activeDoc.value) void loadDocument(activeDoc.value.path)
-    showToast('已撤销该次整理（你手动写的内容保持不动）')
+    showToast(feedback)
   } catch (err) {
-    showToast(parseAppError(err).safeMessage)
+    const parsed = parseAppError(err)
+    const childIds = (organizeOverview.value?.changesets || [])
+      .filter((c) => c.parentId === id && c.status !== 'reverted')
+      .map((c) => c.id)
+    revertBlockedByCs.value = {
+      ...revertBlockedByCs.value,
+      [id]: { message: parsed.safeMessage, childIds },
+    }
+    if (activeWorkspace.value !== 'organize') {
+      showToast(parsed.safeMessage, [
+        { label: '去整理页查看', onClick: () => switchWorkspace('organize') },
+      ])
+    }
   } finally {
     revertingId.value = ''
   }
 }
 
-async function handleDismissSuggestion(id: string) {
-  const session = workspace.value?.session
-  if (!session) return
-  try {
-    await api.dismissSuggestion(session, id)
-    await refreshOrganizeOverview(true)
-  } catch (err) {
-    showToast(parseAppError(err).safeMessage)
-  }
+function handleLintUpdated(report: LintReport) {
+  lintReport.value = report
+  void Promise.all([refreshOrganizeOverview(true), refreshLibraryTree()])
+  if (activeDoc.value) void loadDocument(activeDoc.value.path, true)
+}
+
+async function handleReviewDecided(payload: {
+  decision: 'apply' | 'discard'
+  changeset: ChangesetItem
+  pageTitle: string
+}) {
+  await Promise.all([refreshOrganizeOverview(), refreshLibraryTree()])
+  void refreshLintReport(true)
+  if (activeDoc.value) void loadDocument(activeDoc.value.path, true)
+  showToast(
+    payload.decision === 'apply'
+      ? `已采纳并写入《${payload.pageTitle}》，随时可一键撤销`
+      : `已丢弃《${payload.pageTitle}》的待审改动`,
+  )
+}
+
+async function handleEscalatedConflict(_conflict: ConflictItem) {
+  await Promise.all([refreshOrganizeOverview(), refreshLibraryTree()])
+  showToast('已转为观点冲突，可在上方卡片左右对比确认')
 }
 
 async function handleResolveConflict(payload: {
@@ -1255,6 +1410,7 @@ onMounted(async () => {
       trackUnlisten(await desktopWindow.listen<{ summary?: string; changesetId?: string }>('wikra-organize-finished', ({ payload }) => {
         void refreshOrganizeOverview(true)
         void refreshLibraryTree()
+        void refreshLintReport(true)
         if (activeDoc.value) void loadDocument(activeDoc.value.path, true)
         if (payload?.summary) {
           showToast(payload.summary, [
@@ -1469,13 +1625,13 @@ onUnmounted(() => {
             type="button"
             class="nav-item"
             :class="{ active: activeWorkspace === 'organize' }"
-            title="整理（查看 AI 整理记录与需要你确认的冲突）"
+            title="整理（查看 AI 整理记录、体检与需要你确认的冲突）"
             :disabled="!workspace"
             @click="switchWorkspace('organize')"
           >
             <UiIcon name="sparkles" size="lg" />
             <span class="nav-label">整理</span>
-            <span v-if="openConflicts.length > 0" class="nav-badge warn">{{ openConflicts.length }}</span>
+            <span v-if="organizeAttentionCount > 0" class="nav-badge warn">{{ organizeAttentionCount }}</span>
           </button>
 
           <button
@@ -1580,20 +1736,33 @@ onUnmounted(() => {
 
           <OrganizeView
             v-if="activeWorkspace === 'organize'"
+            :session="workspace.session"
             :overview="organizeOverview"
             :loading="organizeLoading"
             :error="organizeError"
             :buffer-seconds-left="bufferSecondsLeft"
             :reverting-id="revertingId"
+            :lint-report="lintReport"
+            :lint-loading="lintLoading"
+            :lint-error="lintError"
+            :filter-page-path="lintFilterPagePath"
+            :active-wiki-path="activePagePath"
+            :wiki-pages="libraryTree.wikiPages"
+            :rollback-feedback-by-cs="rollbackFeedbackByCs"
+            :revert-blocked-by-cs="revertBlockedByCs"
             @go-library="switchWorkspace('library')"
             @open-capture="openQuickCapture"
             @open-conflict="openConflictReview"
             @open-wiki="openWikiPage"
-            @start-teachback="startTeachback"
-            @dismiss-suggestion="handleDismissSuggestion"
             @open-buffer-queue="bufferModalOpen = true"
             @flush-buffer="handleFlushBufferNow"
             @revert-changeset="handleRevertChangeset"
+            @refresh-lint="refreshLintReport(false)"
+            @clear-lint-filter="lintFilterPagePath = null"
+            @lint-updated="handleLintUpdated"
+            @review-decided="handleReviewDecided"
+            @escalated-conflict="handleEscalatedConflict"
+            @toast="showToast"
           />
 
           <KnowledgeGraphView
@@ -1665,12 +1834,16 @@ onUnmounted(() => {
             :evidence-raw-doc="evidenceRawDoc"
             :evidence-loading="evidenceLoading"
             :external-changed="Boolean(activeDoc && externalChangedPaths[activeDoc.path])"
+            :wikilink-candidates="wikilinkCandidates"
+            :page-lint-findings="activePageLintFindings"
             @toggle-width="toggleDocWidth"
             @toggle-split-origin="toggleSplitOrigin"
             @open-evidence="openEvidenceSplit"
             @close-evidence="closeEvidenceSplit"
             @open-raw="openRawFile"
             @open-wikilink="handleOpenWikilink"
+            @open-wiki-path="openWikiPage"
+            @open-page-lint="handleOpenPageLint"
             @open-conflict="openConflictReview"
             @start-teachback="startTeachback"
             @exit-curtain="exitTeachback"
@@ -1680,6 +1853,7 @@ onUnmounted(() => {
             @reload-doc="loadDocument($event, false)"
             @dismiss-external="activeDoc && (externalChangedPaths = { ...externalChangedPaths, [activeDoc.path]: false })"
             @toggle-task="handleToggleTask"
+            @toast="showToast"
           />
         </main>
 

@@ -4,11 +4,15 @@ use rusqlite::Transaction;
 
 use super::*;
 
-mod documents;
+pub(crate) mod agent;
+pub(crate) mod documents;
 pub(crate) mod inbox;
-mod markdown;
+pub(crate) mod lint;
+pub(crate) mod markdown;
 pub(crate) mod organize;
 
+#[cfg(test)]
+mod p0_tests;
 #[cfg(test)]
 mod tests;
 
@@ -40,6 +44,43 @@ CREATE TABLE IF NOT EXISTS capture_buffer_queue (
 );
 CREATE TABLE IF NOT EXISTS dismissed_suggestions (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS dismissed_graph_gaps (id TEXT PRIMARY KEY);";
+
+pub(super) const MIGRATE_V8: &str = "
+ALTER TABLE wikra_changesets ADD COLUMN parent_id TEXT REFERENCES wikra_changesets(id);
+ALTER TABLE wikra_changesets ADD COLUMN note TEXT NOT NULL DEFAULT '';
+ALTER TABLE wikra_changesets ADD COLUMN dropped_claims INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS wikra_changeset_pages (
+    changeset_id TEXT NOT NULL REFERENCES wikra_changesets(id) ON DELETE CASCADE,
+    path TEXT NOT NULL, title TEXT NOT NULL, before_snapshot TEXT, after_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('applied', 'reverted', 'kept_modified')),
+    PRIMARY KEY (changeset_id, path)
+);
+CREATE TABLE IF NOT EXISTS wikra_changeset_ops (
+    changeset_id TEXT NOT NULL REFERENCES wikra_changesets(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL, op TEXT NOT NULL, page_path TEXT NOT NULL, page_title TEXT NOT NULL,
+    label TEXT NOT NULL, payload_json TEXT NOT NULL, base_hash TEXT,
+    outcome TEXT NOT NULL CHECK(outcome IN ('applied', 'pending_review', 'discarded', 'dropped')),
+    reason TEXT NOT NULL DEFAULT '', conflict_id TEXT REFERENCES conflicts(id),
+    child_changeset_id TEXT REFERENCES wikra_changesets(id),
+    PRIMARY KEY (changeset_id, seq)
+);
+CREATE INDEX IF NOT EXISTS wikra_changeset_ops_pending ON wikra_changeset_ops(outcome, page_path);
+CREATE TABLE IF NOT EXISTS wikra_lint_findings (
+    id TEXT PRIMARY KEY, rule TEXT NOT NULL, paths_json TEXT NOT NULL, page_hashes_json TEXT NOT NULL,
+    detail_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO wikra_changeset_pages (changeset_id, path, title, before_snapshot, after_hash, state)
+SELECT id, target_path, target_title, before_snapshot, after_hash,
+       CASE status WHEN 'reverted' THEN 'reverted' ELSE 'applied' END
+FROM wikra_changesets;
+INSERT OR IGNORE INTO wikra_changeset_ops (changeset_id, seq, op, page_path, page_title, label, payload_json, outcome)
+SELECT id, 1, CASE WHEN before_snapshot IS NULL THEN 'create_page' ELSE 'append_section' END,
+       target_path, target_title, op_label, '{}',
+       CASE status WHEN 'reverted' THEN 'discarded' ELSE 'applied' END
+FROM wikra_changesets;
+UPDATE wikra_changesets SET before_snapshot = NULL;";
 
 fn invalid(stage: &'static str, message: &'static str) -> StorageError {
     error("INVALID_INPUT", stage, None, false, message, message)
@@ -130,47 +171,76 @@ impl MarkdownEdit {
         after: Option<&str>,
         stage: &'static str,
     ) -> Result<String, StorageError> {
+        let key = self.key.clone();
+        MarkdownBatch(vec![(self, after.map(str::to_owned))]).commit(tx, stage)?;
+        Ok(key)
+    }
+}
+
+#[derive(Default)]
+struct MarkdownBatch(Vec<(MarkdownEdit, Option<String>)>);
+
+impl MarkdownBatch {
+    fn push(&mut self, edit: MarkdownEdit, after: Option<String>) {
+        self.0.push((edit, after));
+    }
+
+    fn commit(self, tx: Transaction<'_>, stage: &'static str) -> Result<(), StorageError> {
         let db = |err| database_error(stage, None, err);
-        match after {
-            Some(body) => wiki::update_wiki_index(&tx, &self.key, body)?,
-            None => {
-                tx.execute(
-                    "DELETE FROM search_documents WHERE relative_path = ?1",
-                    [&self.key],
-                )
-                .map_err(db)?;
+        for (edit, after) in &self.0 {
+            match after {
+                Some(body) => wiki::update_wiki_index(&tx, &edit.key, body)?,
+                None => {
+                    tx.execute(
+                        "DELETE FROM search_documents WHERE relative_path = ?1",
+                        [&edit.key],
+                    )
+                    .map_err(db)?;
+                }
             }
         }
-        let before = self.before.as_deref();
-        write_edit(&self.path, before, after).map_err(|err| {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                conflict(stage, "Markdown 已在外部被修改，请刷新后重试")
-            } else {
-                error(
-                    "WRITE_FAILED",
-                    stage,
-                    None,
-                    true,
-                    "无法写入 Markdown 文件",
-                    err,
-                )
+        for (index, (edit, after)) in self.0.iter().enumerate() {
+            if let Err(err) = write_edit(&edit.path, edit.before.as_deref(), after.as_deref()) {
+                let failure = if err.kind() == io::ErrorKind::AlreadyExists
+                    || err.kind() == io::ErrorKind::NotFound && edit.before.is_some()
+                {
+                    conflict(stage, "Markdown 已在外部被修改，请刷新后重试")
+                } else {
+                    error(
+                        "WRITE_FAILED",
+                        stage,
+                        None,
+                        true,
+                        "无法写入 Markdown 文件",
+                        err,
+                    )
+                };
+                return Err(self.restore(index, stage, failure));
             }
-        })?;
-        if let Err(err) = tx.commit() {
-            // The file is already visible. Restore only if it still matches our write.
-            if let Err(restore) = write_edit(&self.path, after, before) {
-                return Err(error(
-                    "WRITE_FAILED",
-                    stage,
-                    None,
-                    true,
-                    "状态库保存失败，请刷新并检查 Markdown 文件",
-                    format!("{err}; restoring Markdown: {restore}"),
-                ));
-            }
-            return Err(db(err));
         }
-        Ok(self.key)
+        tx.commit()
+            .map_err(|err| self.restore(self.0.len(), stage, db(err)))
+    }
+
+    fn restore(&self, written: usize, stage: &'static str, failure: StorageError) -> StorageError {
+        let mut errors = Vec::new();
+        for (edit, after) in self.0[..written].iter().rev() {
+            if let Err(err) = write_edit(&edit.path, after.as_deref(), edit.before.as_deref()) {
+                errors.push(format!("{}: {err}", edit.key));
+            }
+        }
+        if errors.is_empty() {
+            failure
+        } else {
+            error(
+                "WRITE_FAILED",
+                stage,
+                None,
+                true,
+                "部分文件未能恢复，请检查当前 Markdown",
+                format!("{}; {}", failure.technical_detail, errors.join("; ")),
+            )
+        }
     }
 }
 

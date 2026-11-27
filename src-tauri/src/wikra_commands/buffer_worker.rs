@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::capture_commands::active_workspace;
 use crate::dto::AppError;
-use crate::dto::wikra::ChangesetItemDto;
+use crate::dto::wikra::{ChangesetItemDto, CompileSummaryDto};
 use crate::settings;
 use crate::storage::WorkspaceStorage;
 use crate::storage::wikra::organize::ModelAccess;
@@ -174,8 +174,9 @@ fn process_due(app: &AppHandle, workspace: &WorkspaceStorage) -> Result<(), AppE
         .as_ref()
         .is_ok_and(|preferences| preferences.quiet_organize);
     let payload = match result {
-        Ok(changeset) => json!({
+        Ok((changeset, summary)) => json!({
             "changesetId": changeset.id,
+            "compileSummary": summary,
             "quietOrganize": quiet,
             "summary": (!quiet).then_some(changeset.summary),
         }),
@@ -199,20 +200,22 @@ fn compile_batch(
     workspace: &WorkspaceStorage,
     ids: &[String],
     allow_fulltext: bool,
-) -> Result<ChangesetItemDto, AppError> {
+) -> Result<(ChangesetItemDto, CompileSummaryDto), AppError> {
     if !allow_fulltext {
         return Err(AppError::invalid(
             "wikra_organize",
             "随手记全文发送已关闭，可在设置中启用后重新整理",
         ));
     }
-    let (batch, model) = workspace.with_storage(|storage| {
+    let (batch, model, context) = workspace.with_storage(|storage| {
         let model = ModelAccess::load(storage)?.ok_or_else(|| {
             AppError::invalid("wikra_organize", "请先在设置中配置并启用模型，再重新整理")
         })?;
-        Ok::<_, AppError>((storage.prepare_buffer_batch(ids)?, model))
+        let batch = storage.prepare_buffer_batch(ids)?;
+        let context = storage.prepare_compilation(&batch.sources)?;
+        Ok::<_, AppError>((batch, model, context))
     })?;
-    let output = model.compile(&batch.sources)?;
+    let output = model.compile(context, &batch.sources)?;
     workspace
         .with_storage(|storage| storage.apply_buffer_compilation(&batch, &model.alias, output))
         .map_err(AppError::from)

@@ -9,6 +9,8 @@ pub mod dto;
 mod hotkeys;
 #[cfg(windows)]
 mod m2_commands;
+#[cfg(windows)]
+pub mod mcp;
 mod memory;
 mod model;
 mod platform;
@@ -113,7 +115,22 @@ pub fn run() {
             wikra_commands::list_organize_overview,
             wikra_commands::cancel_buffer_item,
             wikra_commands::flush_buffer_now,
+            wikra_commands::get_changeset_detail,
+            wikra_commands::decide_review,
             wikra_commands::revert_changeset,
+            wikra_commands::run_structure_lint,
+            wikra_commands::apply_lint_fix,
+            wikra_commands::undismiss_suggestion,
+            wikra_commands::preview_semantic_lint,
+            wikra_commands::run_semantic_lint,
+            wikra_commands::escalate_lint_to_conflict,
+            capture_commands::list_wikilink_candidates,
+            wikra_commands::resolve_wikilink,
+            wikra_commands::read_citation_context,
+            wikra_commands::get_agent_integration,
+            wikra_commands::set_mcp_raw_allow,
+            wikra_commands::export_vault_skill,
+            wikra_commands::test_mcp_stdio,
             wikra_commands::dismiss_suggestion,
             wikra_commands::teachback_turn,
             wikra_commands::save_answer_to_wiki,

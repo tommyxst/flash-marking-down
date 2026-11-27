@@ -182,14 +182,15 @@ pub(crate) async fn compile_inbox_item(
         let model = ModelAccess::load(storage)?.ok_or_else(|| {
             AppError::invalid("wikra_inbox", "请先在设置中配置并启用模型，再整理原文")
         })?;
-        Ok(Some((item, model)))
+        let context = storage.prepare_compilation(&item.sources)?;
+        Ok(Some((item, model, context)))
     })
     .await?;
-    let Some((item, model)) = prepare else {
+    let Some((item, model, context)) = prepare else {
         return read_workspace(window, session, move |storage| Ok(storage.inbox_item(&id)?)).await;
     };
     let (item, alias, output) = blocking(move || {
-        let output = model.compile(&item.sources)?;
+        let output = model.compile(context, &item.sources)?;
         Ok((item, model.alias, output))
     })
     .await?;
@@ -250,11 +251,191 @@ pub(crate) async fn revert_changeset(
     window: WebviewWindow,
     session: String,
     changeset_id: String,
-) -> CommandResult<ChangesetItemDto> {
+) -> CommandResult<RevertChangesetResultDto> {
     with_workspace(window, session, move |storage| {
         Ok(storage.revert_changeset(&changeset_id)?)
     })
     .await
+}
+
+#[tauri::command]
+pub(crate) async fn get_changeset_detail(
+    window: WebviewWindow,
+    session: String,
+    changeset_id: String,
+) -> CommandResult<ChangesetDetailDto> {
+    read_workspace(window, session, move |storage| {
+        Ok(storage.get_changeset_detail(&changeset_id)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn decide_review(
+    window: WebviewWindow,
+    session: String,
+    changeset_id: String,
+    path: String,
+    decision: ReviewDecision,
+) -> CommandResult<ChangesetItemDto> {
+    with_workspace(window, session, move |storage| {
+        Ok(storage.decide_review(&changeset_id, &path, decision)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn run_structure_lint(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<LintReportDto> {
+    read_workspace(window, session, |storage| Ok(storage.run_structure_lint()?)).await
+}
+
+#[tauri::command]
+pub(crate) async fn apply_lint_fix(
+    window: WebviewWindow,
+    session: String,
+    finding_ids: Vec<String>,
+) -> CommandResult<LintFixResultDto> {
+    with_workspace(window, session, move |storage| {
+        Ok(storage.apply_lint_fix(&finding_ids)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn undismiss_suggestion(
+    window: WebviewWindow,
+    session: String,
+    suggestion_id: String,
+) -> CommandResult<()> {
+    with_workspace(window, session, move |storage| {
+        Ok(storage.undismiss_suggestion(&suggestion_id)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn preview_semantic_lint(
+    window: WebviewWindow,
+    session: String,
+    scope: SemanticLintScope,
+) -> CommandResult<SemanticLintPreviewDto> {
+    read_workspace(window, session, move |storage| {
+        Ok(storage.preview_semantic_lint(&scope)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn run_semantic_lint(
+    window: WebviewWindow,
+    session: String,
+    scope: SemanticLintScope,
+) -> CommandResult<Vec<LintFindingDto>> {
+    let (plan, model) = read_workspace(window.clone(), session.clone(), move |storage| {
+        let plan = storage.prepare_semantic_lint(&scope)?;
+        let model = if plan.needs_model() {
+            Some(ModelAccess::load(storage)?.ok_or_else(|| {
+                AppError::invalid("wikra_lint", "请先在设置中配置并启用模型，再运行语义体检")
+            })?)
+        } else {
+            None
+        };
+        Ok((plan, model))
+    })
+    .await?;
+    let (plan, findings) = blocking(move || {
+        let findings = if let Some(model) = model {
+            plan.run(&model)?
+        } else {
+            Vec::new()
+        };
+        Ok((plan, findings))
+    })
+    .await?;
+    with_workspace(window, session, move |storage| {
+        Ok(storage.finish_semantic_lint(plan, findings)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn escalate_lint_to_conflict(
+    window: WebviewWindow,
+    session: String,
+    finding_id: String,
+) -> CommandResult<crate::dto::ConflictDto> {
+    with_workspace(window, session, move |storage| {
+        storage.escalate_lint_to_conflict(&finding_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn resolve_wikilink(
+    window: WebviewWindow,
+    session: String,
+    from_path: String,
+    target: String,
+) -> CommandResult<WikilinkResolutionDto> {
+    read_workspace(window, session, move |storage| {
+        Ok(storage.resolve_wikilink(&from_path, &target)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn read_citation_context(
+    window: WebviewWindow,
+    session: String,
+    page_path: String,
+    ref_label: String,
+) -> CommandResult<CitationContextDto> {
+    read_workspace(window, session, move |storage| {
+        Ok(storage.read_citation_context(&page_path, &ref_label)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn get_agent_integration(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<AgentIntegrationDto> {
+    read_workspace(window, session, |storage| {
+        Ok(storage.get_agent_integration()?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn set_mcp_raw_allow(
+    window: WebviewWindow,
+    session: String,
+    folders: Vec<String>,
+) -> CommandResult<Vec<String>> {
+    with_workspace(window, session, move |storage| {
+        Ok(storage.set_mcp_raw_allow(&folders)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn export_vault_skill(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<ExportSkillResultDto> {
+    with_workspace(window, session, |storage| Ok(storage.export_vault_skill()?)).await
+}
+
+#[tauri::command]
+pub(crate) async fn test_mcp_stdio(
+    window: WebviewWindow,
+    session: String,
+) -> CommandResult<McpTestResultDto> {
+    read_workspace(window, session, |storage| Ok(storage.test_mcp_stdio())).await
 }
 
 #[tauri::command]

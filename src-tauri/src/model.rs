@@ -249,9 +249,34 @@ pub(crate) fn generate_with(
     instruction: &str,
     input: Value,
 ) -> Result<Value, String> {
+    let mut retries = JSON_RETRY_LIMIT;
+    generate_validated(
+        transport,
+        url,
+        model,
+        token,
+        instruction,
+        input,
+        &mut retries,
+        Ok,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_validated<T>(
+    transport: &dyn HttpTransport,
+    url: &Url,
+    model: &str,
+    token: Option<&str>,
+    instruction: &str,
+    input: Value,
+    retries: &mut usize,
+    validate: impl Fn(Value) -> Result<T, String>,
+) -> Result<T, String> {
     let user_content = input.to_string();
-    for attempt in 0..=JSON_RETRY_LIMIT {
-        let system = if attempt == 0 {
+    let mut retry = false;
+    loop {
+        let system = if !retry {
             instruction.to_owned()
         } else {
             format!("{instruction}\n\n{JSON_RETRY_NOTICE}")
@@ -274,13 +299,15 @@ pub(crate) fn generate_with(
         let text = message["message"]["content"]
             .as_str()
             .ok_or("模型未返回可用内容")?;
-        match extract_json_object(text) {
+        match extract_json_object(text).and_then(&validate) {
             Ok(value) => return Ok(value),
-            Err(error) if attempt == JSON_RETRY_LIMIT => return Err(error),
-            Err(_) => continue,
+            Err(error) if *retries == 0 => return Err(error),
+            Err(_) => {
+                *retries -= 1;
+                retry = true;
+            }
         }
     }
-    Err("模型输出不符合要求的 JSON 格式".into())
 }
 
 fn extract_json_object(raw: &str) -> Result<Value, String> {

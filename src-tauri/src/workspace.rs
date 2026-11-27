@@ -24,10 +24,19 @@ pub(crate) struct MarkdownEntry {
     pub(crate) relative_path: String,
     pub(crate) mtime_ns: i64,
     pub(crate) file_size: i64,
+    pub(crate) created_filetime: i64,
 }
 
 impl WorkspaceFiles {
     pub(crate) fn open(root: &Path, state_dir_name: &str) -> io::Result<Self> {
+        Self::open_layout(root, state_dir_name, true)
+    }
+
+    pub(crate) fn open_read_only(root: &Path) -> io::Result<Self> {
+        Self::open_layout(root, STATE_DIR, false)
+    }
+
+    fn open_layout(root: &Path, state_dir_name: &str, create: bool) -> io::Result<Self> {
         validate_component(OsStr::new(state_dir_name))?;
         let root = workspace_root(root)?;
         let state_dir_name = if state_dir_name == STATE_DIR
@@ -39,12 +48,18 @@ impl WorkspaceFiles {
             state_dir_name
         };
         let state = root.join(state_dir_name);
-        match fs::create_dir(&state) {
-            Ok(()) => (),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error),
+        if create {
+            match fs::create_dir(&state) {
+                Ok(()) => (),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error),
+            }
         }
-        let state = workspace_root(&state)?;
+        let state = match existing_path(&state)? {
+            Some(resolved) if resolved.is_dir() => resolved,
+            None if !create => state,
+            _ => return Err(scope_error("expected a state directory")),
+        };
         if state == root || !state.starts_with(&root) {
             return Err(scope_error("state directory is outside the workspace"));
         }
@@ -95,6 +110,15 @@ impl WorkspaceFiles {
             ));
         }
         self.key(&current)
+    }
+
+    pub(crate) fn directory_key(&self, relative: &Path) -> io::Result<String> {
+        validate_relative(relative)?;
+        let dir = workspace_root(&self.root.join(relative))?;
+        if dir == self.root {
+            return Err(scope_error("expected a workspace subfolder"));
+        }
+        self.key(&dir)
     }
 
     pub(crate) fn initialize_standard_layout(&self) -> io::Result<()> {
@@ -210,6 +234,7 @@ impl WorkspaceFiles {
                         relative_path: self.key(&path)?,
                         mtime_ns: metadata.last_write_time().min(i64::MAX as u64) as i64,
                         file_size: metadata.file_size().min(i64::MAX as u64) as i64,
+                        created_filetime: metadata.creation_time().min(i64::MAX as u64) as i64,
                     });
                 }
                 Ok(())

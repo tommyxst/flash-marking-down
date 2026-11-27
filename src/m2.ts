@@ -387,11 +387,13 @@ export interface LibraryDocSummary {
   folder: string
   docType: 'decision' | 'concept' | 'synthesis' | 'entity' | 'note' | string
   typeLabel: string
+  aliases: string[]
   tags: string[]
   updatedAt: string | null
   citationCount: number
   pendingConflictCount: number
   wikraCore: boolean
+  status?: string | null
 }
 
 export interface RawFileSummary {
@@ -445,6 +447,8 @@ export interface DocumentDetail {
   aliases: string[]
   tags: string[]
   wikraCore: boolean
+  status?: string | null
+  supersedes?: string[]
   sourceUrl: string | null
   pendingConflictIds: string[]
   outline: string[]
@@ -478,17 +482,41 @@ export interface InboxItemSummary {
   highlightCount: number
 }
 
+export interface CompileSummary {
+  changesetId: string
+  applied: number
+  pending: number
+  dropped: number
+  remainingParagraphs: number
+}
+
 export interface InboxItemDetail extends InboxItemSummary {
   summaryPoints: string[]
   relatedPagePaths: string[]
   paragraphs: InboxParagraph[]
+  compileSummary?: CompileSummary | null
 }
 
+export type ChangesetPageState = 'applied' | 'reverted' | 'kept_modified'
+
+export interface ChangesetPage {
+  path: string
+  title: string
+  state: ChangesetPageState | string
+}
+
+export type ChangesetOpOutcome = 'applied' | 'pending_review' | 'discarded' | 'dropped' | 'reverted'
+
 export interface ChangesetOp {
+  seq: number
+  op: 'create_page' | 'append_section' | 'replace_section' | 'add_link' | 'set_frontmatter_key' | string
   label: string
   targetPath: string
   targetTitle: string
-  outcome: 'applied' | 'pending_review' | 'reverted' | string
+  outcome: ChangesetOpOutcome | string
+  reason: string
+  conflictId: string | null
+  childChangesetId: string | null
 }
 
 export interface ChangesetItem {
@@ -496,10 +524,163 @@ export interface ChangesetItem {
   time: string
   trigger: string
   modelAlias: string
-  status: 'applied' | 'partial' | 'reverted'
+  status: 'applied' | 'partial' | 'reverted' | 'partially_reverted' | string
   summary: string
+  note: string
+  parentId: string | null
+  droppedClaims: number
   pagePaths: string[]
+  pages: ChangesetPage[]
   ops: ChangesetOp[]
+}
+
+export interface ChangesetPageDiff {
+  path: string
+  title: string
+  state: ChangesetPageState | string
+  hasPending: boolean
+  pendingReasons: string[]
+  hasProtectedSection: boolean
+  before: string | null
+  after: string | null
+  current: string | null
+  externallyModified: boolean
+}
+
+export interface ChangesetDetail {
+  changeset: ChangesetItem
+  pages: ChangesetPageDiff[]
+}
+
+export interface RevertChangesetResult {
+  changeset: ChangesetItem
+  restored: string[]
+  keptModified: string[]
+}
+
+export type SemanticLintScope =
+  | { kind: 'page'; path: string }
+  | { kind: 'recent'; days: number }
+  | { kind: 'folder'; path: string }
+
+export interface LintFindingFix {
+  kind: 'safe' | 'one_click'
+  label: string
+}
+
+export interface LintFindingEvidence {
+  quoteA: string
+  quoteB: string
+  pathA: string
+  pathB: string
+  titleA: string
+  titleB: string
+}
+
+export interface LintFinding {
+  id: string
+  layer: 'L1' | 'L2'
+  rule: string
+  severity: 'error' | 'warn' | 'info'
+  pagePath: string
+  pageTitle: string
+  line: number | null
+  relatedPaths: string[]
+  message: string
+  dismissed: boolean
+  fix: LintFindingFix | null
+  evidence: LintFindingEvidence | null
+}
+
+export interface LintReport {
+  generatedAt: string
+  pageCount: number
+  unreadable: number
+  durationMs: number
+  findings: LintFinding[]
+}
+
+export interface LintFixResult {
+  changeset: ChangesetItem | null
+  indexRebuilt: boolean
+  report: LintReport
+}
+
+export interface SemanticLintPreview {
+  pages: string[]
+  pageCount: number
+  pairCount: number
+  estimatedChars: number
+  modelAlias: string
+}
+
+export interface WikilinkCandidate {
+  path: string
+  stem: string
+  title: string
+  aliases: string[]
+  folder: string
+  typeLabel: string
+  linkText: string
+  ambiguousStem: boolean
+}
+
+export interface WikilinkMatch {
+  path: string
+  title: string
+  typeLabel: string
+  updatedAt: string | null
+}
+
+export interface WikilinkResolution {
+  status: 'unique' | 'ambiguous' | 'missing'
+  matches: WikilinkMatch[]
+}
+
+export interface CitationContext {
+  rawPath: string
+  quote: string
+  verified: boolean
+  paragraph: string | null
+  prev: string | null
+  next: string | null
+  reason: string | null
+}
+
+export interface RawDirOption {
+  path: string
+  fileCount: number
+  isCaptureDir: boolean
+}
+
+export interface AgentIntegrationSnippets {
+  claudeCli: string
+  mcpJson: string
+  codexToml: string
+}
+
+export interface AgentIntegration {
+  mcpExePath: string
+  mcpExeExists: boolean
+  vaultRoot: string
+  rawDir: string
+  rawDirs: RawDirOption[]
+  rawAllow: string[]
+  snippets: AgentIntegrationSnippets
+  skillPath: string
+  skillExists: boolean
+}
+
+export interface ExportSkillResult {
+  path: string
+  action: 'created' | 'updated' | 'unchanged'
+}
+
+export interface McpTestResult {
+  ok: boolean
+  protocolVersion: string | null
+  tools: string[]
+  error: string | null
 }
 
 export interface BufferQueueItem {

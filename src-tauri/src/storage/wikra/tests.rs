@@ -4,12 +4,13 @@ use crate::workspace::{LEGACY_STATE_DIR, STANDARD_CAPTURE_DIR, STATE_DIR};
 
 use super::super::tests::TestDir;
 use super::inbox::{CompileMode, prepare_clip};
+use super::organize::edit_ops::fixture_output;
 use super::organize::{
-    CaptureMode, CompilationOutput, ModelAccess, generate_teachback, local_teachback,
+    CaptureMode, CompilationOutput, ModelAccess, Source, generate_teachback, local_teachback,
 };
 use super::*;
 
-fn standard_vault(dir: &TestDir) -> Storage {
+pub(super) fn standard_vault(dir: &TestDir) -> Storage {
     let storage = Storage::open(&dir.0, Path::new(STANDARD_CAPTURE_DIR), STATE_DIR).unwrap();
     storage
         .workspace_files()
@@ -18,12 +19,38 @@ fn standard_vault(dir: &TestDir) -> Storage {
     storage
 }
 
-fn compiled_output(title: &str, points: &[(usize, &str)]) -> CompilationOutput {
+fn fixture_response(
+    title: &str,
+    target: Option<&str>,
+    points: &[(usize, &str)],
+) -> serde_json::Value {
     let points: Vec<_> = points.iter()
-        .map(|(source, quote)| json!({ "source": source, "quote": quote, "text": format!("要点：{quote}") }))
+        .map(|(source, quote)| json!({ "source": format!("s{source}"), "quote": quote, "text": format!("要点：{quote}") }))
         .collect();
-    serde_json::from_value(json!({ "title": title, "summary": "整理摘要", "points": points }))
-        .unwrap()
+    let units: Vec<_> = points.iter().map(|point| &point["source"]).collect();
+    let (target, op) = if let Some(target) = target {
+        (
+            json!(target),
+            json!({"op":"append_section","page":"p1","heading":title,"claims":points}),
+        )
+    } else {
+        (
+            json!({"new":{"type":"entity","title":title}}),
+            json!({"op":"create_page","page":"n1","lead":"","sections":[{"heading":"要点","claims":points}]}),
+        )
+    };
+    json!({"routes":[{"units":units,"target":target,"relation":"extends","why":""}],"summary":"整理摘要","ops":[op]})
+}
+
+fn compiled_output(
+    storage: &mut Storage,
+    sources: &[Source],
+    title: &str,
+    target: Option<&str>,
+    points: &[(usize, &str)],
+) -> CompilationOutput {
+    let context = storage.prepare_compilation(sources).unwrap();
+    fixture_output(context, sources, fixture_response(title, target, points))
 }
 
 #[test]
@@ -241,7 +268,7 @@ fn migrates_v1_v2_v5_and_v6_in_place_and_reopens_legacy_state() {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 7);
+            assert_eq!(version, 8);
             for name in [
                 "inbox_items",
                 "inbox_paragraphs",
@@ -586,7 +613,7 @@ fn saves_stub_receipts_and_only_completes_the_original_once() {
 fn compiles_only_marked_inbox_paragraphs_preserves_protection_and_reverts_safely() {
     let dir = TestDir::new();
     let mut storage = standard_vault(&dir);
-    let source = "# 合并规范\n\n第一段可引用\n\n第二段待阅读\r\n";
+    let source = "# 合并规范\n\n第一段可引用\n\n[[第一轮]] 第二段待阅读\r\n";
     let clip = storage
         .create_inbox_item(prepare_clip(source.to_owned(), None).unwrap())
         .unwrap();
@@ -609,24 +636,30 @@ fn compiles_only_marked_inbox_paragraphs_preserves_protection_and_reverts_safely
         .unwrap();
     assert_eq!(plan.sources.len(), 1);
     assert_eq!(plan.sources[0].text, "第一段可引用");
+    let invalid = compiled_output(
+        &mut storage,
+        &plan.sources,
+        "伪造",
+        None,
+        &[(1, "不在选段中的引文")],
+    );
     assert_eq!(
         storage
-            .apply_inbox_compilation(
-                &plan,
-                "fixture-model",
-                compiled_output("伪造", &[(1, "不在选段中的引文")])
-            )
+            .apply_inbox_compilation(&plan, "fixture-model", invalid)
             .err()
             .unwrap()
             .code,
         "INVALID_INPUT",
     );
+    let output = compiled_output(
+        &mut storage,
+        &plan.sources,
+        "第一轮",
+        None,
+        &[(1, "第一段可引用")],
+    );
     let partial = storage
-        .apply_inbox_compilation(
-            &plan,
-            "fixture-model",
-            compiled_output("第一轮", &[(1, "第一段可引用")]),
-        )
+        .apply_inbox_compilation(&plan, "fixture-model", output)
         .unwrap();
     assert!(partial.paragraphs[0].compiled);
     assert!(!partial.paragraphs[1].compiled);
@@ -650,16 +683,16 @@ fn compiles_only_marked_inbox_paragraphs_preserves_protection_and_reverts_safely
         .prepare_inbox_compile(id, CompileMode::Full)
         .unwrap()
         .unwrap();
-    assert!(
-        plan.sources[0].text.contains("第一段可引用")
-            && plan.sources[0].text.contains("第二段待阅读")
+    assert!(plan.sources.len() == 1 && plan.sources[0].text.contains("第二段待阅读"));
+    let output = compiled_output(
+        &mut storage,
+        &plan.sources,
+        "第二轮",
+        Some("c1"),
+        &[(1, "第二段待阅读")],
     );
     let full = storage
-        .apply_inbox_compilation(
-            &plan,
-            "fixture-model",
-            compiled_output("第二轮", &[(1, "第二段待阅读")]),
-        )
+        .apply_inbox_compilation(&plan, "fixture-model", output)
         .unwrap();
     assert!(full.paragraphs.iter().all(|p| p.compiled));
     let page_after = storage.read_document_detail(page).unwrap();
@@ -673,18 +706,17 @@ fn compiles_only_marked_inbox_paragraphs_preserves_protection_and_reverts_safely
         .remove(0);
     assert_eq!(change.page_paths, [page.as_str()]);
     assert_eq!(
-        storage.revert_changeset(&change.id).unwrap().status,
+        storage
+            .revert_changeset(&change.id)
+            .unwrap()
+            .changeset
+            .status,
         "reverted"
     );
     assert_eq!(storage.read_document_detail(page).unwrap().body, protected);
-    assert_eq!(
-        storage
-            .revert_changeset(&first_change.id)
-            .err()
-            .unwrap()
-            .code,
-        "VERSION_CONFLICT"
-    );
+    let first_revert = storage.revert_changeset(&first_change.id).unwrap();
+    assert_eq!(first_revert.changeset.status, "partially_reverted");
+    assert_eq!(first_revert.kept_modified, [page.as_str()]);
     let reverted = storage.inbox_item(id).unwrap();
     assert!(reverted.paragraphs[0].compiled && !reverted.paragraphs[1].compiled);
     assert_eq!(
@@ -761,12 +793,15 @@ fn capture_queue_is_idempotent_keeps_the_first_deadline_and_reverts_a_new_page()
     let ids = storage.due_buffer_items().unwrap();
     assert_eq!(ids, [a.record_id.clone(), c.record_id.clone()]);
     let batch = storage.prepare_buffer_batch(&ids).unwrap();
-    let changeset = storage
-        .apply_buffer_compilation(
-            &batch,
-            "fixture-model",
-            compiled_output("合批", &[(1, "缓冲原文一"), (2, "立即原文二")]),
-        )
+    let output = compiled_output(
+        &mut storage,
+        &batch.sources,
+        "合批",
+        None,
+        &[(1, "缓冲原文一"), (2, "立即原文二")],
+    );
+    let (changeset, _) = storage
+        .apply_buffer_compilation(&batch, "fixture-model", output)
         .unwrap();
     assert!(
         storage
@@ -786,7 +821,7 @@ fn capture_queue_is_idempotent_keeps_the_first_deadline_and_reverts_a_new_page()
             .all(|citation| citation.raw_path == a.relative_path)
     );
     let change = storage.revert_changeset(&changeset.id).unwrap();
-    assert_eq!(change.status, "reverted");
+    assert_eq!(change.changeset.status, "reverted");
     assert!(!dir.0.join(&changeset.page_paths[0]).exists());
     assert!(dir.0.join(&a.relative_path).is_file());
 }
@@ -974,10 +1009,7 @@ fn enabled_model_receives_selected_evidence_and_generates_teachback() {
             let completion = if stage == 0 {
                 assert_eq!(input["sources"].as_array().unwrap().len(), 1);
                 assert_eq!(input["sources"][0]["text"], "这句获准送入整理");
-                json!({
-                    "title": "选段整理", "summary": "摘要",
-                    "points": [{ "text": "结论适用于所选材料", "source": 1, "quote": "这句获准送入整理" }]
-                })
+                fixture_response("选段整理", None, &[(1, "这句获准送入整理")])
             } else {
                 assert_eq!(input["step"], 2);
                 assert_eq!(input["citations"][0]["quote"], "这句获准送入整理");
@@ -1001,7 +1033,8 @@ fn enabled_model_receives_selected_evidence_and_generates_teachback() {
         .unwrap()
         .unwrap();
     let model = ModelAccess::load(&storage).unwrap().unwrap();
-    let output = model.compile(&plan.sources).unwrap();
+    let context = storage.prepare_compilation(&plan.sources).unwrap();
+    let output = model.compile(context, &plan.sources).unwrap();
     let compiled = storage
         .apply_inbox_compilation(&plan, &model.alias, output)
         .unwrap();

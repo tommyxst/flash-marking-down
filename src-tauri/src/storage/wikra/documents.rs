@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::dto::wikra::*;
 
-use super::markdown::{Footnote, Markdown};
+use super::markdown::{Footnote, Markdown, match_quote, paragraph_slices};
 use super::*;
 
 const STAGE: &str = "wikra_document";
@@ -14,17 +14,17 @@ struct Clip {
     saved_at: String,
 }
 
-struct Document {
-    path: String,
-    title: String,
-    doc_type: String,
-    raw: bool,
+pub(crate) struct Document {
+    pub path: String,
+    pub title: String,
+    pub doc_type: String,
+    pub raw: bool,
     clip: Option<Clip>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    pending_conflict_ids: Vec<String>,
-    body: String,
-    parsed: Markdown,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub pending_conflict_ids: Vec<String>,
+    pub body: String,
+    pub parsed: Markdown,
 }
 
 impl Document {
@@ -45,82 +45,140 @@ impl Document {
             })
     }
 
-    fn meta(&self) -> bool {
-        let name = self.path.rsplit('/').next().unwrap_or_default();
-        ["index.md", "log.md", "SCHEMA.md"]
-            .iter()
-            .any(|meta| name.eq_ignore_ascii_case(meta))
+    pub(crate) fn meta(&self) -> bool {
+        meta_path(&self.path)
+    }
+
+    pub(crate) fn knowledge_page(&self) -> bool {
+        !self.raw && !self.meta() && in_directory(&self.path, "wiki")
     }
 }
 
-struct Catalog {
+pub(crate) fn meta_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    ["index.md", "log.md", "SCHEMA.md", "SKILL.md"]
+        .iter()
+        .any(|meta| name.eq_ignore_ascii_case(meta))
+}
+
+pub(crate) struct Catalog {
     raw_dir: String,
-    docs: Vec<Document>,
-    paths: HashMap<String, usize>,
-    names: HashMap<String, Option<usize>>,
+    pub docs: Vec<Document>,
+    pub paths: HashMap<String, usize>,
+    pub names: HashMap<String, Vec<usize>>,
+    pub unreadable: usize,
+}
+
+pub(crate) enum LinkResolution {
+    Unique(usize),
+    Ambiguous(Vec<usize>),
+    MissingAnchor(usize),
+    Missing,
+}
+
+impl LinkResolution {
+    pub(super) fn page(self) -> Option<usize> {
+        match self {
+            Self::Unique(id) | Self::MissingAnchor(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 impl Catalog {
-    fn load(storage: &Storage) -> Result<Self, StorageError> {
-        let raw_dir = storage.raw_dir();
-        let clips_dir = storage.clips_dir();
-        let db = |err| database_error(STAGE, None, err);
-        let mut notes = storage.connection.prepare(
-            "SELECT relative_path, min(captured_at) FROM notes WHERE draft_id <> 'manual' GROUP BY relative_path",
-        ).map_err(db)?;
-        let captured: HashMap<String, String> = notes
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?.to_lowercase(), row.get(1)?))
-            })
-            .map_err(db)?
-            .collect::<Result<_, _>>()
-            .map_err(db)?;
-        let mut clips = storage
-            .connection
-            .prepare("SELECT raw_path, id, title, url, saved_at FROM inbox_items")
-            .map_err(db)?;
-        let mut clips: HashMap<String, Clip> = clips
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?.to_lowercase(),
-                    Clip {
-                        id: row.get(1)?,
-                        title: row.get(2)?,
-                        url: row.get(3)?,
-                        saved_at: row.get(4)?,
-                    },
-                ))
-            })
-            .map_err(db)?
-            .collect::<Result<_, _>>()
-            .map_err(db)?;
-
-        let mut conflicts: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for item in storage
-            .list_conflicts()?
-            .into_iter()
-            .filter(|c| c.status == "open")
-        {
-            for path in [item.current_path, item.incoming_path]
-                .into_iter()
-                .flatten()
-            {
-                conflicts
-                    .entry(physical_path(&path).to_lowercase())
-                    .or_default()
-                    .insert(item.id.clone());
-            }
-        }
+    pub(crate) fn load(storage: &Storage) -> Result<Self, StorageError> {
         let files = storage.workspace_files();
-        let (mut entries, _) = files
+        let (entries, unreadable) = files
             .markdown_entries()
             .map_err(|err| source_error(STAGE, err))?;
+        Self::load_from(
+            &files,
+            Some(&storage.connection),
+            storage.raw_dir(),
+            storage.capture_dir(),
+            entries,
+            unreadable,
+        )
+    }
+
+    pub(crate) fn load_from(
+        files: &WorkspaceFiles,
+        conn: Option<&Connection>,
+        raw_dir: &str,
+        capture_dir: &str,
+        mut entries: Vec<crate::workspace::MarkdownEntry>,
+        mut unreadable: usize,
+    ) -> Result<Self, StorageError> {
+        let clips_dir = format!("{raw_dir}/clips");
+        let db = |err| database_error(STAGE, None, err);
+        let mut captured = HashMap::new();
+        let mut clips = HashMap::new();
+        let mut conflicts: HashMap<String, BTreeSet<String>> = HashMap::new();
+        if let Some(conn) = conn {
+            let mut notes = conn.prepare(
+            "SELECT relative_path, min(captured_at) FROM notes WHERE draft_id <> 'manual' GROUP BY relative_path",
+        ).map_err(db)?;
+            captured = notes
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?.to_lowercase(), row.get(1)?))
+                })
+                .map_err(db)?
+                .collect::<Result<_, _>>()
+                .map_err(db)?;
+            let mut query = conn
+                .prepare("SELECT raw_path, id, title, url, saved_at FROM inbox_items")
+                .map_err(db)?;
+            clips = query
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?.to_lowercase(),
+                        Clip {
+                            id: row.get(1)?,
+                            title: row.get(2)?,
+                            url: row.get(3)?,
+                            saved_at: row.get(4)?,
+                        },
+                    ))
+                })
+                .map_err(db)?
+                .collect::<Result<_, _>>()
+                .map_err(db)?;
+
+            let mut query = conn
+                .prepare(
+                    "SELECT id, current_path, incoming_path FROM conflicts WHERE status = 'open'",
+                )
+                .map_err(db)?;
+            let rows = query
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(db)?;
+            for (id, current, incoming) in rows.filter_map(Result::ok) {
+                for path in [current, incoming].into_iter().flatten() {
+                    conflicts
+                        .entry(physical_path(&path).to_lowercase())
+                        .or_default()
+                        .insert(id.clone());
+                }
+            }
+        }
         entries.sort_unstable_by(|a, b| a.relative_path.cmp(&b.relative_path));
         let mut docs = Vec::with_capacity(entries.len());
         let mut paths = HashMap::with_capacity(entries.len());
-        let mut names = HashMap::new();
-        let mut timestamp = storage
-            .connection
+        let mut names: HashMap<String, Vec<usize>> = HashMap::new();
+        let memory;
+        let timestamp_conn = if let Some(conn) = conn {
+            conn
+        } else {
+            memory = Connection::open_in_memory().map_err(db)?;
+            &memory
+        };
+        let mut timestamp = timestamp_conn
             .prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch')")
             .map_err(db)?;
         for entry in entries {
@@ -129,13 +187,14 @@ impl Catalog {
                 .read_markdown(&path)
                 .and_then(|bytes| String::from_utf8(bytes).map_err(io::Error::other))
             else {
+                unreadable += 1;
                 continue;
             };
             let key = path.to_lowercase();
             let parsed = Markdown::parse(&body);
             let clip = clips.remove(&key);
             let raw = in_directory(&path, raw_dir)
-                || in_directory(&path, storage.capture_dir())
+                || in_directory(&path, capture_dir)
                 || captured.contains_key(&key)
                 || clip.is_some();
             let doc_type = if raw {
@@ -178,6 +237,15 @@ impl Catalog {
                         .value("created")
                         .or_else(|| parsed.value("createdat"))
                         .map(str::to_owned)
+                })
+                .or_else(|| {
+                    timestamp
+                        .query_row(
+                            [entry.created_filetime / 10_000_000 - 11_644_473_600],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten()
                 });
             let mut pending_conflict_ids = parsed.conflicts();
             for id in conflicts.remove(&key).into_iter().flatten() {
@@ -190,14 +258,10 @@ impl Catalog {
                 .chain(std::iter::once(title.as_str()))
                 .chain(parsed.list("aliases").iter().map(String::as_str))
             {
-                names
-                    .entry(name.to_lowercase())
-                    .and_modify(|found| {
-                        if *found != Some(index) {
-                            *found = None;
-                        }
-                    })
-                    .or_insert(Some(index));
+                let matching = names.entry(name.to_lowercase()).or_default();
+                if matching.last() != Some(&index) {
+                    matching.push(index);
+                }
             }
             paths.insert(key, index);
             docs.push(Document {
@@ -218,55 +282,129 @@ impl Catalog {
             docs,
             paths,
             names,
+            unreadable,
         })
     }
 
-    fn resolve(&self, source: &str, target: &str) -> Option<usize> {
-        let target = physical_path(target)
-            .split('#')
-            .next()?
-            .trim()
-            .trim_matches('<')
-            .trim_end_matches('>');
-        if target.is_empty() || target.contains(':') || target.starts_with(['/', '\\']) {
-            return None;
+    pub(crate) fn resolve(&self, source: &str, target: &str) -> Option<usize> {
+        match self.resolve_link(source, target) {
+            LinkResolution::Unique(id) => Some(id),
+            _ => None,
         }
-        let decoded = percent_decode(target);
-        [target, decoded.as_str()].into_iter().find_map(|target| {
-            let relative = join_reference(parent_dir(source), target);
-            let root = (!target.starts_with('.'))
-                .then(|| join_reference("", target))
-                .flatten();
-            let root_first = target.starts_with("wiki/")
-                || target
-                    .strip_prefix(self.raw_dir.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'));
-            let options = if root_first {
-                [root, relative]
-            } else {
-                [relative, root]
-            };
-            options
-                .into_iter()
-                .flatten()
-                .find_map(|key| self.paths.get(&key.to_lowercase()).copied())
-                .or_else(|| {
-                    if target.contains(['/', '\\']) {
-                        return None;
-                    }
-                    self.names
-                        .get(&file_stem(target).to_lowercase())
-                        .copied()
-                        .flatten()
-                })
-        })
     }
 
-    fn citation(&self, doc: &Document, note: &Footnote) -> DocCitationDto {
+    pub(crate) fn resolve_link(&self, source: &str, target: &str) -> LinkResolution {
+        let target = physical_path(target.trim().trim_matches(['<', '>']));
+        let (target, anchor) = target.split_once('#').map_or_else(
+            || {
+                target
+                    .rsplit_once('^')
+                    .filter(|(_, id)| {
+                        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    })
+                    .map_or((target, None), |(path, id)| (path, Some(format!("^{id}"))))
+            },
+            |(path, anchor)| (path, Some(percent_decode(anchor))),
+        );
+        let matching = if target.is_empty() {
+            self.paths
+                .get(&source.to_lowercase())
+                .copied()
+                .into_iter()
+                .collect()
+        } else {
+            self.match_path(source, target)
+        };
+        match matching.as_slice() {
+            [] => LinkResolution::Missing,
+            &[id]
+                if anchor
+                    .as_ref()
+                    .is_some_and(|anchor| !self.docs[id].parsed.has_anchor(anchor)) =>
+            {
+                LinkResolution::MissingAnchor(id)
+            }
+            &[id] => LinkResolution::Unique(id),
+            _ => LinkResolution::Ambiguous(matching),
+        }
+    }
+
+    pub(super) fn named(&self, name: &str) -> &[usize] {
+        self.names
+            .get(&name.to_lowercase())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn stem_matches(&self, stem: &str) -> Vec<usize> {
+        let key = stem.to_lowercase();
+        self.named(stem)
+            .iter()
+            .copied()
+            .filter(|&id| file_stem(&self.docs[id].path).to_lowercase() == key)
+            .collect()
+    }
+
+    fn match_path(&self, source: &str, target: &str) -> Vec<usize> {
+        let decoded = percent_decode(target);
+        [target, decoded.as_str()]
+            .into_iter()
+            .find_map(|target| {
+                if target.is_empty() || target.contains(':') || target.starts_with(['/', '\\']) {
+                    return None;
+                }
+                let explicit = target.contains(['/', '\\']);
+                if !explicit {
+                    let stem = file_stem(target);
+                    let files = self.stem_matches(stem);
+                    if !files.is_empty() {
+                        return Some(files);
+                    }
+                    let names = self.named(stem);
+                    if !names.is_empty() {
+                        return Some(names.to_vec());
+                    }
+                }
+                let relative = join_reference(parent_dir(source), target);
+                let root = (!target.starts_with('.'))
+                    .then(|| join_reference("", target))
+                    .flatten();
+                let root_first = target.starts_with("wiki/")
+                    || target
+                        .strip_prefix(self.raw_dir.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'));
+                let options = if root_first {
+                    [root, relative]
+                } else {
+                    [relative, root]
+                };
+                if let Some(id) = options
+                    .into_iter()
+                    .flatten()
+                    .find_map(|key| self.paths.get(&key.to_lowercase()).copied())
+                {
+                    return Some(vec![id]);
+                }
+                if !explicit || target.starts_with('.') {
+                    return None;
+                }
+                let suffix = format!("/{}", join_reference("", target)?.to_lowercase());
+                let mut matches: Vec<_> = self
+                    .paths
+                    .iter()
+                    .filter(|(path, _)| path.ends_with(&suffix))
+                    .map(|(_, id)| *id)
+                    .collect();
+                matches.sort_unstable();
+                (!matches.is_empty()).then_some(matches)
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn citation(&self, doc: &Document, note: &Footnote) -> DocCitationDto {
         let raw_path = note
             .target
             .as_deref()
-            .and_then(|target| self.resolve(&doc.path, target))
+            .and_then(|target| self.resolve_link(&doc.path, target).page())
             .map(|id| &self.docs[id])
             .filter(|doc| doc.raw)
             .map(|doc| doc.path.clone());
@@ -279,24 +417,112 @@ impl Catalog {
         }
     }
 
-    fn relations<'a>(
+    pub(crate) fn citation_context(
+        &self,
+        files: &WorkspaceFiles,
+        page: &Document,
+        note: &Footnote,
+        allows: impl FnOnce(&str) -> bool,
+    ) -> CitationContextDto {
+        let mut response = CitationContextDto {
+            raw_path: self.citation(page, note).raw_path,
+            quote: note.quote.clone(),
+            verified: false,
+            paragraph: None,
+            prev: None,
+            next: None,
+            reason: None,
+        };
+        let marker = note
+            .target
+            .as_deref()
+            .and_then(|target| target.split_once(NOTE_ANCHOR))
+            .map(|(_, marker)| marker);
+        let raw = files
+            .markdown_file(&response.raw_path)
+            .ok()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(&response.raw_path))
+            .and_then(|(_, path)| fs::read_to_string(path).ok());
+        let Some(raw) = raw
+            .as_deref()
+            .and_then(|body| marker.map_or(Some(body), |marker| block_body(body, marker)))
+        else {
+            response.reason = Some("原文缺失");
+            return response;
+        };
+        let paragraphs = paragraph_slices(raw);
+        let matched = paragraphs
+            .iter()
+            .enumerate()
+            .find_map(|(index, paragraph)| {
+                match_quote(paragraph, &note.quote).map(|quote| (index, quote))
+            });
+        response.verified = matched.is_some();
+        if !allows(&response.raw_path) {
+            response.reason = Some("raw 未授权");
+        } else if let Some((index, quote)) = matched {
+            let current = paragraphs[index];
+            let start = quote.as_ptr() as usize - current.as_ptr() as usize;
+            let preceding: String = current[..start]
+                .chars()
+                .rev()
+                .take(240)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let current: String = preceding
+                .chars()
+                .chain(current[start..].chars())
+                .take(800)
+                .collect();
+            response.paragraph = Some(current);
+            response.prev = index.checked_sub(1).map(|i| {
+                paragraphs[i]
+                    .chars()
+                    .rev()
+                    .take(198)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            });
+            response.next = paragraphs
+                .get(index + 1)
+                .map(|next| next.chars().take(198).collect());
+        } else {
+            response.reason = Some("引文与原文不符");
+        }
+        response
+    }
+
+    pub(crate) fn relations<'a>(
         &'a self,
         doc: &'a Document,
     ) -> impl Iterator<Item = (usize, &'static str, &'a str, &'a str)> + 'a {
         doc.parsed
             .links
             .iter()
+            .filter(|_| !doc.meta())
             .filter_map(move |link| {
-                self.resolve(&doc.path, &link.target)
+                self.resolve_link(&doc.path, &link.target)
+                    .page()
                     .map(|to| (to, "link", link.label.as_str(), link.snippet.as_str()))
             })
-            .chain(doc.parsed.footnotes.iter().filter_map(move |note| {
-                self.resolve(&doc.path, note.target.as_deref()?)
-                    .map(|to| (to, "citation", note.label.as_str(), note.quote.as_str()))
-            }))
+            .chain(
+                doc.parsed
+                    .footnotes
+                    .iter()
+                    .filter(|_| !doc.meta())
+                    .filter_map(move |note| {
+                        self.resolve_link(&doc.path, note.target.as_deref()?)
+                            .page()
+                            .map(|to| (to, "citation", note.label.as_str(), note.quote.as_str()))
+                    }),
+            )
     }
 
-    fn incoming(&self, wiki_only: bool) -> Vec<Vec<DocBacklinkDto>> {
+    pub(crate) fn incoming(&self, wiki_only: bool) -> Vec<Vec<DocBacklinkDto>> {
         let mut incoming = (0..self.docs.len()).map(|_| Vec::new()).collect::<Vec<_>>();
         for (from, doc) in self
             .docs
@@ -320,6 +546,120 @@ impl Catalog {
 }
 
 impl Storage {
+    pub(crate) fn list_wikilink_candidates(
+        &self,
+    ) -> Result<Vec<WikilinkCandidateDto>, StorageError> {
+        let catalog = Catalog::load(self)?;
+        Ok(catalog
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(_, doc)| !doc.raw && !doc.meta())
+            .map(|(id, doc)| {
+                let stem = file_stem(&doc.path);
+                let ambiguous_stem = catalog.stem_matches(stem) != [id];
+                let target = if ambiguous_stem {
+                    let path = &doc.path[..doc.path.len() - 3];
+                    path.rmatch_indices('/')
+                        .map(|(index, _)| &path[index + 1..])
+                        .skip(1)
+                        .find(|candidate| {
+                            let name = format!("{candidate}.md").to_lowercase();
+                            catalog
+                                .paths
+                                .keys()
+                                .filter(|key| **key == name || key.ends_with(&format!("/{name}")))
+                                .count()
+                                == 1
+                        })
+                        .unwrap_or(path)
+                } else {
+                    stem
+                };
+                let link_text = if target == doc.title {
+                    format!("[[{target}]]")
+                } else {
+                    format!("[[{target}|{}]]", doc.title.replace(['|', '[', ']'], " "))
+                };
+                WikilinkCandidateDto {
+                    path: doc.path.clone(),
+                    stem: stem.to_owned(),
+                    title: doc.title.clone(),
+                    aliases: doc.parsed.list("aliases").to_vec(),
+                    folder: parent_dir(&doc.path).to_owned(),
+                    type_label: type_label(&doc.doc_type),
+                    link_text,
+                    ambiguous_stem,
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn resolve_wikilink(
+        &self,
+        from_path: &str,
+        target: &str,
+    ) -> Result<WikilinkResolutionDto, StorageError> {
+        let catalog = Catalog::load(self)?;
+        let from = if from_path.is_empty() {
+            String::new()
+        } else {
+            crate::workspace::normalize_workspace_subdir(Path::new(from_path))
+                .map_err(|_| invalid(STAGE, "链接起点不在工作区"))?
+        };
+        let target = target
+            .strip_prefix("[[")
+            .and_then(|s| s.strip_suffix("]]"))
+            .unwrap_or(target);
+        let target = target.split_once('|').map_or(target, |(name, _)| name);
+        let (status, matching) = match catalog.resolve_link(&from, target) {
+            LinkResolution::Unique(i) => ("unique", vec![i]),
+            LinkResolution::Ambiguous(ids) => ("ambiguous", ids),
+            _ => ("missing", Vec::new()),
+        };
+        Ok(WikilinkResolutionDto {
+            status,
+            matches: matching
+                .into_iter()
+                .map(|id| {
+                    let doc = &catalog.docs[id];
+                    WikilinkMatchDto {
+                        path: doc.path.clone(),
+                        title: doc.title.clone(),
+                        type_label: type_label(&doc.doc_type),
+                        updated_at: doc.updated_at.clone(),
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn read_citation_context(
+        &self,
+        page_path: &str,
+        ref_label: &str,
+    ) -> Result<CitationContextDto, StorageError> {
+        let catalog = Catalog::load(self)?;
+        let key = self
+            .workspace
+            .files
+            .markdown_key(page_path)
+            .map_err(|err| source_error(STAGE, err))?;
+        let doc = catalog
+            .paths
+            .get(&key.to_lowercase())
+            .map(|&i| &catalog.docs[i])
+            .filter(|doc| !doc.raw)
+            .ok_or_else(|| invalid(STAGE, "找不到知识页"))?;
+        let note = doc
+            .parsed
+            .footnotes
+            .iter()
+            .find(|note| note.ref_label == ref_label)
+            .ok_or_else(|| invalid(STAGE, "找不到该页引文"))?;
+        Ok(catalog.citation_context(&self.workspace.files, doc, note, |_| true))
+    }
+
     pub(crate) fn list_library_tree(&self) -> Result<LibraryTreeDto, StorageError> {
         let catalog = Catalog::load(self)?;
         let incoming = catalog.incoming(true);
@@ -352,6 +692,8 @@ impl Storage {
                     type_label: type_label(&doc.doc_type),
                     doc_type: doc.doc_type,
                     tags: doc.parsed.list("tags").to_vec(),
+                    aliases: doc.parsed.list("aliases").to_vec(),
+                    status: doc.parsed.value("status").map(str::to_owned),
                     updated_at: doc.updated_at,
                     citation_count: doc.parsed.footnotes.len(),
                     pending_conflict_count: doc.pending_conflict_ids.len(),
@@ -413,6 +755,8 @@ impl Storage {
             type_label: type_label(&doc.doc_type),
             doc_type: doc.doc_type,
             aliases: doc.parsed.list("aliases").to_vec(),
+            status: doc.parsed.value("status").map(str::to_owned),
+            supersedes: doc.parsed.list("supersedes").to_vec(),
             tags: doc.parsed.list("tags").to_vec(),
             wikra_core: doc.parsed.core(),
             source_url,
@@ -540,11 +884,15 @@ impl Storage {
                     snippet: snippet.to_owned(),
                 });
             }
-            if doc.raw {
+            if doc.raw || doc.meta() {
                 continue;
             }
             for link in &doc.parsed.links {
-                if catalog.resolve(&doc.path, &link.target).is_none() {
+                if catalog
+                    .resolve_link(&doc.path, &link.target)
+                    .page()
+                    .is_none()
+                {
                     let id = format!("missing:{}:{}", doc.path, link.target);
                     if !seen_gaps.insert(id.clone()) {
                         continue;
@@ -681,17 +1029,17 @@ impl Storage {
     }
 }
 
-pub(super) fn in_directory(path: &str, dir: &str) -> bool {
+pub(crate) fn in_directory(path: &str, dir: &str) -> bool {
     path.get(..dir.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(dir))
         && (path.len() == dir.len() || path.as_bytes().get(dir.len()) == Some(&b'/'))
 }
 
-fn parent_dir(path: &str) -> &str {
+pub(crate) fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-fn file_stem(path: &str) -> &str {
+pub(crate) fn file_stem(path: &str) -> &str {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.rsplit_once('.')
         .filter(|(_, ext)| ext.eq_ignore_ascii_case("md"))
@@ -748,7 +1096,7 @@ fn default_doc_type(path: &str) -> &'static str {
     "page"
 }
 
-fn type_label(doc_type: &str) -> &'static str {
+pub(crate) fn type_label(doc_type: &str) -> &'static str {
     match doc_type {
         "decision" => "决策",
         "concept" => "概念",
@@ -764,7 +1112,7 @@ fn raw_label(clip: bool) -> &'static str {
     if clip { "收藏原文" } else { "随手笔记" }
 }
 
-fn find_excerpt(text: &str, lowercase_query: &str) -> Option<String> {
+pub(crate) fn find_excerpt(text: &str, lowercase_query: &str) -> Option<String> {
     let lowercase = text.to_lowercase();
     let start = lowercase.find(lowercase_query)?;
     let position = lowercase[..start].chars().count();

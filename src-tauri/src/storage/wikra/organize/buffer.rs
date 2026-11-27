@@ -209,11 +209,12 @@ impl BufferBatch {
         &self,
         conn: &Connection,
         files: &WorkspaceFiles,
+        source_count: usize,
     ) -> Result<(), StorageError> {
         let mut statement = conn.prepare("SELECT EXISTS(SELECT 1 FROM capture_buffer_queue WHERE note_id = ?1 AND due_at IS NOT NULL)")
             .map_err(db)?;
         let changed = || conflict(STAGE, "整理中的随手记已有变化，请刷新后重新整理");
-        for (id, source) in self.ids.iter().zip(&self.sources) {
+        for (id, source) in self.ids.iter().zip(&self.sources).take(source_count) {
             if !statement
                 .query_row([id], |row| row.get::<_, bool>(0))
                 .map_err(db)?
@@ -229,12 +230,23 @@ impl BufferBatch {
         Ok(())
     }
 
-    pub(super) fn remove(&self, conn: &Connection) -> Result<(), StorageError> {
-        let mut statement = conn
+    pub(super) fn finish(
+        &self,
+        conn: &Connection,
+        compiled: &HashSet<usize>,
+    ) -> Result<(), StorageError> {
+        let mut remove = conn
             .prepare("DELETE FROM capture_buffer_queue WHERE note_id = ?1")
             .map_err(db)?;
-        for id in &self.ids {
-            statement.execute([id]).map_err(db)?;
+        let mut keep = conn
+            .prepare("UPDATE capture_buffer_queue SET due_at = NULL WHERE note_id = ?1")
+            .map_err(db)?;
+        for (i, id) in self.ids.iter().enumerate() {
+            if compiled.contains(&i) {
+                remove.execute([id]).map_err(db)?;
+            } else {
+                keep.execute([id]).map_err(db)?;
+            }
         }
         Ok(())
     }

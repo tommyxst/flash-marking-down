@@ -1,21 +1,28 @@
 <script setup lang="ts">
+import { closeCompletion, completionStatus, startCompletion } from '@codemirror/autocomplete'
 import { history, historyKeymap, insertNewline, standardKeymap } from '@codemirror/commands'
 import { markdownLanguage } from '@codemirror/lang-markdown'
 import { Compartment, EditorState, Text } from '@codemirror/state'
 import { EditorView, keymap, placeholder } from '@codemirror/view'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { captureMarkdown } from './captureMarkdown'
+import { createWikilinkAutocomplete, hasWikilinkTrigger } from './editor/wikilinkComplete'
+import type { WikilinkCandidate } from './m2'
 
 const props = withDefaults(defineProps<{
   readonly?: boolean
   placeholderText?: string
   autofocus?: boolean
   editorId?: string
+  wikilinkCandidates?: WikilinkCandidate[]
+  compactTooltip?: boolean
 }>(), {
   readonly: false,
   placeholderText: '记下现在想到的事…',
   autofocus: false,
   editorId: 'note',
+  wikilinkCandidates: undefined,
+  compactTooltip: false,
 })
 const model = defineModel<string>({ required: true })
 const emit = defineEmits<{ ready: []; blur: []; 'composition-change': [composing: boolean] }>()
@@ -27,6 +34,13 @@ let composing = false
 let compositionTimer: number | undefined
 let compositionSelection: EditorState | undefined
 
+function detectLineSeparator(text: string): '\r\n' | '\n' {
+  const totalLf = (text.match(/\n/g) || []).length
+  if (totalLf === 0) return '\n'
+  const crlf = (text.match(/\r\n/g) || []).length
+  return crlf > 0 && crlf >= totalLf - crlf ? '\r\n' : '\n'
+}
+
 function editMode() {
   return [EditorState.readOnly.of(props.readonly), EditorView.editable.of(!props.readonly)]
 }
@@ -36,6 +50,9 @@ function startComposition() {
   const state = view?.state
   compositionSelection = state && !state.selection.main.empty ? state : undefined
   composing = true
+  if (view && completionStatus(view.state) !== null) {
+    closeCompletion(view)
+  }
   emit('composition-change', true)
 }
 
@@ -52,19 +69,26 @@ function finishComposition(event: CompositionEvent) {
     }
     compositionSelection = undefined
     const { state } = view
-    if (!state.toText(model.value).eq(state.doc)) model.value = state.doc.toString()
+    const serialized = state.sliceDoc()
+    if (serialized !== model.value) model.value = serialized
     composing = false
     emit('composition-change', false)
+
+    // After IME commits (e.g., 【【 or Chinese query after [[), trigger wikilink completion if matching.
+    if (!props.readonly && (props.wikilinkCandidates?.length ?? 0) > 0 && hasWikilinkTrigger(view.state)) {
+      startCompletion(view)
+    }
   })
 }
 
-function newEditorState(doc: Text) {
+function newEditorState(doc: Text, lineSeparator: '\r\n' | '\n') {
   const enter = (editor: EditorView) => !editor.state.readOnly && insertNewline(editor)
   const nonce = document.querySelector<HTMLStyleElement>('#capture-editor-style')?.nonce
   return EditorState.create({
     doc,
     selection: { anchor: doc.length },
     extensions: [
+      EditorState.lineSeparator.of(lineSeparator),
       nonce ? EditorView.cspNonce.of(nonce) : [],
       EditorView.contentAttributes.of({ id: props.editorId, 'aria-label': 'Markdown 正文', tabindex: '0' }),
       EditorView.lineWrapping,
@@ -72,6 +96,11 @@ function newEditorState(doc: Text) {
       editable.of(editMode()),
       markdownLanguage,
       captureMarkdown,
+      createWikilinkAutocomplete({
+        getCandidates: () => props.wikilinkCandidates ?? [],
+        isComposing: () => composing,
+        compact: props.compactTooltip,
+      }),
       history(),
       keymap.of([
         { key: 'Enter', run: enter, shift: enter },
@@ -82,14 +111,18 @@ function newEditorState(doc: Text) {
         blur: () => { emit('blur') },
       }),
       EditorView.updateListener.of((update) => {
-        if (update.docChanged && !composing) model.value = update.state.doc.toString()
+        if (update.docChanged && !composing) {
+          const next = update.state.sliceDoc()
+          if (next !== model.value) model.value = next
+        }
       }),
     ],
   })
 }
 
 onMounted(() => {
-  const state = newEditorState(Text.of(model.value.split(/\r\n?|\n/)))
+  const lineSep = detectLineSeparator(model.value)
+  const state = newEditorState(Text.of(model.value.split(/\r\n?|\n/)), lineSep)
   view = new EditorView({ state, parent: host.value, scrollTo: EditorView.scrollIntoView(state.selection.main) })
   if (props.autofocus) view.focus()
   emit('ready')
@@ -107,11 +140,16 @@ watch(() => props.placeholderText, (value) => {
 })
 watch(model, (value) => {
   if (!view) return
-  const doc = view.state.toText(value)
-  if (!doc.eq(view.state.doc)) view.setState(newEditorState(doc))
+  if (value === view.state.sliceDoc()) return
+  const lineSep = detectLineSeparator(value)
+  const doc = Text.of(value.split(/\r\n?|\n/))
+  view.setState(newEditorState(doc, lineSep))
 })
 
-defineExpose({ focus: () => view?.focus() })
+defineExpose({
+  focus: () => view?.focus(),
+  isCompleting: () => Boolean(view && completionStatus(view.state) !== null),
+})
 </script>
 
 <template>
@@ -177,6 +215,7 @@ defineExpose({ focus: () => view?.focus() })
 .capture-editor :deep(.cm-md-strikethrough) { text-decoration: line-through; }
 .capture-editor :deep(.cm-md-code) { background: var(--surface); color: var(--text-secondary); }
 .capture-editor :deep(.cm-md-link) { color: var(--accent); text-decoration: underline; }
+.capture-editor :deep(.cm-md-wikilink) { color: var(--accent); }
 .capture-editor :deep(.cm-md-marker) { color: var(--accent); }
 .capture-editor :deep(.cm-md-syntax) { color: var(--accent); opacity: 0.78; }
 </style>

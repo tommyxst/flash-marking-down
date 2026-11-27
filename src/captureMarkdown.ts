@@ -44,6 +44,8 @@ const lineStyles = new Map([
   ['Blockquote', Decoration.line({ class: 'cm-md-quote-line' })],
 ])
 const link = Decoration.mark({ class: 'cm-md-link' })
+const wikilink = Decoration.mark({ class: 'cm-md-wikilink' })
+const WIKILINK_RE = /\[\[[^\]\r\n]+\]\]/g
 const inlineStyles = new Map([
   ['StrongEmphasis', Decoration.mark({ class: 'cm-md-strong' })],
   ['Emphasis', Decoration.mark({ class: 'cm-md-emphasis' })],
@@ -153,6 +155,33 @@ export function buildCaptureDecorations(state: EditorState, from: number, to: nu
       }
     },
   })
+
+  // Highlight closed [[wikilinks]] gently without concealing brackets.
+  const codeSpans: [number, number][] = []
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter(node) {
+      if (node.name === 'FencedCode' || node.name === 'CodeBlock' || node.name === 'InlineCode') {
+        codeSpans.push([node.from, node.to])
+        return false
+      }
+    },
+  })
+  const inCodeSpan = (pos: number) => codeSpans.some(([s, e]) => pos >= s && pos < e)
+  forEachLine(from, to, (line, lineStart, lineEnd) => {
+    const slice = doc.sliceString(lineStart, lineEnd)
+    WIKILINK_RE.lastIndex = 0
+    for (const match of slice.matchAll(WIKILINK_RE)) {
+      const idx = match.index ?? 0
+      const absFrom = lineStart + idx
+      const absTo = absFrom + match[0].length
+      if (!inCodeSpan(absFrom)) {
+        ranges.push(wikilink.range(absFrom, absTo))
+      }
+    }
+  })
+
   return Decoration.set(ranges, true)
 }
 

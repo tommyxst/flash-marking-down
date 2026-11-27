@@ -3,6 +3,11 @@ name = "wikra"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
+default-run = "wikra"
+
+[[bin]]
+name = "wikra-mcp"
+path = "src/bin/wikra_mcp.rs"
 
 [build-dependencies]
 tauri-build = { version = "=2.7.5", features = [] }

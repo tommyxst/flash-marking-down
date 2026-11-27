@@ -294,7 +294,6 @@ fn insert_paragraphs(
 
 pub(crate) struct InboxCompilation {
     pub(super) id: String,
-    pub(super) title: String,
     raw_path: String,
     expected_hash: String,
     state: String,
@@ -308,6 +307,7 @@ impl InboxCompilation {
         &self,
         conn: &Connection,
         files: &WorkspaceFiles,
+        source_count: usize,
     ) -> Result<(), StorageError> {
         let summary = item_summary(conn, &self.id)?;
         let conflicted = || conflict(STAGE, "收件箱原文、存档状态或选段已有变化，请刷新后重试");
@@ -322,7 +322,7 @@ impl InboxCompilation {
             return Err(conflicted());
         }
         let paragraphs = item_paragraphs(conn, &self.id)?;
-        for position in &self.positions {
+        for position in &self.positions[..source_count] {
             if !paragraphs.iter().any(|p| {
                 p.position == *position
                     && !p.compiled
@@ -375,9 +375,14 @@ impl Storage {
                     .collect()
             })
             .collect();
-        let mut pages = self.connection.prepare(
-            "SELECT DISTINCT target_path FROM wikra_changesets WHERE inbox_id = ?1 AND status = 'applied' ORDER BY target_path",
-        ).map_err(db)?;
+        let mut pages = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT p.path FROM wikra_changeset_pages p
+             JOIN wikra_changesets c ON c.id = p.changeset_id
+             WHERE c.inbox_id = ?1 AND p.state <> 'reverted' ORDER BY p.path",
+            )
+            .map_err(db)?;
         let related_page_paths = pages
             .query_map([id], |row| row.get(0))
             .map_err(db)?
@@ -388,6 +393,7 @@ impl Storage {
             summary_points,
             related_page_paths,
             paragraphs,
+            compile_summary: None,
         })
     }
 
@@ -570,29 +576,20 @@ impl Storage {
                 "收件箱原文已在外部被修改，请刷新后重新收藏",
             ));
         }
-        let sources = if mode == CompileMode::Full {
-            vec![Source {
-                title: item.title.clone(),
+        let sources = selected
+            .iter()
+            .map(|p| Source {
+                title: if p.heading.is_empty() {
+                    item.title.clone()
+                } else {
+                    p.heading.clone()
+                },
                 path: item.raw_path.clone(),
-                text: body,
-            }]
-        } else {
-            selected
-                .iter()
-                .map(|p| Source {
-                    title: if p.heading.is_empty() {
-                        item.title.clone()
-                    } else {
-                        p.heading.clone()
-                    },
-                    path: item.raw_path.clone(),
-                    text: p.text.clone(),
-                })
-                .collect()
-        };
+                text: p.text.clone(),
+            })
+            .collect();
         Ok(Some(InboxCompilation {
             id: id.to_owned(),
-            title: item.title,
             raw_path: item.raw_path,
             expected_hash,
             state: item.state,

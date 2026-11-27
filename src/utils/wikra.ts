@@ -18,7 +18,100 @@ export function shortDate(value: string | null | undefined): string {
 }
 
 export const WIKRA_PREFS_STORAGE_KEY = 'wikra-ui-prefs-v2'
-export const WIKRA_WIKI_CACHE_KEY = 'wikra-wiki-candidates-v2'
+
+export function opKindLabel(op: string): string {
+  switch (op) {
+    case 'create_page':
+      return '新建'
+    case 'append_section':
+      return '追加'
+    case 'replace_section':
+      return '替换章节'
+    case 'add_link':
+      return '补双链'
+    case 'set_frontmatter_key':
+      return '补别名'
+    default:
+      return '更新'
+  }
+}
+
+export function changesetStatusLabel(status: string): string {
+  switch (status) {
+    case 'applied':
+      return '已完成'
+    case 'partial':
+      return '含待确认项'
+    case 'partially_reverted':
+      return '已部分撤销'
+    case 'reverted':
+      return '已撤销'
+    default:
+      return '整理记录'
+  }
+}
+
+export function changesetStatusTone(status: string): string {
+  switch (status) {
+    case 'applied':
+      return 'success'
+    case 'partial':
+      return 'warning'
+    case 'partially_reverted':
+      return 'info'
+    default:
+      return ''
+  }
+}
+
+export function pendingReasonLabel(reason: string): string {
+  const r = reason.trim()
+  if (!r) return '需人工确认'
+  const lower = r.toLowerCase()
+  if (lower.includes('replace_section') || r.includes('替换')) return '替换已有章节'
+  if (lower.includes('wikra-core') || lower.includes('decision') || r.includes('决策') || r.includes('核心')) return '核心决策页'
+  if (lower.includes('conflict') || r.includes('冲突') || r.includes('分歧')) return '存在观点分歧'
+  if (lower.includes('uncertain') || r.includes('不确定')) return '结论待核实'
+  if (lower.includes('thin') || r.includes('单薄')) return '单薄新页'
+  if (lower.includes('heading') || lower.includes('h2') || r.includes('同名')) return '章节标题重复'
+  if (lower.includes('hash') || lower.includes('modified') || r.includes('变动')) return '来源变动'
+  if (lower.includes('batch') || lower.includes('15') || r.includes('批量')) return '涉及页面较多'
+  return r
+}
+
+export function lintRuleLabel(rule: string): string {
+  switch (rule) {
+    case 'broken_link':
+      return '断链'
+    case 'missing_source':
+    case 'quote_mismatch':
+      return '引文异常'
+    case 'structure_blocked':
+      return '标记未闭合'
+    case 'broken_anchor':
+      return '锚点失效'
+    case 'ambiguous_name':
+      return '重名链接'
+    case 'stale_conflict_marker':
+      return '残留冲突标记'
+    case 'index_drift':
+      return '目录页待同步'
+    case 'orphan':
+      return '尚未关联'
+    case 'thin_page':
+      return '内容较单薄'
+    case 'semantic_duplicate':
+      return '疑似重复内容'
+    case 'semantic_contradiction':
+      return '疑似观点冲突'
+    default:
+      return '体检提醒'
+  }
+}
+
+export function shortChangesetId(id: string): string {
+  return id.length > 8 ? id.slice(0, 8) : id
+}
 
 export function applyBodyPreferences(theme: ThemeName, docWidth: DocWidthMode) {
   const safeTheme: ThemeName = theme === 'paper' ? 'paper' : 'slate'

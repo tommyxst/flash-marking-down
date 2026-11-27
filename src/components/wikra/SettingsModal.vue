@@ -4,6 +4,7 @@ import { api, type AppSettings } from '../../api/client'
 import { parseAppError, type UiError } from '../../api/errors'
 import ErrorNotice from '../ErrorNotice.vue'
 import type {
+  AgentIntegration,
   CredentialReference,
   CredentialSlot,
   CredentialState,
@@ -11,6 +12,7 @@ import type {
   HotkeyStatus,
   IndexRebuildResult,
   IntegrationsConfig,
+  McpTestResult,
   OpenedWorkspace,
   ThemeName,
 } from '../../m2'
@@ -99,6 +101,146 @@ const rebuilding = ref(false)
 const rebuildMessage = ref('')
 const rebuildError = ref<UiError | null>(null)
 
+// Section 6: External Agent Integration (Read-Only MCP & SKILL.md)
+type SnippetTab = 'claudeCli' | 'mcpJson' | 'codexToml'
+const agentInfo = ref<AgentIntegration | null>(null)
+const loadingAgent = ref(false)
+const agentError = ref<UiError | null>(null)
+const snippetTab = ref<SnippetTab>('claudeCli')
+const copiedKey = ref('')
+let copyResetTimer: number | undefined
+const testingMcp = ref(false)
+const mcpTestResult = ref<McpTestResult | null>(null)
+const mcpTestError = ref<UiError | null>(null)
+const exportingSkill = ref(false)
+const skillFeedback = ref('')
+const skillError = ref<UiError | null>(null)
+const selectedRawAllow = ref<string[]>([])
+const savingRawAllow = ref(false)
+const rawAllowFeedback = ref('')
+const rawAllowError = ref<UiError | null>(null)
+
+const snippetTitle = computed(() => {
+  if (snippetTab.value === 'claudeCli') return '终端注册命令（Claude Code）'
+  if (snippetTab.value === 'mcpJson') return 'JSON 配置片段（适用于 Claude Desktop 与 Antigravity mcp_config.json）'
+  return 'TOML 配置块（适用于 Codex 配置文件）'
+})
+
+const activeSnippetText = computed(() => {
+  const s = agentInfo.value?.snippets
+  if (!s) return ''
+  if (snippetTab.value === 'claudeCli') return s.claudeCli
+  if (snippetTab.value === 'mcpJson') return s.mcpJson
+  return s.codexToml
+})
+
+const rawAllowPolicySummary = computed(() => {
+  const n = selectedRawAllow.value.length
+  return n === 0
+    ? '当前策略：仅知识页（未放开任何原文目录）'
+    : `当前策略：知识页 + 已放开 ${n} 个原文目录`
+})
+
+const skillCopyTargets = [
+  { key: 'claude-skill', label: 'Claude Code', path: '~/.claude/skills/wikra-lookup/SKILL.md' },
+  { key: 'agents-skill', label: 'Antigravity / 通用 Agent', path: '~/.agents/skills/wikra-lookup/SKILL.md' },
+] as const
+
+async function loadAgentIntegration() {
+  if (!props.session) return
+  loadingAgent.value = true
+  agentError.value = null
+  try {
+    const info = await api.getAgentIntegration(props.session)
+    agentInfo.value = info
+    selectedRawAllow.value = [...(info.rawAllow || [])]
+  } catch (err) {
+    agentError.value = parseAppError(err)
+  } finally {
+    loadingAgent.value = false
+  }
+}
+
+async function copyText(key: string, text: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key
+    window.clearTimeout(copyResetTimer)
+    copyResetTimer = window.setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = ''
+    }, 2000)
+  } catch {
+    agentError.value = { safeMessage: '无法访问剪贴板，请手动选中复制。' }
+  }
+}
+
+async function handleTestMcp() {
+  if (!props.session || testingMcp.value || !agentInfo.value?.mcpExeExists) return
+  testingMcp.value = true
+  mcpTestResult.value = null
+  mcpTestError.value = null
+  try {
+    mcpTestResult.value = await api.testMcpStdio(props.session)
+  } catch (err) {
+    mcpTestError.value = parseAppError(err)
+  } finally {
+    testingMcp.value = false
+  }
+}
+
+async function handleExportSkill() {
+  if (!props.session || exportingSkill.value) return
+  exportingSkill.value = true
+  skillFeedback.value = ''
+  skillError.value = null
+  try {
+    const res = await api.exportVaultSkill(props.session)
+    if (agentInfo.value) {
+      agentInfo.value = { ...agentInfo.value, skillPath: res.path, skillExists: true }
+    }
+    skillFeedback.value = res.action === 'created'
+      ? '已在知识库根目录生成 SKILL.md（技能名 wikra-lookup）。'
+      : res.action === 'updated'
+        ? '已更新知识库根目录的 SKILL.md 托管区块。'
+        : '知识库根目录的 SKILL.md 已是最新版本，无需改动。'
+  } catch (err) {
+    skillError.value = parseAppError(err)
+  } finally {
+    exportingSkill.value = false
+  }
+}
+
+function toggleRawAllowDir(path: string, checked: boolean) {
+  const next = new Set(selectedRawAllow.value)
+  if (checked) next.add(path)
+  else next.delete(path)
+  selectedRawAllow.value = Array.from(next)
+  rawAllowFeedback.value = ''
+  rawAllowError.value = null
+}
+
+async function handleSaveRawAllow() {
+  if (!props.session || savingRawAllow.value) return
+  savingRawAllow.value = true
+  rawAllowFeedback.value = ''
+  rawAllowError.value = null
+  try {
+    const saved = await api.setMcpRawAllow(props.session, selectedRawAllow.value)
+    selectedRawAllow.value = [...saved]
+    if (agentInfo.value) {
+      agentInfo.value = { ...agentInfo.value, rawAllow: [...saved] }
+    }
+    rawAllowFeedback.value = saved.length === 0
+      ? '已保存：外部 Agent 仅可访问知识页，所有原文目录保持关闭。'
+      : `已保存目录授权：允许外部 Agent 读取 ${saved.length} 个原文目录。`
+  } catch (err) {
+    rawAllowError.value = parseAppError(err)
+  } finally {
+    savingRawAllow.value = false
+  }
+}
+
 function normalizeDirPath(val: string): string {
   return val
     .trim()
@@ -142,6 +284,13 @@ function syncFromProps() {
   dirsError.value = null
   rebuildMessage.value = ''
   rebuildError.value = null
+  mcpTestResult.value = null
+  mcpTestError.value = null
+  skillFeedback.value = ''
+  skillError.value = null
+  rawAllowFeedback.value = ''
+  rawAllowError.value = null
+  copiedKey.value = ''
 }
 
 async function loadIntegrations() {
@@ -190,7 +339,10 @@ watch(
     if (isOpen) {
       syncFromProps()
       if (props.hotkey) hotkeyChoice.value = props.hotkey.id
-      if (props.session) void loadIntegrations()
+      if (props.session) {
+        void loadIntegrations()
+        void loadAgentIntegration()
+      }
     }
   },
   { immediate: true },
@@ -260,6 +412,7 @@ async function saveWorkspaceDirs() {
     syncingDirs = false
     emit('workspaceDirsUpdated', updated)
     dirsFeedback.value = `目录设置已保存：原始文件位于 ${rawDirDraft.value}/，随手记保存至 ${captureDirDraft.value}/。`
+    void loadAgentIntegration()
   } catch (err) {
     dirsError.value = parseAppError(err)
   } finally {
@@ -447,7 +600,10 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 onMounted(() => window.addEventListener('keydown', onKeydown))
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+  window.clearTimeout(copyResetTimer)
+})
 </script>
 
 <template>
@@ -804,6 +960,200 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </div>
           <p v-if="rebuildMessage" class="notice success" role="status">{{ rebuildMessage }}</p>
           <ErrorNotice :error="rebuildError" />
+        </section>
+
+        <!-- 6. External Agent Integration (Read-Only MCP & SKILL.md) -->
+        <section v-if="session" class="setting-card">
+          <div class="row-between">
+            <strong>6. 外部 Agent 接入（只读 MCP 与 SKILL.md）</strong>
+            <span class="pill">只读本机访问 · 绝不改写知识库</span>
+          </div>
+
+          <ErrorNotice v-if="agentError" :error="agentError" />
+
+          <div v-if="loadingAgent && !agentInfo" class="hint">
+            正在检测本地只读 MCP 服务与目录授权配置…
+          </div>
+
+          <template v-else-if="agentInfo">
+            <!-- 6.1 Executable Probe & Local Handshake Self-Test -->
+            <div class="mcp-status-box">
+              <div class="row-between">
+                <div class="row-flex">
+                  <strong style="font-size:12.5px;">本地只读服务程序</strong>
+                  <span class="pill" :class="agentInfo.mcpExeExists ? 'success' : 'warning'">
+                    {{ agentInfo.mcpExeExists ? '已就绪' : '未找到程序' }}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="btn sm"
+                  :disabled="!agentInfo.mcpExeExists || testingMcp"
+                  @click="handleTestMcp"
+                >{{ testingMcp ? '正在测试握手…' : '测试本地连接' }}</button>
+              </div>
+
+              <div class="mono hint" style="word-break:break-all;">
+                {{ agentInfo.mcpExePath }}
+              </div>
+
+              <p v-if="!agentInfo.mcpExeExists" class="notice" style="margin:0;">
+                未在当前程序目录检测到 <code class="mono">wikra-mcp.exe</code>。请确认已将完整发布包中的
+                <code class="mono">wikra-mcp.exe</code> 与 <code class="mono">wikra.exe</code> 放在同一文件夹后，重新打开设置页面检查。
+              </p>
+
+              <div v-if="mcpTestResult">
+                <div v-if="mcpTestResult.ok" class="row-flex" role="status">
+                  <span class="pill success">
+                    握手正常 · 协议 {{ mcpTestResult.protocolVersion || '已协商' }} · 可用工具 {{ mcpTestResult.tools.length }} 个{{ mcpTestResult.tools.length ? `（${mcpTestResult.tools.join(' / ')}）` : '' }}
+                  </span>
+                </div>
+                <div v-else class="notice error" role="alert" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+                  <span class="pill error">连接失败</span>
+                  <span>{{ mcpTestResult.error || '未能完成本地握手，请检查程序权限或知识库目录是否可读。' }}</span>
+                </div>
+              </div>
+              <ErrorNotice v-if="mcpTestError" :error="mcpTestError" />
+            </div>
+
+            <!-- 6.2 Multi-Client Snippets & One-Click Copy -->
+            <div style="display:flex;flex-direction:column;gap:8px;">
+              <div class="row-between">
+                <strong style="font-size:12.5px;">外部工具配置片段</strong>
+                <div class="segmented" style="flex:0 1 auto;">
+                  <button
+                    type="button"
+                    :class="{ active: snippetTab === 'claudeCli' }"
+                    @click="snippetTab = 'claudeCli'"
+                  >Claude Code CLI</button>
+                  <button
+                    type="button"
+                    :class="{ active: snippetTab === 'mcpJson' }"
+                    @click="snippetTab = 'mcpJson'"
+                  >Claude / Antigravity JSON</button>
+                  <button
+                    type="button"
+                    :class="{ active: snippetTab === 'codexToml' }"
+                    @click="snippetTab = 'codexToml'"
+                  >Codex TOML</button>
+                </div>
+              </div>
+
+              <div class="mcp-code-wrap">
+                <div class="mcp-code-head">
+                  <span>{{ snippetTitle }}</span>
+                  <button
+                    type="button"
+                    class="btn xs"
+                    :disabled="!activeSnippetText"
+                    @click="copyText(`snippet-${snippetTab}`, activeSnippetText)"
+                  >{{ copiedKey === `snippet-${snippetTab}` ? '已复制' : '一键复制' }}</button>
+                </div>
+                <pre class="mcp-code-pre mono">{{ activeSnippetText }}</pre>
+              </div>
+            </div>
+
+            <!-- 6.3 SKILL.md Export & Install Guide -->
+            <div style="padding-top:10px;border-top:1px solid var(--line-subtle);display:flex;flex-direction:column;gap:8px;">
+              <div class="row-between">
+                <div class="row-flex">
+                  <strong style="font-size:12.5px;">Agent 使用说明（SKILL.md）</strong>
+                  <span class="pill" :class="agentInfo.skillExists ? 'info' : ''">
+                    {{ agentInfo.skillExists ? '已导出（Vault 根）' : '尚未导出' }}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="btn sm"
+                  :disabled="exportingSkill"
+                  @click="handleExportSkill"
+                >{{ exportingSkill ? '正在生成…' : '生成 / 更新 Vault 根 SKILL.md' }}</button>
+              </div>
+
+              <div class="hint" style="word-break:break-all;">
+                导出路径：<span class="mono">{{ agentInfo.skillPath }}</span>（固定技能名 <span class="mono">wikra-lookup</span>，仅维护托管区块，不改动你的手写内容）
+              </div>
+
+              <p v-if="skillFeedback" class="notice success" role="status">{{ skillFeedback }}</p>
+              <ErrorNotice v-if="skillError" :error="skillError" />
+
+              <div class="skill-install-box">
+                <span style="color:var(--text-secondary);">
+                  生成到知识库根目录后，外部 Agent 不会自动扫描该文件。请按所用工具将其复制到对应技能目录（目录名需保持 <code class="mono">wikra-lookup</code>）：
+                </span>
+                <div v-for="target in skillCopyTargets" :key="target.key" class="skill-path-row">
+                  <div class="row-flex" style="min-width:0;flex:1 1 220px;">
+                    <span class="pill">{{ target.label }}</span>
+                    <code class="mono">{{ target.path }}</code>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn quiet xs"
+                    @click="copyText(target.key, target.path)"
+                  >{{ copiedKey === target.key ? '已复制' : '复制路径' }}</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 6.4 Raw Directory Allowlist (D3-A Two-Level Privacy) -->
+            <div style="padding-top:10px;border-top:1px solid var(--line-subtle);display:flex;flex-direction:column;gap:10px;">
+              <strong style="font-size:12.5px;">允许外部 Agent 读取的原文目录</strong>
+
+              <div class="notice" style="display:flex;flex-direction:column;gap:4px;">
+                <strong style="color:var(--text);">
+                  默认仅暴露 <code class="mono">wiki/</code> 知识页与页内已有逐字短引，外部 Agent 看不到
+                  <code class="mono">{{ agentInfo.rawDir || 'raw' }}/</code> 与随手记正文。
+                </strong>
+                <span>
+                  勾选下方目录后，外部 Agent 可检索、读取该目录内的原文，并在查证引文时获得原段前后各 1 段上下文（最多 1,200 字）。<code class="mono">.wikra/</code>、草稿与凭据永远不会暴露。
+                </span>
+              </div>
+
+              <div v-if="agentInfo.rawDirs.length > 0" class="raw-allow-list">
+                <label
+                  v-for="dir in agentInfo.rawDirs"
+                  :key="dir.path"
+                  class="raw-allow-item"
+                  :class="{ checked: selectedRawAllow.includes(dir.path) }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="selectedRawAllow.includes(dir.path)"
+                    :disabled="savingRawAllow"
+                    @change="toggleRawAllowDir(dir.path, ($event.target as HTMLInputElement).checked)"
+                  >
+                  <div style="min-width:0;display:flex;flex-direction:column;gap:4px;flex:1;">
+                    <div class="row-flex">
+                      <span class="mono" style="font-size:12px;font-weight:600;word-break:break-all;">{{ dir.path }}</span>
+                      <span class="pill">{{ dir.fileCount }} 篇</span>
+                      <span v-if="dir.isCaptureDir" class="pill warning">随手记目录</span>
+                    </div>
+                    <span class="hint">
+                      {{ dir.isCaptureDir
+                        ? '私人随手记 · 建议保持关闭'
+                        : '原文子目录 · 默认对外部 Agent 不可见' }}
+                    </span>
+                  </div>
+                </label>
+              </div>
+              <p v-else class="hint">
+                当前原文目录下暂无可单独授权的子目录。
+              </p>
+
+              <div class="row-between">
+                <span class="hint">{{ rawAllowPolicySummary }}</span>
+                <button
+                  type="button"
+                  class="btn primary sm"
+                  :disabled="savingRawAllow"
+                  @click="handleSaveRawAllow"
+                >{{ savingRawAllow ? '正在保存…' : '保存目录授权' }}</button>
+              </div>
+
+              <p v-if="rawAllowFeedback" class="notice success" role="status">{{ rawAllowFeedback }}</p>
+              <ErrorNotice v-if="rawAllowError" :error="rawAllowError" />
+            </div>
+          </template>
         </section>
       </div>
 

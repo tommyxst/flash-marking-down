@@ -1,0 +1,3434 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wikra P0 增量交互高保真原型</title>
+  <link rel="stylesheet" href="./styles.css">
+  <style>
+    /* ========================================================================
+       Wikra P0 Incremental Styles (100% inheriting styles.css Slate/Paper tokens)
+       Zero CDN, zero decorative gradients, zero emoji.
+       ======================================================================== */
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      overflow: hidden;
+      background: var(--canvas);
+    }
+
+    /* Prototype Review Topbar */
+    .p0-bar {
+      flex: none;
+      height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 14px;
+      background: var(--inset);
+      border-bottom: 1px solid var(--line-subtle);
+    }
+    .p0-bar-left {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      flex: none;
+    }
+    .p0-bar-tag {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .p0-scene-tabs {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      padding: 3px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .p0-scene-tabs::-webkit-scrollbar { display: none; }
+    .p0-scene-tab {
+      border: 1px solid transparent;
+      border-radius: 4px;
+      padding: 4px 10px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 550;
+      cursor: pointer;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    }
+    .p0-scene-tab:hover { color: var(--text); background: var(--surface-raised); }
+    .p0-scene-tab.active {
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+      color: var(--accent);
+      font-weight: 620;
+    }
+    .p0-bar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: none;
+    }
+
+    /* Viewport Frame Wrapper (supports Full vs 1100x700 simulated laptop DPI check) */
+    .p0-viewport-host {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      background: var(--inset);
+      overflow: auto;
+    }
+    .p0-viewport-host.narrow-mode {
+      padding: 16px;
+      align-items: flex-start;
+    }
+    .p0-app-frame {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--canvas);
+      overflow: hidden;
+    }
+    .p0-viewport-host.narrow-mode .p0-app-frame {
+      width: 1100px;
+      height: 700px;
+      flex: none;
+      border-radius: 10px;
+      border: 1px solid var(--line-strong);
+      box-shadow: var(--shadow-float);
+    }
+
+    /* Workspace Shell inside Frame */
+    .p0-shell {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      overflow: hidden;
+    }
+    .p0-stage {
+      flex: 1;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--canvas);
+      container-type: inline-size;
+      container-name: stage;
+      overflow: hidden;
+    }
+
+    /* Small utility helpers */
+    .btn.xs { min-height: 22px; padding: 2px 7px; font-size: 11.5px; }
+    .btn.danger-outline {
+      border-color: var(--error);
+      color: var(--error);
+      background: var(--error-soft);
+    }
+    .btn.danger-outline:hover:not(:disabled) {
+      filter: brightness(1.06);
+    }
+    .hint { font-size: 12px; color: var(--muted); }
+    .row-flex { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+
+    /* ========================================================================
+       Scene 1: Organize & Lint Incremental Styles
+       ======================================================================== */
+    .ops-card-head { flex-wrap: wrap; }
+    .ops-row { flex-wrap: wrap; }
+    .ops-row-main { flex: 1 1 220px; }
+    .ops-row-actions { flex-wrap: wrap; }
+    .lint-filter-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .lint-filter-pills {
+      display: inline-flex;
+      gap: 2px;
+      padding: 3px;
+      border-radius: 6px;
+      background: var(--inset);
+      border: 1px solid var(--line-subtle);
+      flex-wrap: wrap;
+    }
+    .lint-filter-pills button {
+      border: none;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .lint-filter-pills button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .lint-filter-pills button.active {
+      background: var(--surface-active);
+      color: var(--text);
+      font-weight: 600;
+    }
+    .lint-page-filter-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 7px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--accent-border);
+      background: var(--accent-soft);
+      font-size: 12px;
+      color: var(--text);
+    }
+    .lint-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px 12px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--canvas);
+    }
+    .lint-row.sev-error { border-left: 3px solid var(--error); }
+    .lint-row.sev-warn { border-left: 3px solid var(--warning); }
+    .lint-row.sev-info { border-left: 3px solid var(--info); }
+    .lint-row-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; }
+    .lint-row-meta { font-size: 11.5px; color: var(--muted); font-family: "JetBrains Mono", monospace; word-break: break-all; }
+    .lint-collapsed-note {
+      font-size: 11.5px;
+      color: var(--muted);
+      padding: 4px 2px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    /* L2 Semantic Lint Trigger Footer inside Health Card */
+    .l2-zone {
+      margin-top: 6px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .l2-budget-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 9px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--inset);
+      font-size: 12px;
+    }
+    .l2-result-card {
+      padding: 11px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--accent-border);
+      background: var(--canvas);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .l2-quotes-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    @container stage (max-width: 680px) {
+      .l2-quotes-grid { grid-template-columns: 1fr; }
+    }
+    .l2-quote-box {
+      padding: 8px 10px;
+      border-radius: 5px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    /* Multi-page Changeset Enhancements */
+    .cs-card.highlighted {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent-border);
+    }
+    .cs-op-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px 8px;
+      flex-wrap: wrap;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--line-subtle);
+    }
+    .cs-op-row:last-child { border-bottom: none; }
+    .cs-op-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex: 1 1 200px;
+      flex-wrap: wrap;
+    }
+    .cs-op-tag {
+      font-size: 10.5px;
+      font-weight: 650;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--surface-raised);
+      border: 1px solid var(--line-subtle);
+      color: var(--text-secondary);
+      flex: none;
+    }
+    .cs-op-tag.create { color: var(--success); border-color: transparent; background: var(--success-soft); }
+    .cs-op-tag.replace { color: var(--warning); border-color: transparent; background: var(--warning-soft); }
+    .cs-op-tag.dropped { color: var(--muted); }
+    .cs-gentle-note {
+      padding: 6px 9px;
+      border-radius: 5px;
+      background: var(--info-soft);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .cs-revert-blocked {
+      padding: 8px 10px;
+      border-radius: 5px;
+      border: 1px solid var(--warning);
+      background: var(--warning-soft);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .cs-rollback-feedback {
+      padding: 8px 10px;
+      border-radius: 5px;
+      border: 1px solid var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    /* Side-by-Side Pending Review Diff Modal */
+    .diff-modal {
+      width: min(1040px, 100%);
+      max-height: 88dvh;
+      border-radius: 10px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      box-shadow: var(--shadow-float);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      container-type: inline-size;
+      container-name: diffmodal;
+    }
+    .diff-modal-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .diff-pane-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    @container diffmodal (max-width: 840px) {
+      .diff-pane-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 860px) {
+      .diff-pane-grid { grid-template-columns: 1fr; }
+    }
+    .diff-doc-col {
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--inset);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .diff-doc-head {
+      padding: 8px 12px;
+      background: var(--surface-raised);
+      border-bottom: 1px solid var(--line-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .diff-code {
+      padding: 10px 0;
+      font-family: "JetBrains Mono", "Microsoft YaHei UI", monospace;
+      font-size: 12px;
+      line-height: 1.65;
+      overflow-x: auto;
+    }
+    .diff-line {
+      padding: 1px 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: flex;
+      gap: 10px;
+    }
+    .diff-ln {
+      width: 24px;
+      flex: none;
+      text-align: right;
+      color: var(--muted);
+      user-select: none;
+      opacity: 0.7;
+    }
+    .diff-line.del { background: var(--error-soft); color: var(--text); }
+    .diff-line.add { background: var(--success-soft); color: var(--text); }
+    .diff-line.protect { background: var(--surface); color: var(--muted); border-left: 2px solid var(--success); }
+    .version-conflict-bar {
+      padding: 10px 13px;
+      border-radius: 6px;
+      border: 1px solid var(--error);
+      background: var(--error-soft);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12.5px;
+    }
+
+    /* ========================================================================
+       Scene 2: Settings Card 6 (External Agent MCP & SKILL.md)
+       ======================================================================== */
+    .settings-preview-stage {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px 36px;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      background: var(--canvas);
+    }
+    .settings-modal-inline {
+      width: min(820px, 100%);
+      border-radius: 10px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      box-shadow: var(--shadow-sm);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .settings-collapsed-nav {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding: 10px 14px;
+      border-radius: 6px;
+      border: 1px dashed var(--line);
+      background: var(--surface-raised);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .mcp-status-box {
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .mcp-code-wrap {
+      position: relative;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--inset);
+      overflow: hidden;
+    }
+    .mcp-code-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--line-subtle);
+      background: var(--surface-raised);
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+    .mcp-code-pre {
+      margin: 0;
+      padding: 11px 12px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text);
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .skill-install-box {
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      font-size: 12px;
+    }
+    .skill-path-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 5px 8px;
+      border-radius: 4px;
+      background: var(--inset);
+      border: 1px solid var(--line-subtle);
+    }
+    .skill-path-row .mono {
+      word-break: break-all;
+      min-width: 0;
+    }
+    .raw-allow-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    @container stage (max-width: 680px) {
+      .raw-allow-list { grid-template-columns: 1fr; }
+    }
+    .raw-allow-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 9px 11px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      cursor: pointer;
+      transition: border-color 0.12s ease, background 0.12s ease;
+    }
+    .raw-allow-item:hover { border-color: var(--line-strong); }
+    .raw-allow-item.checked { border-color: var(--accent-border); background: var(--accent-soft); }
+    .raw-allow-item input { margin-top: 3px; accent-color: var(--accent); cursor: pointer; }
+
+    /* ========================================================================
+       Scene 3: [[ / 【【 Autocomplete (540px Quick Capture + Main Source)
+       ======================================================================== */
+    .ac-showcase {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px 40px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .ac-controls-bar {
+      padding: 11px 14px;
+      border-radius: 7px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .ac-dual-grid {
+      display: grid;
+      grid-template-columns: 540px minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+    }
+    @container stage (max-width: 1020px) {
+      .ac-dual-grid { grid-template-columns: 1fr; }
+    }
+    .hud-540 {
+      position: relative;
+      width: 540px;
+      max-width: 100%;
+      height: 380px;
+      border-radius: 10px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      box-shadow: var(--shadow-float);
+      display: flex;
+      flex-direction: column;
+      overflow: visible;
+    }
+    .hud-540 > .hud-head {
+      border-radius: 9px 9px 0 0;
+      flex: none;
+    }
+    .hud-540 > .hud-foot {
+      border-radius: 0 0 9px 9px;
+      flex: none;
+      flex-wrap: nowrap;
+      gap: 8px;
+      padding: 8px 12px;
+      position: relative;
+      z-index: 5;
+    }
+    .hud-foot-status {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cm-sim-wrap {
+      position: relative;
+      background: var(--inset);
+      min-height: 210px;
+      padding: 14px 16px;
+    }
+    .hud-540 .cm-sim-wrap {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 12px 16px;
+    }
+    .cm-sim-textarea {
+      width: 100%;
+      min-height: 178px;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text);
+      font-family: "JetBrains Mono", "Microsoft YaHei UI", monospace;
+      font-size: 13.5px;
+      line-height: 1.72;
+      resize: none;
+    }
+    .hud-540 .cm-sim-textarea {
+      flex: 1;
+      min-height: 0;
+      height: 100%;
+    }
+    /* Styled CodeMirror 6 Autocomplete Popover */
+    .cm-ac-popover {
+      position: absolute;
+      z-index: 30;
+      width: 320px;
+      max-width: calc(100% - 16px);
+      border-radius: 7px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-raised);
+      box-shadow: var(--shadow-float);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .hud-540 .cm-ac-popover {
+      max-height: min(216px, calc(100vh - 110px));
+    }
+    .cm-ac-list {
+      flex: 1;
+      min-height: 0;
+      max-height: 252px;
+      overflow-y: auto;
+      padding: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .cm-ac-option {
+      width: 100%;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      background: transparent;
+      padding: 6px 8px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .cm-ac-option:hover { background: var(--surface-active); }
+    .cm-ac-option.active {
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+    }
+    .cm-ac-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .cm-ac-title {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cm-ac-match {
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .cm-ac-sub {
+      font-size: 11px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cm-ac-foot {
+      padding: 5px 9px;
+      border-top: 1px solid var(--line-subtle);
+      background: var(--inset);
+      font-size: 10.5px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .esc-chain-bar {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    @container stage (max-width: 780px) {
+      .esc-chain-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .esc-step {
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line-subtle);
+      background: var(--surface);
+      font-size: 11.5px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .esc-step.active {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+    }
+
+    /* ========================================================================
+       Scene 4: WikiDocumentView Enhancements (Lint Badge, Disambig, Cite Hover)
+       ======================================================================== */
+    .lint-toolbar-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 26px;
+      padding: 2px 9px;
+      border-radius: 5px;
+      border: 1px solid transparent;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: filter 0.12s ease;
+    }
+    .lint-toolbar-badge.warn {
+      background: var(--warning-soft);
+      border-color: var(--warning);
+      color: var(--warning);
+    }
+    .lint-toolbar-badge.error {
+      background: var(--error-soft);
+      border-color: var(--error);
+      color: var(--error);
+    }
+    .lint-toolbar-badge:hover { filter: brightness(1.08); }
+
+    /* Anchored Disambiguation Popover */
+    .inline-anchor-wrap {
+      position: relative;
+      display: inline-block;
+    }
+    .disambig-popover {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 40;
+      width: 316px;
+      max-width: calc(100vw - 24px);
+      border-radius: 7px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-raised);
+      box-shadow: var(--shadow-float);
+      overflow: hidden;
+      text-align: left;
+    }
+    .disambig-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 7px 10px;
+      background: var(--inset);
+      border-bottom: 1px solid var(--line-subtle);
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+    .disambig-list {
+      padding: 5px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .disambig-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      background: transparent;
+      padding: 7px 9px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .disambig-item:hover,
+    .disambig-item:focus-visible {
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+      outline: none;
+    }
+
+    /* Citation Hover Preview Card */
+    .cite-hover-card {
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 42;
+      width: 364px;
+      max-width: calc(100vw - 24px);
+      border-radius: 8px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-raised);
+      box-shadow: var(--shadow-float);
+      padding: 11px 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      text-align: left;
+      font-family: "Hanken Grotesk", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: var(--text);
+    }
+    /* Hover bridge so moving cursor into card stays open */
+    .cite-hover-card::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 100%;
+      height: 10px;
+    }
+    .cite-hover-quote {
+      padding: 7px 10px;
+      border-left: 3px solid var(--accent);
+      background: var(--canvas);
+      border-radius: 0 5px 5px 0;
+      color: var(--text-secondary);
+      font-size: 12.5px;
+    }
+    .raw-para-block {
+      padding: 8px 11px;
+      border-radius: 5px;
+      border: 1px solid transparent;
+      margin-bottom: 8px;
+      color: var(--text-secondary);
+      font-size: 13px;
+      line-height: 1.72;
+    }
+    .raw-para-block.located {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--text);
+    }
+  </style>
+</head>
+<body data-theme="slate" data-density="standard" data-width="readable">
+  <!-- Top Review Bar -->
+  <header class="p0-bar">
+    <div class="p0-bar-left">
+      <span class="brand-glyph" aria-hidden="true">
+        <svg class="ui-icon sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3 5 14h6l-1 7 9-11h-6l1-7z"/></svg>
+      </span>
+      <span class="brand-title">Wikra</span>
+      <span class="p0-bar-tag">P0 增量原型</span>
+    </div>
+
+    <nav class="p0-scene-tabs" role="tablist" aria-label="P0 交互场景切换">
+      <button type="button" class="p0-scene-tab active" data-scene="organize" role="tab" aria-selected="true">
+        1. 整理与体检
+      </button>
+      <button type="button" class="p0-scene-tab" data-scene="settings" role="tab" aria-selected="false">
+        2. 外部 Agent 接入
+      </button>
+      <button type="button" class="p0-scene-tab" data-scene="autocomplete" role="tab" aria-selected="false">
+        3. [[ / 【【 补全
+      </button>
+      <button type="button" class="p0-scene-tab" data-scene="wikidoc" role="tab" aria-selected="false">
+        4. 知识页增强
+      </button>
+    </nav>
+
+    <div class="p0-bar-right">
+      <button type="button" class="btn sm" id="btn-viewport-toggle" title="在全宽与 1100×700 窄视口之间切换">
+        视口：全宽
+      </button>
+      <button type="button" class="btn sm" id="btn-theme-toggle" title="切换深色 Cognitive Slate / 浅色 Paper Daylight">
+        主题：深色 Slate
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Viewport Host -->
+  <div id="viewport-host" class="p0-viewport-host">
+    <div class="p0-app-frame">
+      <div class="p0-shell">
+        <!-- Simplified 56px Nav Rail matching Rev.3 -->
+        <aside class="nav-rail" aria-label="主导航">
+          <div class="nav-group">
+            <button type="button" class="nav-item" data-rail-scene="wikidoc" title="知识库">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+              <span class="nav-label">知识库</span>
+            </button>
+            <button type="button" class="nav-item" data-rail-scene="organize" title="整理与体检">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 3v18"/><path d="m17 8 5 4-5 4"/><path d="m7 16-5-4 5-4"/></svg>
+              <span class="nav-label">整理</span>
+              <span class="nav-badge warn" id="rail-pending-badge">3</span>
+            </button>
+            <button type="button" class="nav-item" data-rail-scene="autocomplete" title="随手记与补全">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+              <span class="nav-label">随手记</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <button type="button" class="nav-item" id="rail-theme-btn" title="切换明暗主题">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>
+              <span class="nav-label">主题</span>
+            </button>
+            <button type="button" class="nav-item" data-rail-scene="settings" title="设置">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+              <span class="nav-label">设置</span>
+            </button>
+          </div>
+        </aside>
+
+        <!-- Dynamic Stage -->
+        <main id="stage-root" class="p0-stage" aria-live="polite"></main>
+      </div>
+
+      <!-- Calm Status Bar -->
+      <footer class="statusbar">
+        <div class="status-group">
+          <span><span class="status-dot"></span>本地知识库：D:\Vault\MyBrain</span>
+          <span class="mono">38 篇知识页 · 70 篇原文</span>
+        </div>
+        <div class="status-group">
+          <span class="status-slot-buffer">待整理队列：2 条（00:42 后自动合批）</span>
+          <span id="status-mcp-summary">外部 Agent 只读接入：已就绪（仅知识页）</span>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal Layer (Pending Review Diff) -->
+  <div id="modal-layer" class="overlay-layer hidden" role="dialog" aria-modal="true" aria-label="差异确认"></div>
+
+  <!-- Toast Region -->
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+
+  <script>
+    (() => {
+      // ======================================================================
+      // Shared Prototype State
+      // ======================================================================
+      const state = {
+        scene: 'organize', // organize | settings | autocomplete | wikidoc
+        theme: 'slate',    // slate | paper
+        narrow: false,
+
+        // Scene 1: Organize & Lint
+        conflicts: [
+          {
+            id: 'cf-101',
+            topic: 'API 超时与重试约定：弱网超时阈值',
+            currentLabel: '原有约定（8 秒上限）',
+            incomingLabel: '11-27 压测随手记（建议收紧至 3 秒）',
+            pagePath: 'wiki/decisions/API 超时与重试约定.md',
+            status: 'open',
+          },
+        ],
+        pendingReviews: [
+          {
+            id: 'pr-1',
+            changesetId: 'cs-0912',
+            op: 'replace_section',
+            opTag: '替换章节',
+            opTagClass: 'replace',
+            pagePath: 'wiki/decisions/API 超时与重试约定.md',
+            pageTitle: 'API 超时与重试约定',
+            reasonLabel: '核心决策页更新',
+            summary: '替换「弱网退避策略」章节 · 含 2 条逐字原文依据',
+            externallyModified: false,
+            diskState: 'baseline', // baseline | external_dirty
+            hasProtectZone: true,
+            baseBeforeLines: [
+              { n: 12, text: '## 弱网退避策略', type: 'ctx' },
+              { n: 13, text: '- 移动弱网下超时统一设为 8 秒，失败后线性重试 3 次。[^w8a01-1]', type: 'del' },
+              { n: 14, text: '- 暂不区分幂等接口与非幂等写操作。', type: 'del' },
+              { n: 15, text: '', type: 'ctx' },
+              { n: 16, text: '<!-- wikra-protect:start -->', type: 'protect' },
+              { n: 17, text: '## 我的理解', type: 'protect' },
+              { n: 18, text: '生产网关的 SLA 红线是 P99 < 4 秒，调参前必须看监控大盘。', type: 'protect' },
+              { n: 19, text: '<!-- wikra-protect:end -->', type: 'protect' },
+            ],
+            externalBeforeLines: [
+              { n: 12, text: '## 弱网退避策略', type: 'ctx' },
+              { n: 13, text: '- 移动弱网下超时临时调为 5 秒（刚刚在 Obsidian 中手动修订）。', type: 'del' },
+              { n: 14, text: '- 写接口需核对幂等键后再开启重试。', type: 'del' },
+              { n: 15, text: '', type: 'ctx' },
+              { n: 16, text: '<!-- wikra-protect:start -->', type: 'protect' },
+              { n: 17, text: '## 我的理解', type: 'protect' },
+              { n: 18, text: '生产网关的 SLA 红线是 P99 < 4 秒，调参前必须看监控大盘。', type: 'protect' },
+              { n: 19, text: '<!-- wikra-protect:end -->', type: 'protect' },
+            ],
+            beforeLines: [
+              { n: 12, text: '## 弱网退避策略', type: 'ctx' },
+              { n: 13, text: '- 移动弱网下超时统一设为 8 秒，失败后线性重试 3 次。[^w8a01-1]', type: 'del' },
+              { n: 14, text: '- 暂不区分幂等接口与非幂等写操作。', type: 'del' },
+              { n: 15, text: '', type: 'ctx' },
+              { n: 16, text: '<!-- wikra-protect:start -->', type: 'protect' },
+              { n: 17, text: '## 我的理解', type: 'protect' },
+              { n: 18, text: '生产网关的 SLA 红线是 P99 < 4 秒，调参前必须看监控大盘。', type: 'protect' },
+              { n: 19, text: '<!-- wikra-protect:end -->', type: 'protect' },
+            ],
+            afterLines: [
+              { n: 12, text: '## 弱网退避策略', type: 'ctx' },
+              { n: 13, text: '- 首次重试 500ms 起步，采用指数退避（上限 8 秒），最多重试 2 次。[^w0912-1]', type: 'add' },
+              { n: 14, text: '- 仅对 GET / 幂等查询自动重试，写请求须带幂等键才允许重试。[^w0912-2]', type: 'add' },
+              { n: 15, text: '', type: 'ctx' },
+              { n: 16, text: '<!-- wikra-protect:start -->', type: 'protect' },
+              { n: 17, text: '## 我的理解（手动保护，本次未改动）', type: 'protect' },
+              { n: 18, text: '生产网关的 SLA 红线是 P99 < 4 秒，调参前必须看监控大盘。', type: 'protect' },
+              { n: 19, text: '<!-- wikra-protect:end -->', type: 'protect' },
+            ],
+          },
+          {
+            id: 'pr-2',
+            changesetId: 'cs-0912',
+            op: 'create_page',
+            opTag: '新建',
+            opTagClass: 'create',
+            pagePath: 'wiki/concepts/熔断半开探针.md',
+            pageTitle: '熔断半开探针',
+            reasonLabel: '新建单薄页',
+            summary: '新建概念页 · 当前仅 1 条结论，建议确认是否独立建页',
+            externallyModified: true,
+            diskState: 'external_dirty', // baseline | external_dirty
+            hasProtectZone: false,
+            baseBeforeLines: [
+              { n: 1, text: '（原基线无此文件，采纳后将新建 wiki/concepts/熔断半开探针.md）', type: 'ctx' },
+            ],
+            externalBeforeLines: [
+              { n: 1, text: '# 熔断半开探针', type: 'ctx' },
+              { n: 2, text: '刚在 Obsidian 中手动创建并补了一段探针间隔说明（与原基线不一致）。', type: 'del' },
+            ],
+            beforeLines: [
+              { n: 1, text: '# 熔断半开探针', type: 'ctx' },
+              { n: 2, text: '刚在 Obsidian 中手动创建并补了一段探针间隔说明（与原基线不一致）。', type: 'del' },
+            ],
+            afterLines: [
+              { n: 1, text: '# 熔断半开探针', type: 'ctx' },
+              { n: 2, text: '> 熔断恢复期通过单路试探请求检测下游可用性。', type: 'add' },
+              { n: 3, text: '- 半开态放行 1 个探针请求成功后再恢复全量流量。[^w0912-4]', type: 'add' },
+            ],
+          },
+        ],
+        activeDiffId: null,
+        highlightCsId: null,
+
+        lintFilter: 'attention', // attention | all | dismissed
+        lintPageFilter: null,    // null or { path, title }
+        lintFindings: [
+          {
+            id: 'lint-1',
+            rule: 'broken_link',
+            ruleLabel: '断链',
+            severity: 'error',
+            pagePath: 'wiki/concepts/重试与退避策略.md',
+            pageTitle: '重试与退避策略',
+            message: '引用了不存在的 [[退避策略]]，检测到唯一候选《重试与退避策略》',
+            fix: { kind: 'one_click', label: '一键改链' },
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-2',
+            rule: 'quote_mismatch',
+            ruleLabel: '引文异常',
+            severity: 'error',
+            pagePath: 'wiki/decisions/API 超时与重试约定.md',
+            pageTitle: 'API 超时与重试约定',
+            message: '脚注 [^w4a9c-2] 对应的原文片段与原件文字不一致（不自动修复，请人工核对）',
+            fix: null,
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-3',
+            rule: 'structure_blocked',
+            ruleLabel: '标记未闭合',
+            severity: 'error',
+            pagePath: 'wiki/concepts/数据库索引笔记.md',
+            pageTitle: '数据库索引笔记',
+            message: '存在未闭合的保护标记 <!-- wikra-protect:start -->，AI 整理已跳过此页',
+            fix: null,
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-4',
+            rule: 'broken_anchor',
+            ruleLabel: '锚点失效',
+            severity: 'warn',
+            pagePath: 'wiki/concepts/重试与退避策略.md',
+            pageTitle: '重试与退避策略',
+            message: '链接 [[网关限流设计#旧版熔断参数]] 指向的小节标题不存在',
+            fix: null,
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-5',
+            rule: 'ambiguous_name',
+            ruleLabel: '重名链接',
+            severity: 'warn',
+            pagePath: 'wiki/concepts/重试与退避策略.md',
+            pageTitle: '重试与退避策略',
+            message: '[[超时设置]] 同时匹配 2 篇同名页，建议改为带目录的明确双链',
+            fix: null,
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-6',
+            rule: 'stale_conflict_marker',
+            ruleLabel: '残留冲突标记',
+            severity: 'warn',
+            pagePath: 'wiki/concepts/日志采样规范.md',
+            pageTitle: '日志采样规范',
+            message: '残留已处理完毕的旧冲突标记，可安全清理',
+            fix: { kind: 'safe', label: '清理标记' },
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-7',
+            rule: 'index_drift',
+            ruleLabel: '目录页待同步',
+            severity: 'info',
+            pagePath: 'wiki/index.md',
+            pageTitle: '知识库总目录',
+            message: 'wiki/index.md 与当前 38 篇知识页有 2 处出入（全库聚合 1 项）',
+            fix: { kind: 'safe', label: '同步目录' },
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-8',
+            rule: 'orphan',
+            ruleLabel: '尚未关联',
+            severity: 'info',
+            pagePath: 'wiki/concepts/缓存击穿笔记.md',
+            pageTitle: '缓存击穿笔记',
+            message: '尚未与其他知识页互相链接（已排除 24 小时内新建页与目录页）',
+            fix: null,
+            dismissed: false,
+            fixed: false,
+          },
+          {
+            id: 'lint-9',
+            rule: 'thin_page',
+            ruleLabel: '内容较单薄',
+            severity: 'info',
+            pagePath: 'wiki/concepts/灰度开关速记.md',
+            pageTitle: '灰度开关速记',
+            message: '当前仅含 1 条短结论，可后续补充或并入相关页面',
+            fix: null,
+            dismissed: true,
+            fixed: false,
+          },
+        ],
+
+        // L2 Semantic Lint
+        l2Scope: 'recent', // page | recent | folder（无当前知识页时默认近 7 天变动）
+        l2ActiveDocTitle: null, // 打开知识页后解锁「当前页邻域」
+        l2Folder: 'wiki/decisions',
+        l2Running: false,
+        l2Done: false,
+        l2Results: [
+          {
+            id: 'l2-1',
+            summary: '两篇页面对「最大重试次数」的建议口径存在潜在冲突',
+            pageA: '重试与退避策略',
+            quoteA: '“弱网下指数退避最多重试 2 次，总耗时控制在 8 秒以内。”',
+            pageB: '客户端容错清单',
+            quoteB: '“读接口遇到 502/504 时默认自动重试 5 次后再弹窗提示。”',
+            escalated: false,
+            dismissed: false,
+          },
+        ],
+
+        // Multi-page Changesets
+        changesets: [
+          {
+            id: 'cs-0915',
+            summary: '已采纳待审改动：《网关限流设计》（替换限流阈值章节）',
+            time: '今天 13:48',
+            trigger: '人工差异确认',
+            modelAlias: 'gpt-4.1-mini',
+            status: 'applied',
+            parentId: 'cs-0912',
+            droppedClaims: 0,
+            rollbackNote: '',
+            revertBlockedNote: '',
+            revertBlockedChildId: null,
+            ops: [
+              { op: 'replace_section', tag: '替换章节', tagClass: 'replace', title: '网关限流设计', path: 'wiki/concepts/网关限流设计.md', detail: '限流阈值更新', outcome: 'applied', pageState: 'applied' },
+            ],
+          },
+          {
+            id: 'cs-0912',
+            summary: '整理「网关弱网重试实践」随手记（涉及 5 篇变动页面）',
+            time: '今天 13:42',
+            trigger: '60 秒合批整理',
+            modelAlias: 'gpt-4.1-mini',
+            status: 'partial', // applied | partial | partially_reverted | reverted
+            parentId: null,
+            droppedClaims: 1,
+            rollbackNote: '',
+            revertBlockedNote: '',
+            revertBlockedChildId: null,
+            ops: [
+              { op: 'create_page', tag: '新建', tagClass: 'create', title: 'Magpie 网关接入', path: 'wiki/entities/Magpie 网关接入.md', detail: '', outcome: 'applied', pageState: 'applied' },
+              { op: 'append_section', tag: '追加', tagClass: '', title: '重试与退避策略', path: 'wiki/concepts/重试与退避策略.md', detail: '弱网退避要点', outcome: 'applied', pageState: 'applied' },
+              { op: 'add_link', tag: '补双链', tagClass: '', title: '网关限流设计', path: 'wiki/concepts/网关限流设计.md', detail: '→ Magpie 网关接入', outcome: 'applied', pageState: 'applied' },
+              { op: 'set_frontmatter_key', tag: '补别名', tagClass: '', title: '重试与退避策略', path: 'wiki/concepts/重试与退避策略.md', detail: '+ Retry Policy', outcome: 'applied', pageState: 'applied' },
+              { op: 'replace_section', tag: '替换章节', tagClass: 'replace', title: 'API 超时与重试约定', path: 'wiki/decisions/API 超时与重试约定.md', detail: '核心决策页', outcome: 'pending_review', reviewId: 'pr-1', pageState: 'pending' },
+              { op: 'create_page', tag: '新建', tagClass: 'create', title: '熔断半开探针', path: 'wiki/concepts/熔断半开探针.md', detail: '新建单薄页', outcome: 'pending_review', reviewId: 'pr-2', pageState: 'pending' },
+              { op: 'append_section', tag: '追加', tagClass: '', title: '个人复盘日志', path: 'wiki/concepts/个人复盘日志.md', detail: '位于手动保护区', outcome: 'dropped', pageState: 'dropped' },
+            ],
+          },
+          {
+            id: 'cs-0850',
+            summary: '整理「OpenViking 本地记忆分层」收藏文章（3 篇页面）',
+            time: '今天 10:15',
+            trigger: '收件箱提炼',
+            modelAlias: 'gpt-4.1-mini',
+            status: 'partially_reverted',
+            parentId: null,
+            droppedClaims: 0,
+            rollbackNote: '已还原 2 篇；《API 超时与重试约定》因你后续手动修改，已原样保留。',
+            revertBlockedNote: '',
+            revertBlockedChildId: null,
+            ops: [
+              { op: 'create_page', tag: '新建', tagClass: 'create', title: '记忆分层抽取原则', path: 'wiki/concepts/记忆分层抽取原则.md', detail: '', outcome: 'applied', pageState: 'reverted' },
+              { op: 'append_section', tag: '追加', tagClass: '', title: 'API 超时与重试约定', path: 'wiki/decisions/API 超时与重试约定.md', detail: '网关超时备注', outcome: 'applied', pageState: 'kept_modified', simulatedUserModified: true },
+              { op: 'add_link', tag: '补双链', tagClass: '', title: '本地检索架构', path: 'wiki/concepts/本地检索架构.md', detail: '→ 记忆分层抽取原则', outcome: 'applied', pageState: 'reverted' },
+            ],
+          },
+        ],
+
+        // Scene 2: Settings Card 6 (External Agent MCP & SKILL.md)
+        mcpExeExists: true,
+        mcpTab: 'claudeCli', // claudeCli | mcpJson | codexToml
+        mcpTestState: 'idle', // idle | ok | err
+        skillExists: true,
+        skillFeedback: '',
+        rawDirs: [
+          { path: 'raw/clips', fileCount: 14, isCaptureDir: false, allowed: false },
+          { path: 'raw/papers', fileCount: 6, isCaptureDir: false, allowed: false },
+          { path: 'raw/notes', fileCount: 42, isCaptureDir: true, allowed: false },
+          { path: 'raw/meetings', fileCount: 8, isCaptureDir: false, allowed: false },
+        ],
+        rawAllowSavedFeedback: '',
+
+        // Scene 3: Autocomplete
+        acCandidates: [
+          { path: 'wiki/concepts/重试与退避策略.md', stem: '重试与退避策略', title: '重试与退避策略', aliases: ['Retry Policy', '指数退避'], typeLabel: '概念', linkText: '[[重试与退避策略]]', folder: 'wiki/concepts' },
+          { path: 'wiki/decisions/API 超时与重试约定.md', stem: 'API 超时与重试约定', title: 'API 超时与重试约定', aliases: ['超时重试规范'], typeLabel: '决策', linkText: '[[API 超时与重试约定]]', folder: 'wiki/decisions' },
+          { path: 'wiki/decisions/超时设置.md', stem: '超时设置', title: '超时设置', aliases: ['Timeout'], typeLabel: '决策', linkText: '[[decisions/超时设置|超时设置]]', folder: 'wiki/decisions', duplicate: true },
+          { path: 'wiki/concepts/超时设置.md', stem: '超时设置', title: '超时设置', aliases: ['Client Timeout'], typeLabel: '概念', linkText: '[[concepts/超时设置|超时设置]]', folder: 'wiki/concepts', duplicate: true },
+          { path: 'wiki/concepts/网关限流设计.md', stem: '网关限流设计', title: '网关限流设计', aliases: ['Rate Limit', '令牌桶'], typeLabel: '概念', linkText: '[[网关限流设计]]', folder: 'wiki/concepts' },
+          { path: 'wiki/entities/Magpie 网关接入.md', stem: 'Magpie 网关接入', title: 'Magpie 网关接入', aliases: ['Magpie'], typeLabel: '实体', linkText: '[[Magpie 网关接入]]', folder: 'wiki/entities' },
+          { path: 'wiki/concepts/熔断半开探针.md', stem: '熔断半开探针', title: '熔断半开探针', aliases: ['Half-Open Probe'], typeLabel: '概念', linkText: '[[熔断半开探针]]', folder: 'wiki/concepts' },
+        ],
+        hudText: '今天压测确认弱网退避逻辑需要同步更新到 [[重试',
+        hudCursor: null,
+        hudPrevText: '',
+        hudComposing: false,
+        hudAcDismissed: false,
+        hudAcActiveIdx: 0,
+        hudPopoverPos: 'normal', // normal | right-clamp | flip-up
+        hudEscLog: '按 Esc 观察四级优先仲裁：当前命中第 2 级（仅关闭补全弹层）',
+        sourceText: '## 关联策略\n\n当下游出现 503 拥塞时，应联动执行 [[重试',
+        srcCursor: null,
+        sourceAcActiveIdx: 0,
+        sourceAcOpen: true,
+
+        // Scene 4: WikiDocumentView Enhancements
+        docBadgeMode: 'live', // live | warn_only | clean
+        docDisambigOpen: false,
+        docHoverCite: null, // 'w1' | 'w2' | null
+        docSplitCite: null, // 'w1' | 'w2' | null
+        docActiveTitle: '重试与退避策略',
+      };
+
+      // ======================================================================
+      // Utilities
+      // ======================================================================
+      function esc(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function toast(msg) {
+        const region = document.getElementById('toast-region');
+        const el = document.createElement('div');
+        el.className = 'toast';
+        el.textContent = msg;
+        region.appendChild(el);
+        window.setTimeout(() => {
+          el.remove();
+        }, 3200);
+      }
+
+      function copyText(text, label) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => toast(`已复制${label}`),
+            () => toast(`已选中${label}（预览环境请按 Ctrl+C 复制）`)
+          );
+        } else {
+          toast(`已复制${label}`);
+        }
+      }
+
+      function updateGlobalChrome() {
+        document.body.dataset.theme = state.theme;
+        const themeBtn = document.getElementById('btn-theme-toggle');
+        themeBtn.textContent = state.theme === 'slate' ? '主题：深色 Slate' : '主题：浅色 Paper';
+
+        const host = document.getElementById('viewport-host');
+        host.classList.toggle('narrow-mode', state.narrow);
+        document.getElementById('btn-viewport-toggle').textContent = state.narrow ? '视口：1100×700' : '视口：全宽';
+
+        document.querySelectorAll('.p0-scene-tab').forEach((btn) => {
+          const active = btn.dataset.scene === state.scene;
+          btn.classList.toggle('active', active);
+          btn.setAttribute('aria-selected', String(active));
+        });
+        document.querySelectorAll('.nav-item[data-rail-scene]').forEach((btn) => {
+          btn.classList.toggle('active', btn.dataset.railScene === state.scene);
+        });
+
+        const totalPending = state.conflicts.filter((c) => c.status === 'open').length + state.pendingReviews.length;
+        const badge = document.getElementById('rail-pending-badge');
+        badge.textContent = String(totalPending);
+        badge.classList.toggle('hidden', totalPending === 0);
+
+        const allowedCount = state.rawDirs.filter((d) => d.allowed).length;
+        document.getElementById('status-mcp-summary').textContent = state.mcpExeExists
+          ? (allowedCount === 0
+              ? '外部 Agent 只读接入：已就绪（仅知识页）'
+              : `外部 Agent 只读接入：已就绪（知识页 + ${allowedCount} 个原文目录）`)
+          : '外部 Agent 只读接入：未检测到 wikra-mcp.exe';
+      }
+
+      // ======================================================================
+      // Scene 1: OrganizeView (Pending Review + Health Check L1/L2 + Multi-page Changesets)
+      // ======================================================================
+      function getL2Budget() {
+        const folderBudgets = {
+          'wiki/decisions': { pages: 5, pairs: 1, chars: '3,600', label: 'wiki/decisions/ 目录下的页面' },
+          'wiki/concepts': { pages: 8, pairs: 2, chars: '5,200', label: 'wiki/concepts/ 目录下的页面' },
+          'wiki/entities': { pages: 3, pairs: 0, chars: '0', label: 'wiki/entities/ 目录下的页面' },
+        };
+        const l2Budgets = {
+          page: { pages: 6, pairs: 2, chars: '4,800', label: `《${state.l2ActiveDocTitle || '重试与退避策略'}》及直接相邻页面` },
+          recent: { pages: 11, pairs: 4, chars: '9,400', label: '近 7 天新建或改动的页面' },
+          folder: folderBudgets[state.l2Folder] || folderBudgets['wiki/decisions'],
+        };
+        const effectiveScope = (state.l2Scope === 'page' && !state.l2ActiveDocTitle) ? 'recent' : state.l2Scope;
+        return { scope: effectiveScope, budget: l2Budgets[effectiveScope] };
+      }
+
+      function renderOrganizeScene() {
+        const openConflicts = state.conflicts.filter((c) => c.status === 'open');
+        const pendingCount = openConflicts.length + state.pendingReviews.length;
+
+        // Lint counts (respecting page filter if active)
+        const scopedLint = state.lintFindings.filter((f) => {
+          if (f.fixed) return false;
+          if (state.lintPageFilter && f.pagePath !== state.lintPageFilter.path) return false;
+          return true;
+        });
+        const activeFindings = scopedLint.filter((f) => !f.dismissed);
+        const errorCount = activeFindings.filter((f) => f.severity === 'error').length;
+        const warnCount = activeFindings.filter((f) => f.severity === 'warn').length;
+        const infoCount = activeFindings.filter((f) => f.severity === 'info').length;
+        const dismissedCount = scopedLint.filter((f) => f.dismissed).length;
+        // B1: 批量安全修复严格限定 fix.kind === 'safe'（broken_link 仅允许行内单条确认）
+        const safeFixable = activeFindings.filter((f) => f.fix && f.fix.kind === 'safe');
+
+        const visibleLint = scopedLint.filter((f) => {
+          if (state.lintFilter === 'dismissed') return f.dismissed;
+          if (f.dismissed) return false;
+          if (state.lintFilter === 'attention') return f.severity === 'error' || f.severity === 'warn';
+          return true;
+        });
+
+        // L2 budget estimation (defaults to 'recent' when no active wiki doc)
+        const { scope: effectiveL2Scope, budget: curBudget } = getL2Budget();
+        const visibleL2 = state.l2Results.filter((r) => !r.dismissed);
+
+        const headPillText = pendingCount > 0
+          ? `${openConflicts.length} 处冲突 · ${state.pendingReviews.length} 篇待审`
+          : '已全部确认';
+
+        const lintSummaryText = (errorCount + warnCount) > 0
+          ? `${errorCount} 项错误 · ${warnCount} 项提醒`
+          : '未发现异常';
+
+        return `
+          <div class="stage-body">
+            <div class="organize-wrap">
+              <section class="organize-header">
+                <div>
+                  <h1>整理与同步</h1>
+                  <p>常规补充会在后台自动落盘且随时可按页撤销；涉及核心结论变动、观点冲突或知识库体检异常时，在这里集中处理。</p>
+                </div>
+                <div class="row-flex">
+                  <button type="button" class="btn sm" data-go-scene="wikidoc">回到知识库</button>
+                  <button type="button" class="btn primary sm" data-go-scene="autocomplete">记一条随手笔记</button>
+                </div>
+              </section>
+
+              <div class="organize-cols">
+                <!-- Left Column: 2 Focused Cards -->
+                <div class="org-col">
+                  <!-- Card 1: Conflicts & Per-page Pending Reviews -->
+                  <section class="ops-card ${pendingCount > 0 ? 'priority' : ''}">
+                    <div class="ops-card-head">
+                      <div class="ops-card-title">
+                        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="m10.29 3.86-8.48 14.7A2 2 0 0 0 3.53 21.5h16.94a2 2 0 0 0 1.72-2.94l-8.48-14.7a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                        <span>需要你确认的冲突与待审改动</span>
+                        <span class="pill ${pendingCount > 0 ? 'warning' : 'success'}">${esc(headPillText)}</span>
+                      </div>
+                    </div>
+
+                    <div class="ops-list">
+                      ${openConflicts.map((c) => `
+                        <div class="ops-row">
+                          <div class="ops-row-main">
+                            <div class="row-flex">
+                              <span class="pill warning">观点冲突</span>
+                              <span class="ops-row-title">${esc(c.topic)}</span>
+                            </div>
+                            <span class="ops-row-desc">${esc(c.currentLabel)} 与 ${esc(c.incomingLabel)} 存在分歧，请进入左右对比页确认以哪条为准。</span>
+                          </div>
+                          <div class="ops-row-actions">
+                            <button type="button" class="btn primary sm" data-open-conflict="${esc(c.id)}">左右对比确认</button>
+                          </div>
+                        </div>
+                      `).join('')}
+
+                      ${state.pendingReviews.map((pr) => `
+                        <div class="ops-row">
+                          <div class="ops-row-main">
+                            <div class="row-flex">
+                              <span class="pill accent">待审改动</span>
+                              <span class="ops-row-title">${esc(pr.pageTitle)}</span>
+                              <span class="pill">${esc(pr.reasonLabel)}</span>
+                              ${pr.externallyModified ? '<span class="pill error">磁盘已有外部变动</span>' : ''}
+                            </div>
+                            <span class="ops-row-desc">${esc(pr.summary)}</span>
+                          </div>
+                          <div class="ops-row-actions">
+                            <button type="button" class="btn primary sm" data-open-diff="${esc(pr.id)}">查看差异并确认</button>
+                          </div>
+                        </div>
+                      `).join('')}
+
+                      ${pendingCount === 0 ? `
+                        <div class="ops-row">
+                          <div class="ops-row-main">
+                            <span class="ops-row-title">当前没有待确认的冲突或改动，知识库保持一致</span>
+                            <span class="ops-row-desc">仅当 AI 需要替换核心页结论、新建单薄页或发现观点分歧时，才会在这里暂停请你把关。</span>
+                          </div>
+                        </div>
+                      ` : ''}
+                    </div>
+                  </section>
+
+                  <!-- Card 2: Knowledge Base Health Check (L1 + L2) -->
+                  <section class="ops-card" id="health-check-card">
+                    <div class="ops-card-head">
+                      <div class="ops-card-title">
+                        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                        <span>知识库体检</span>
+                        <span class="pill ${errorCount > 0 ? 'error' : warnCount > 0 ? 'warning' : 'success'}">${esc(lintSummaryText)}</span>
+                      </div>
+                      <div class="row-flex">
+                        <button type="button" class="btn quiet sm" id="btn-rerun-lint">重新检查</button>
+                        ${safeFixable.length > 0 ? `
+                          <button type="button" class="btn primary sm" id="btn-fix-all-safe" title="仅批量修复安全项（残留冲突标记、目录页待同步）；断链改写需逐条核对">
+                            一键修复安全项 (${safeFixable.length})
+                          </button>
+                        ` : ''}
+                      </div>
+                    </div>
+
+                    ${state.lintPageFilter ? `
+                      <div class="lint-page-filter-bar">
+                        <span>当前仅查看 <strong>《${esc(state.lintPageFilter.title)}》</strong> 的体检项（从知识页徽标跳转）</span>
+                        <button type="button" class="btn sm" id="btn-clear-page-filter">查看全库</button>
+                      </div>
+                    ` : ''}
+
+                    <div class="lint-filter-row">
+                      <div class="lint-filter-pills" role="tablist" aria-label="体检筛选">
+                        <button type="button" class="${state.lintFilter === 'attention' ? 'active' : ''}" data-lint-filter="attention">
+                          需关注 (${errorCount + warnCount})
+                        </button>
+                        <button type="button" class="${state.lintFilter === 'all' ? 'active' : ''}" data-lint-filter="all">
+                          全部 (${activeFindings.length})
+                        </button>
+                        <button type="button" class="${state.lintFilter === 'dismissed' ? 'active' : ''}" data-lint-filter="dismissed">
+                          已忽略 (${dismissedCount})
+                        </button>
+                      </div>
+                      <span class="hint">默认仅展示错误与提醒，低优先级建议已折叠</span>
+                    </div>
+
+                    <div class="ops-list">
+                      ${visibleLint.length ? visibleLint.map((f) => `
+                        <div class="lint-row sev-${esc(f.severity)}">
+                          <div class="lint-row-main">
+                            <div class="row-flex">
+                              <span class="pill ${f.severity === 'error' ? 'error' : f.severity === 'warn' ? 'warning' : 'info'}">${esc(f.ruleLabel)}</span>
+                              <span class="ops-row-title">${esc(f.pageTitle)}</span>
+                            </div>
+                            <span class="ops-row-desc">${esc(f.message)}</span>
+                            <span class="lint-row-meta">${esc(f.pagePath)}</span>
+                          </div>
+                          <div class="ops-row-actions">
+                            ${!f.dismissed && f.fix ? `
+                              <button type="button" class="btn primary sm" data-fix-lint="${esc(f.id)}">${esc(f.fix.label)}</button>
+                            ` : ''}
+                            ${!f.dismissed ? `
+                              <button type="button" class="btn sm" data-open-doc-from-lint="${esc(f.pageTitle)}">打开页面</button>
+                              <button type="button" class="btn quiet sm" data-dismiss-lint="${esc(f.id)}">忽略</button>
+                            ` : `
+                              <button type="button" class="btn sm" data-restore-lint="${esc(f.id)}">恢复提示</button>
+                            `}
+                          </div>
+                        </div>
+                      `).join('') : `
+                        <p class="hint" style="padding:6px 2px;">当前筛选下没有需要处理的体检项。</p>
+                      `}
+                    </div>
+
+                    ${state.lintFilter === 'attention' && infoCount > 0 ? `
+                      <div class="lint-collapsed-note">
+                        <span>已折叠 ${infoCount} 项低优先级建议（如目录页待同步、尚未关联页、单薄页），避免打扰。</span>
+                        <button type="button" class="btn quiet xs" data-lint-filter="all">展开查看全部</button>
+                      </div>
+                    ` : ''}
+
+                    <!-- L2 Directed Semantic Lint Trigger Footer -->
+                    <div class="l2-zone">
+                      <div class="row-between">
+                        <div class="row-flex">
+                          <strong style="font-size:13px;">定向语义体检</strong>
+                          <span class="pill">按需调用 AI · 双侧短引核验</span>
+                        </div>
+                        <div class="lint-filter-pills" role="radiogroup" aria-label="语义体检范围">
+                          <button
+                            type="button"
+                            class="${effectiveL2Scope === 'page' ? 'active' : ''}"
+                            data-l2-scope="page"
+                            ${!state.l2ActiveDocTitle ? 'disabled title="当前未打开知识页，已默认选中近 7 天变动"' : ''}
+                          >当前页邻域</button>
+                          <button type="button" class="${effectiveL2Scope === 'recent' ? 'active' : ''}" data-l2-scope="recent">近 7 天变动</button>
+                          <button type="button" class="${effectiveL2Scope === 'folder' ? 'active' : ''}" data-l2-scope="folder">指定文件夹</button>
+                        </div>
+                      </div>
+
+                      ${!state.l2ActiveDocTitle ? `
+                        <div class="row-between" style="font-size:11.5px;">
+                          <span class="hint">当前无打开的知识页上下文，已默认选中「近 7 天变动」（打开任意知识页后可解锁「当前页邻域」）。</span>
+                          <button type="button" class="btn quiet xs" id="btn-sim-open-doc-l2">演示：关联《重试与退避策略》</button>
+                        </div>
+                      ` : ''}
+
+                      ${effectiveL2Scope === 'folder' ? `
+                        <div class="row-flex" style="font-size:12px;">
+                          <label for="l2-folder-sel" class="hint">选择检查目录：</label>
+                          <select id="l2-folder-sel" class="tweak-select">
+                            <option value="wiki/decisions" ${state.l2Folder === 'wiki/decisions' ? 'selected' : ''}>wiki/decisions/（决策页 · 1 组候选）</option>
+                            <option value="wiki/concepts" ${state.l2Folder === 'wiki/concepts' ? 'selected' : ''}>wiki/concepts/（概念页 · 2 组候选）</option>
+                            <option value="wiki/entities" ${state.l2Folder === 'wiki/entities' ? 'selected' : ''}>wiki/entities/（实体页 · 0 组候选禁用态）</option>
+                          </select>
+                        </div>
+                      ` : ''}
+
+                      <div class="l2-budget-strip">
+                        <div style="min-width:0;flex:1;">
+                          <div style="color:var(--text);">
+                            范围：<strong>${esc(curBudget.label)}</strong>
+                          </div>
+                          ${curBudget.pairs === 0 ? `
+                            <div class="hint" style="margin-top:2px;">
+                              预计扫描 <strong class="mono">${curBudget.pages}</strong> 篇页面 · 筛出 <strong class="mono">0</strong> 组候选对 —— 当前范围内未筛出需要深度比对的相似页面。
+                            </div>
+                          ` : `
+                            <div class="hint" style="margin-top:2px;">
+                              预计扫描 <strong class="mono">${curBudget.pages}</strong> 篇页面 · 筛出 <strong class="mono">${curBudget.pairs}</strong> 组候选对 · 约 <strong class="mono">${curBudget.chars}</strong> 字 · 模型 <span class="mono">gpt-4.1-mini</span>（确认后才调用）
+                            </div>
+                          `}
+                        </div>
+                        <button type="button" class="btn primary sm" id="btn-run-l2" ${state.l2Running || curBudget.pairs === 0 ? 'disabled' : ''}>
+                          ${state.l2Running ? '正在比对…' : (curBudget.pairs === 0 ? '无可比对候选' : (state.l2Done ? '重新语义体检' : '确认开始语义体检'))}
+                        </button>
+                      </div>
+
+                      ${state.l2Done ? (visibleL2.length ? visibleL2.map((item) => `
+                        <div class="l2-result-card">
+                          <div class="row-between">
+                            <div class="row-flex">
+                              <span class="pill accent">语义分歧发现</span>
+                              <strong style="font-size:12.5px;">${esc(item.summary)}</strong>
+                            </div>
+                            <div class="row-flex">
+                              ${item.escalated
+                                ? '<span class="pill warning">已转为待确认冲突</span>'
+                                : `<button type="button" class="btn primary sm" data-escalate-l2="${esc(item.id)}">转为冲突</button>`
+                              }
+                              <button type="button" class="btn quiet sm" data-dismiss-l2="${esc(item.id)}">忽略</button>
+                            </div>
+                          </div>
+                          <div class="l2-quotes-grid">
+                            <div class="l2-quote-box">
+                              <button type="button" class="wikilink" style="font-size:11.5px;font-weight:650;align-self:flex-start;text-align:left;" data-open-doc-from-lint="${esc(item.pageA)}">《${esc(item.pageA)}》逐字短引 →</button>
+                              <span>${esc(item.quoteA)}</span>
+                            </div>
+                            <div class="l2-quote-box">
+                              <button type="button" class="wikilink" style="font-size:11.5px;font-weight:650;align-self:flex-start;text-align:left;" data-open-doc-from-lint="${esc(item.pageB)}">《${esc(item.pageB)}》逐字短引 →</button>
+                              <span>${esc(item.quoteB)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      `).join('') : '<p class="hint">语义体检完成，当前范围内未发现新的观点矛盾。</p>') : ''}
+                    </div>
+                  </section>
+                </div>
+
+                <!-- Right Column: Buffer Queue + Upgraded Multi-Page Changesets -->
+                <div class="org-col">
+                  <div class="buffer-banner">
+                    <div>
+                      <strong>有 2 条新笔记正在等待合并整理</strong>
+                      <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">
+                        将在 <strong class="mono">00:42</strong> 后自动开始，写错了可先移出本次队列。
+                      </div>
+                    </div>
+                    <div class="row-flex" style="flex:none;">
+                      <button type="button" class="btn sm" id="btn-buffer-view">查看 / 撤回</button>
+                      <button type="button" class="btn primary sm" id="btn-buffer-flush">立即整理</button>
+                    </div>
+                  </div>
+
+                  <section class="ops-card">
+                    <div class="ops-card-head">
+                      <div class="ops-card-title">
+                        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+                        <span>AI 最近帮你整理了什么</span>
+                      </div>
+                      <span class="hint">多页变动按页安全撤销，不覆盖手动修改</span>
+                    </div>
+
+                    <div class="ops-list">
+                      ${state.changesets.map((cs) => {
+                        const statusMap = {
+                          applied: { text: '已完成', cls: 'success' },
+                          partial: { text: '含待确认项', cls: 'warning' },
+                          partially_reverted: { text: '已部分撤销', cls: 'info' },
+                          reverted: { text: '已撤销', cls: '' },
+                        };
+                        const st = statusMap[cs.status] || statusMap.applied;
+                        return `
+                          <article class="cs-card ${state.highlightCsId === cs.id ? 'highlighted' : ''}" id="cs-card-${esc(cs.id)}">
+                            <div class="row-between">
+                              <strong style="font-size:13px;">${esc(cs.summary)}</strong>
+                              <span class="pill ${st.cls}">${st.text}</span>
+                            </div>
+                            <div class="row-flex" style="font-size:11.5px;color:var(--muted);">
+                              <span>${esc(cs.time)} · ${esc(cs.trigger)} · ${esc(cs.modelAlias)}</span>
+                              ${cs.parentId ? `
+                                <button type="button" class="pill accent" style="cursor:pointer;" data-jump-parent="${esc(cs.parentId)}">
+                                  由待审确认生成 · 关联 #${esc(cs.parentId)}
+                                </button>
+                              ` : ''}
+                            </div>
+
+                            ${cs.droppedClaims > 0 ? `
+                              <div class="cs-gentle-note">
+                                <svg class="ui-icon sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                                <span>已跳过 ${cs.droppedClaims} 条不符原文的结论（未写入页面）</span>
+                              </div>
+                            ` : ''}
+
+                            <div class="editop-list">
+                              ${cs.ops.map((op) => {
+                                const stateLabel = op.pageState === 'reverted'
+                                  ? '<span class="pill">已还原</span>'
+                                  : op.pageState === 'kept_modified'
+                                    ? '<span class="pill accent">已保留你的修改</span>'
+                                    : op.outcome === 'pending_review'
+                                      ? `<button type="button" class="pill warning" style="cursor:pointer;" data-open-diff="${esc(op.reviewId || '')}">等待你确认 · 查看差异</button>`
+                                      : op.outcome === 'discarded'
+                                        ? '<span class="pill">已丢弃</span>'
+                                        : op.outcome === 'dropped'
+                                          ? '<span class="pill">已跳过</span>'
+                                          : '<span class="hint">已写入</span>';
+                                return `
+                                  <div class="cs-op-row">
+                                    <div class="cs-op-left">
+                                      <span class="cs-op-tag ${esc(op.tagClass)}">${esc(op.tag)}</span>
+                                      <button type="button" class="wikilink" data-open-doc-from-lint="${esc(op.title)}">${esc(op.title)}</button>
+                                      ${op.detail ? `<span class="hint">· ${esc(op.detail)}</span>` : ''}
+                                    </div>
+                                    <div>${stateLabel}</div>
+                                  </div>
+                                `;
+                              }).join('')}
+                            </div>
+
+                            ${cs.revertBlockedNote ? `
+                              <div class="cs-revert-blocked" role="alert">
+                                <span>${esc(cs.revertBlockedNote)}</span>
+                                ${cs.revertBlockedChildId ? `
+                                  <button type="button" class="btn xs" data-jump-parent="${esc(cs.revertBlockedChildId)}">定位子记录 #${esc(cs.revertBlockedChildId)}</button>
+                                ` : ''}
+                              </div>
+                            ` : ''}
+
+                            ${cs.rollbackNote ? `
+                              <div class="cs-rollback-feedback">${esc(cs.rollbackNote)}</div>
+                            ` : ''}
+
+                            <div class="row-flex">
+                              ${cs.status !== 'reverted' && cs.status !== 'partially_reverted' ? `
+                                <button type="button" class="btn sm" data-revert-cs="${esc(cs.id)}">撤销此次整理</button>
+                              ` : ''}
+                            </div>
+                          </article>
+                        `;
+                      }).join('')}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // ======================================================================
+      // Scene 2: SettingsModal Card 6 (External Agent MCP & SKILL.md)
+      // ======================================================================
+      function getMcpSnippet() {
+        const exe = 'D:\\\\Apps\\\\Wikra\\\\wikra-mcp.exe';
+        const vault = 'D:\\\\Vault\\\\MyBrain';
+        if (state.mcpTab === 'claudeCli') {
+          return {
+            title: '在终端中运行（Claude Code CLI · snippets.claudeCli）',
+            code: `claude mcp add wikra -- "D:\\Apps\\Wikra\\wikra-mcp.exe" --vault "D:\\Vault\\MyBrain"`,
+          };
+        }
+        if (state.mcpTab === 'mcpJson') {
+          return {
+            title: 'Claude Desktop / Antigravity MCP 配置（mcp_config.json · snippets.mcpJson）',
+            code: `{
+  "mcpServers": {
+    "wikra": {
+      "command": "${exe}",
+      "args": ["--vault", "${vault}"]
+    }
+  }
+}`,
+          };
+        }
+        return {
+          title: 'Codex CLI 配置（~/.codex/config.toml · snippets.codexToml）',
+          code: `[mcp_servers.wikra]
+command = "${exe}"
+args = ["--vault", "${vault}"]`,
+        };
+      }
+
+      function renderSettingsScene() {
+        const snippet = getMcpSnippet();
+        const allowedDirs = state.rawDirs.filter((d) => d.allowed);
+        const policySummary = allowedDirs.length === 0
+          ? '当前策略：仅知识页与页内短引（未放开任何原文目录）'
+          : `当前策略：知识页 + 已放开 ${allowedDirs.length} 个原文目录（${allowedDirs.map((d) => d.path).join('、')}）`;
+
+        return `
+          <div class="settings-preview-stage">
+            <div class="settings-modal-inline">
+              <div class="hud-head">
+                <strong style="font-size:14px;">设置 · 外观、AI 模型、数据范围与外部 Agent 接入</strong>
+                <div class="row-flex">
+                  <button type="button" class="btn xs" id="btn-toggle-mcp-exists">
+                    演示：${state.mcpExeExists ? '切换为「未找到程序」' : '恢复「已就绪」'}
+                  </button>
+                </div>
+              </div>
+
+              <div class="modal-body">
+                <!-- Context Anchor for Existing Cards 1-5 -->
+                <div class="settings-collapsed-nav">
+                  <span>既有设置卡片（已折叠预览）：</span>
+                  <span class="pill">1. 外观与阅读宽度</span>
+                  <span class="pill">2. AI 模型与网关</span>
+                  <span class="pill">3. OpenViking 记忆</span>
+                  <span class="pill">4. 数据发送范围</span>
+                  <span class="pill">5. 热键与知识库目录</span>
+                  <span class="pill accent">6. 外部 Agent 接入（本次新增）</span>
+                </div>
+
+                <!-- Card 6: External Agent MCP & SKILL.md -->
+                <section class="setting-card">
+                  <div class="row-between">
+                    <strong style="font-size:14px;">6. 外部 Agent 接入（只读 MCP 与 SKILL.md）</strong>
+                    <span class="pill ${state.mcpExeExists ? 'success' : 'warning'}">
+                      ${state.mcpExeExists ? '已就绪' : '未找到程序'}
+                    </span>
+                  </div>
+                  <p class="hint">
+                    让 Claude Code、Codex、Antigravity 等本机编程助手直接检索你的知识库并核验原文出处，全程只读，绝不改动你的 Markdown 文件。
+                  </p>
+
+                  <!-- 6.1 Executable Detection + Local Test -->
+                  <div class="mcp-status-box">
+                    <div class="row-between">
+                      <div style="min-width:0;flex:1;">
+                        <div style="font-size:12px;font-weight:600;color:var(--text-secondary);">只读 MCP 组件路径</div>
+                        <div class="mono" style="font-size:11.5px;color:var(--muted);margin-top:2px;word-break:break-all;">
+                          D:\\Apps\\Wikra\\wikra-mcp.exe
+                        </div>
+                      </div>
+                      <div class="row-flex">
+                        <button type="button" class="btn sm" id="btn-test-mcp" ${state.mcpExeExists ? '' : 'disabled'}>
+                          测试本地连接
+                        </button>
+                        <button type="button" class="btn quiet xs" id="btn-test-mcp-fail" ${state.mcpExeExists ? '' : 'disabled'} title="演示连接失败态样式">
+                          演示失败态
+                        </button>
+                      </div>
+                    </div>
+
+                    ${!state.mcpExeExists ? `
+                      <div class="cs-gentle-note" style="background:var(--warning-soft);color:var(--text);">
+                        <span>未在当前程序目录检测到 <code>wikra-mcp.exe</code>。请确认已将完整发布包中的 <code>wikra-mcp.exe</code> 与 <code>wikra.exe</code> 放在同一文件夹后，重新打开设置页面检查。</span>
+                      </div>
+                    ` : ''}
+
+                    ${state.mcpTestState === 'ok' ? `
+                      <div class="row-flex">
+                        <span class="pill success">握手正常 · 协议 2025-11-25 · 可用工具 3 个（search / read_page / get_evidence）</span>
+                      </div>
+                    ` : ''}
+
+                    ${state.mcpTestState === 'err' ? `
+                      <div class="cs-gentle-note" style="background:var(--error-soft);border:1px solid var(--error);color:var(--text);" role="alert">
+                        <span class="pill error">连接失败</span>
+                        <span>本地只读服务启动超时或知识库目录不可读，请确认程序未被安全软件拦截且当前目录具有读取权限后重试。</span>
+                      </div>
+                    ` : ''}
+                  </div>
+
+                  <!-- 6.2 Multi-Client Snippets -->
+                  <div style="display:flex;flex-direction:column;gap:8px;">
+                    <div class="row-between">
+                      <span style="font-size:12.5px;font-weight:600;">接入配置片段（自动填入当前知识库路径）</span>
+                      <div class="lint-filter-pills" role="tablist" aria-label="客户端配置切换">
+                        <button type="button" class="${state.mcpTab === 'claudeCli' ? 'active' : ''}" data-mcp-tab="claudeCli">Claude Code CLI</button>
+                        <button type="button" class="${state.mcpTab === 'mcpJson' ? 'active' : ''}" data-mcp-tab="mcpJson">Claude / Antigravity JSON</button>
+                        <button type="button" class="${state.mcpTab === 'codexToml' ? 'active' : ''}" data-mcp-tab="codexToml">Codex TOML</button>
+                      </div>
+                    </div>
+                    <div class="mcp-code-wrap">
+                      <div class="mcp-code-head">
+                        <span>${esc(snippet.title)}</span>
+                        <button type="button" class="btn xs" id="btn-copy-snippet">一键复制</button>
+                      </div>
+                      <pre class="mcp-code-pre"><code>${esc(snippet.code)}</code></pre>
+                    </div>
+                  </div>
+
+                  <!-- 6.3 SKILL.md Export & Install Distinction -->
+                  <div style="padding-top:10px;border-top:1px solid var(--line-subtle);display:flex;flex-direction:column;gap:8px;">
+                    <div class="row-between">
+                      <div class="row-flex">
+                        <strong style="font-size:12.5px;">Agent 使用说明（SKILL.md）</strong>
+                        <span class="pill ${state.skillExists ? 'info' : ''}">
+                          ${state.skillExists ? '已导出（Vault 根）' : '尚未导出'}
+                        </span>
+                      </div>
+                      <button type="button" class="btn primary sm" id="btn-export-skill">
+                        生成 / 更新 Vault 根 SKILL.md
+                      </button>
+                    </div>
+                    <span class="hint" style="word-break:break-all;">
+                      文件路径：<code class="mono">D:\\Vault\\MyBrain\\SKILL.md</code>（固定技能名 <code class="mono">wikra-lookup</code>，仅更新托管区内容，保留你的自定义说明）。
+                    </span>
+                    ${state.skillFeedback ? `<span class="pill success" style="align-self:flex-start;">${esc(state.skillFeedback)}</span>` : ''}
+
+                    <div class="skill-install-box">
+                      <span style="color:var(--text-secondary);">
+                        <strong>安装提示：</strong>「已导出」仅表示文件已生成到知识库根目录。若希望外部 Agent 自动发现该技能，请将此文件复制到以下任一技能目录（保持目录名为 <code class="mono">wikra-lookup</code>）：
+                      </span>
+                      <div class="skill-path-row">
+                        <span class="mono" style="font-size:11.5px;">Claude Code：~/.claude/skills/wikra-lookup/SKILL.md</span>
+                        <button type="button" class="btn quiet xs" data-copy-path="~/.claude/skills/wikra-lookup/SKILL.md">复制路径</button>
+                      </div>
+                      <div class="skill-path-row">
+                        <span class="mono" style="font-size:11.5px;">Antigravity / 通用：~/.agents/skills/wikra-lookup/SKILL.md</span>
+                        <button type="button" class="btn quiet xs" data-copy-path="~/.agents/skills/wikra-lookup/SKILL.md">复制路径</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 6.4 Raw Folder Authorization (D3-A Two-Level Model) -->
+                  <div style="padding-top:10px;border-top:1px solid var(--line-subtle);display:flex;flex-direction:column;gap:10px;">
+                    <div>
+                      <strong style="font-size:12.5px;">原文目录授权（按文件夹显式放开）</strong>
+                      <p style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
+                        <strong>默认仅暴露 <code>wiki/</code> 与页内已有逐字短引，外部 Agent 看不到 <code>raw/</code> 与随手记正文。</strong>
+                        勾选下方目录后，外部 Agent 可检索并读取对应目录原文，且查证引文时可获取原段前后各 1 段上下文（最多 1,200 字）。
+                      </p>
+                    </div>
+
+                    <div class="raw-allow-list">
+                      ${state.rawDirs.map((d, idx) => `
+                        <label class="raw-allow-item ${d.allowed ? 'checked' : ''}">
+                          <input type="checkbox" data-raw-allow-idx="${idx}" ${d.allowed ? 'checked' : ''}>
+                          <div style="min-width:0;display:flex;flex-direction:column;gap:3px;">
+                            <div class="row-flex">
+                              <span class="mono" style="font-size:12px;font-weight:600;word-break:break-all;">${esc(d.path)}</span>
+                              <span class="pill">${d.fileCount} 篇</span>
+                              ${d.isCaptureDir ? '<span class="pill warning">随手记目录</span>' : ''}
+                            </div>
+                            <span class="hint">
+                              ${d.isCaptureDir ? '私人随手记 · 建议保持关闭' : '原文子目录 · 默认对外部 Agent 不可见'}
+                            </span>
+                          </div>
+                        </label>
+                      `).join('')}
+                    </div>
+
+                    <div class="row-between">
+                      <span class="hint">${esc(policySummary)}</span>
+                      <button type="button" class="btn sm" id="btn-save-raw-allow">保存目录授权</button>
+                    </div>
+                    ${state.rawAllowSavedFeedback ? `<span class="pill success" style="align-self:flex-start;">${esc(state.rawAllowSavedFeedback)}</span>` : ''}
+                  </div>
+                </section>
+              </div>
+
+              <div class="hud-foot">
+                <span class="hint">.wikra/ 状态目录、未保存草稿与系统凭据永远不会暴露给外部 Agent</span>
+                <button type="button" class="btn primary sm" data-go-scene="organize">完成</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // ======================================================================
+      // Scene 3: [[ / 【【 Autocomplete (540×380 Quick Capture + Main Source Mode)
+      // ======================================================================
+      function matchAutocomplete(text, cursorPos) {
+        const pos = typeof cursorPos === 'number' ? Math.max(0, Math.min(cursorPos, text.length)) : text.length;
+        const before = text.slice(0, pos);
+        const after = text.slice(pos);
+        const m = before.match(/(?:\[\[|【【)([^\]】\n]{0,40})$/);
+        if (!m) return null;
+        // 吸收光标后紧邻的成对闭合符 ]] 或 】】
+        const closeMatch = after.match(/^(?:\]\]|】】)/);
+        return {
+          start: before.length - m[0].length,
+          end: pos + (closeMatch ? closeMatch[0].length : 0),
+          rawTrigger: m[0].startsWith('【【') ? '【【' : '[[',
+          query: m[1].trim(),
+          absorbedClosing: Boolean(closeMatch),
+        };
+      }
+
+      function formatPickedLink(picked) {
+        if (picked.matchedAlias) {
+          // 重名文件 + 别名命中：[[folder/stem|alias]]；唯一文件 + 别名命中：[[stem|alias]]
+          const target = picked.duplicate
+            ? `${picked.folder.replace(/^wiki\//, '')}/${picked.stem}`
+            : picked.stem;
+          return `[[${target}|${picked.matchedAlias}]]`;
+        }
+        return picked.linkText;
+      }
+
+      function filterCandidates(query) {
+        const q = query.toLowerCase();
+        return state.acCandidates
+          .map((c) => {
+            const matchedAlias = q ? c.aliases.find((a) => a.toLowerCase().includes(q)) : null;
+            const titleHit = !q || c.title.toLowerCase().includes(q) || c.stem.toLowerCase().includes(q);
+            const pathHit = q && c.path.toLowerCase().includes(q);
+            if (!titleHit && !matchedAlias && !pathHit) return null;
+            return { ...c, matchedAlias };
+          })
+          .filter(Boolean)
+          .slice(0, 7);
+      }
+
+      function highlightText(text, query) {
+        if (!query) return esc(text);
+        const idx = text.toLowerCase().indexOf(query.toLowerCase());
+        if (idx < 0) return esc(text);
+        return esc(text.slice(0, idx))
+          + `<span class="cm-ac-match">${esc(text.slice(idx, idx + query.length))}</span>`
+          + esc(text.slice(idx + query.length));
+      }
+
+      function renderAcPopoverHtml(candidates, activeIdx, query, scope, posStyle) {
+        if (!candidates.length) return '';
+        return `
+          <div class="cm-ac-popover" style="${posStyle}" role="listbox" aria-label="知识页双链补全">
+            <div class="cm-ac-list">
+              ${candidates.map((c, idx) => {
+                const sub = c.matchedAlias
+                  ? `别名命中：${c.matchedAlias} · ${c.folder}`
+                  : (c.duplicate ? `重名路径：${c.path}` : c.folder);
+                return `
+                  <button
+                    type="button"
+                    class="cm-ac-option ${idx === activeIdx ? 'active' : ''}"
+                    role="option"
+                    aria-selected="${idx === activeIdx}"
+                    data-ac-pick="${scope}:${idx}"
+                  >
+                    <div class="cm-ac-top">
+                      <span class="cm-ac-title">${highlightText(c.title, query)}</span>
+                      <span class="pill ${c.typeLabel === '决策' ? 'accent' : ''}">${esc(c.typeLabel)}</span>
+                    </div>
+                    <span class="cm-ac-sub">${esc(sub)}</span>
+                  </button>
+                `;
+              }).join('')}
+            </div>
+            <div class="cm-ac-foot">
+              <span>↑↓ 选择 · Enter / Tab 插入</span>
+              <span>Esc 仅关闭补全</span>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderAutocompleteScene() {
+        const hudMatch = matchAutocomplete(state.hudText, state.hudCursor);
+        const hudCands = hudMatch && !state.hudComposing && !state.hudAcDismissed
+          ? filterCandidates(hudMatch.query)
+          : [];
+        const hudShow = hudCands.length > 0;
+        if (state.hudAcActiveIdx >= hudCands.length) state.hudAcActiveIdx = 0;
+
+        // 540×380 快捷窗三态定位：均位于 290px 编辑区内，不裁切且绝不遮挡底栏
+        let hudPosStyle = 'top: 44px; left: 16px;';
+        if (state.hudPopoverPos === 'right-clamp') hudPosStyle = 'top: 44px; right: 8px; left: auto;';
+        if (state.hudPopoverPos === 'flip-up') hudPosStyle = 'bottom: 40px; left: 16px; top: auto;';
+
+        const srcMatch = matchAutocomplete(state.sourceText, state.srcCursor);
+        const srcCands = srcMatch && state.sourceAcOpen ? filterCandidates(srcMatch.query) : [];
+        if (state.sourceAcActiveIdx >= srcCands.length) state.sourceAcActiveIdx = 0;
+
+        // Current active Esc level in HUD
+        const escLevel = state.hudComposing ? 1 : (hudShow ? 2 : (!state.hudText.trim() ? 3 : 4));
+
+        return `
+          <div class="ac-showcase">
+            <div class="ac-controls-bar">
+              <div>
+                <strong style="font-size:14px;">双链模糊补全（支持 <code>[[</code> 与微软拼音 <code>【【</code>）</strong>
+                <div class="hint">可直接编辑下方文本框，体验实时过滤、自动吸收闭合符、重名+别名格式、Ctrl+Z 单步回退与四级 Esc 优先级。</div>
+              </div>
+              <div class="row-flex">
+                <button type="button" class="btn sm" data-ac-preset="ascii">输入 [[重试</button>
+                <button type="button" class="btn sm" data-ac-preset="cjk">微软拼音 【【重试|】】</button>
+                <button type="button" class="btn sm" data-ac-preset="alias">搜别名 [[Retry</button>
+                <button type="button" class="btn sm" data-ac-preset="dup">重名消歧 [[超时</button>
+                <button type="button" class="btn sm" data-ac-preset="dup-alias">重名+别名 [[Timeout</button>
+                <button type="button" class="btn sm" data-ac-preset="all">全部候选 [[</button>
+                <button type="button" class="btn sm ${state.hudPopoverPos === 'right-clamp' ? 'active-toggle' : ''}" data-ac-pos="right-clamp">边缘右钳位</button>
+                <button type="button" class="btn sm ${state.hudPopoverPos === 'flip-up' ? 'active-toggle' : ''}" data-ac-pos="flip-up">底部上翻</button>
+                <button type="button" class="btn sm ${state.hudComposing ? 'active-toggle' : ''}" id="btn-toggle-ime">
+                  ${state.hudComposing ? '退出 IME 组词模拟' : '模拟 IME 组词期'}
+                </button>
+              </div>
+            </div>
+
+            <!-- 4-Level Esc Live Indicator -->
+            <div class="esc-chain-bar" aria-label="四级 Esc 优先级实时状态">
+              <div class="esc-step ${escLevel === 1 ? 'active' : ''}">
+                <strong>第 1 级 · IME 组词期</strong>
+                <span class="hint">直接交还输入法，补全不弹出</span>
+              </div>
+              <div class="esc-step ${escLevel === 2 ? 'active' : ''}">
+                <strong>第 2 级 · 补全弹层打开</strong>
+                <span class="hint">Esc 仅关弹层，不收起窗口</span>
+              </div>
+              <div class="esc-step ${escLevel === 3 ? 'active' : ''}">
+                <strong>第 3 级 · 空草稿</strong>
+                <span class="hint">立即收起随手记浮窗</span>
+              </div>
+              <div class="esc-step ${escLevel === 4 ? 'active' : ''}">
+                <strong>第 4 级 · 非空草稿</strong>
+                <span class="hint">落盘保留草稿并收起，绝不提交</span>
+              </div>
+            </div>
+
+            <div class="ac-dual-grid">
+              <!-- Scenario 3A: 540×380 Quick Capture HUD -->
+              <div style="display:flex;flex-direction:column;gap:8px;">
+                <div class="row-between">
+                  <span class="kicker">场景 A · 随手记快捷浮窗（真实尺寸 540×380，minHeight: 280，fixed 定位 + 高度上限 220px）</span>
+                  <span class="hint">可按 Esc / ↑↓ / Enter 测试</span>
+                </div>
+                <section class="hud-540" aria-label="随手记 540×380 浮窗预览">
+                  <div class="hud-head">
+                    <div class="row-flex">
+                      <span class="pill accent">随手记</span>
+                      <span class="hint">存为本地 Markdown 原文（<span class="mono">raw/notes</span>）</span>
+                    </div>
+                    <button type="button" class="icon-btn" id="btn-hud-sim-esc" title="模拟按下 Esc">&times;</button>
+                  </div>
+
+                  <div class="cm-sim-wrap">
+                    <textarea
+                      id="hud-sim-input"
+                      class="cm-sim-textarea"
+                      spellcheck="false"
+                      placeholder="输入 [[ 或 【【 试试模糊补全…"
+                    >${esc(state.hudText)}</textarea>
+
+                    ${hudShow ? renderAcPopoverHtml(hudCands, state.hudAcActiveIdx, hudMatch.query, 'hud', hudPosStyle) : ''}
+                  </div>
+
+                  <div class="hud-foot">
+                    <span class="hint hud-foot-status" title="${esc(state.hudComposing ? '中文组词期：Enter 与 Esc 优先交给输入法' : state.hudEscLog)}">
+                      <span class="status-dot ${state.hudComposing ? 'off' : ''}"></span>
+                      ${state.hudComposing
+                        ? '中文组词期：Enter 与 Esc 优先交给输入法'
+                        : esc(state.hudEscLog)}
+                    </span>
+                    <div class="row-flex" style="flex:none;flex-wrap:nowrap;">
+                      ${state.hudPrevText ? '<button type="button" class="btn quiet sm" id="btn-hud-undo">Ctrl+Z</button>' : ''}
+                      <button type="button" class="btn sm" id="btn-hud-save-only">仅保存</button>
+                      <button type="button" class="btn primary sm" id="btn-hud-commit">保存并整理</button>
+                    </div>
+                  </div>
+                </section>
+              </div>
+
+              <!-- Scenario 3B: Main Window Source Mode -->
+              <div style="display:flex;flex-direction:column;gap:8px;min-width:0;">
+                <div class="row-between">
+                  <span class="kicker">场景 B · 主窗知识页「源码」模式（复用同一套补全与候选源）</span>
+                  <span class="hint">保留 CRLF 换行与 Obsidian 语法</span>
+                </div>
+                <section class="ops-card" style="padding:0;overflow:hidden;">
+                  <div class="doc-toolbar">
+                    <div class="breadcrumb">wiki/concepts/重试与退避策略.md · 源码模式</div>
+                    <div class="row-flex">
+                      <span class="pill accent">源码编辑中</span>
+                      <button type="button" class="btn primary sm" id="btn-src-save">保存改动</button>
+                    </div>
+                  </div>
+                  <div class="cm-sim-wrap" style="min-height:262px;">
+                    <textarea
+                      id="src-sim-input"
+                      class="cm-sim-textarea"
+                      style="min-height:230px;"
+                      spellcheck="false"
+                    >${esc(state.sourceText)}</textarea>
+
+                    ${srcCands.length ? renderAcPopoverHtml(srcCands, state.sourceAcActiveIdx, srcMatch.query, 'source', 'top: 90px; left: 26px;') : ''}
+                  </div>
+                  <div class="hud-foot">
+                    <span class="hint">100% 兼容 Obsidian 语法；别名命中写入 [[stem|别名]]，重名写入 [[folder/stem|标题]]，重名+别名写入 [[folder/stem|alias]]，并吸收紧邻的 ]] / 】】</span>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // ======================================================================
+      // Scene 4: WikiDocumentView Enhancements (Lint Badge, Disambig, Cite Hover)
+      // ======================================================================
+      const citationsData = {
+        w1: {
+          label: '2026-11-26 弱网压测随手记',
+          rawPath: 'raw/notes/2026-11-26-retry.md',
+          verified: true,
+          quote: '弱网环境下首次重试建议 500ms 起步，指数退避上限不超过 8s，最多重试 2 次，避免把下游雪崩放大。',
+          paragraphs: [
+            '下午在 3G 弱网模拟下对移动端网关做了 20 分钟压测，重点观察超时与重试对尾延迟的影响。',
+            '弱网环境下首次重试建议 500ms 起步，指数退避上限不超过 8s，最多重试 2 次，避免把下游雪崩放大。',
+            '同时确认非幂等的提交订单类接口不能在客户端无条件重试，必须由服务端校验幂等键。',
+          ],
+          hitIdx: 1,
+        },
+        w2: {
+          label: '网关稳定性复盘纪要',
+          rawPath: 'raw/clips/2026-11-20-gateway-postmortem.md',
+          verified: false,
+          quote: '当熔断器处于半开态时，只放行单路探针请求检测下游恢复情况。',
+          paragraphs: [
+            '11 月 18 日故障复盘显示，故障恢复瞬间大量并发探针导致下游二次被打满。',
+            '当熔断器处于半开状态时，只放行单路探针请求检测下游恢复情况（原文已修订表述）。',
+            '后续需在限流与熔断两个模块间共享健康状态信号。',
+          ],
+          hitIdx: 1,
+        },
+      };
+
+      function renderWikiDocScene() {
+        const liveLintItems = state.lintFindings.filter((f) => !f.fixed && !f.dismissed && f.pagePath === 'wiki/concepts/重试与退避策略.md' && (f.severity === 'error' || f.severity === 'warn'));
+        const docLintItems = state.docBadgeMode === 'clean'
+          ? []
+          : (state.docBadgeMode === 'warn_only'
+              ? liveLintItems.filter((f) => f.severity === 'warn')
+              : liveLintItems);
+        const hasDocError = docLintItems.some((f) => f.severity === 'error');
+        const badgeLabel = hasDocError ? `${docLintItems.length} 项体检异常` : `${docLintItems.length} 项体检提醒`;
+        const badgeModeNextLabel = state.docBadgeMode === 'live'
+          ? '演示：切换为仅提醒'
+          : (state.docBadgeMode === 'warn_only' ? '演示：无异常隐藏' : '演示：恢复体检徽标');
+        const splitCiteObj = state.docSplitCite ? citationsData[state.docSplitCite] : null;
+
+        return `
+          <div class="stage-body flush">
+            <div class="editor-shell ${splitCiteObj ? 'with-evidence' : ''}">
+              <div class="editor-main">
+                <div class="doc-toolbar">
+                  <div class="breadcrumb">wiki/concepts/${esc(state.docActiveTitle)}.md</div>
+                  <div class="row-flex" style="flex:none;">
+                    <button type="button" class="btn primary sm">阅读</button>
+                    <button type="button" class="btn sm" data-go-scene="autocomplete">源码</button>
+                    <button type="button" class="btn sm ${splitCiteObj ? 'active-toggle' : ''}" id="btn-toggle-split">
+                      对照原文
+                    </button>
+                    ${docLintItems.length > 0 ? `
+                      <button
+                        type="button"
+                        class="lint-toolbar-badge ${hasDocError ? 'error' : 'warn'}"
+                        id="btn-doc-lint-badge"
+                        title="${hasDocError ? '点击前往整理页查看本页的体检异常' : '点击前往整理页查看本页的体检提醒'}"
+                      >
+                        <svg class="ui-icon sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        <span>${esc(badgeLabel)}</span>
+                      </button>
+                    ` : ''}
+                    <button type="button" class="btn quiet sm" id="btn-toggle-clean-doc" title="循环演示：含异常(红) / 仅提醒(琥珀) / 无异常隐藏">
+                      ${badgeModeNextLabel}
+                    </button>
+                  </div>
+                </div>
+
+                <div class="doc-scroll">
+                  <article class="doc-paper">
+                    <div class="doc-title-row">
+                      <h1>${esc(state.docActiveTitle)}</h1>
+                      <span class="mono" style="font-size:11.5px;color:var(--muted);">更新于 11-27</span>
+                    </div>
+
+                    <div class="props-summary-bar">
+                      <div class="row-flex">
+                        <span class="pill accent">概念</span>
+                        <span class="pill">别名：Retry Policy</span>
+                        <span class="hint">参考了 2 处原文 · 点击下方同名双链或悬停脚注体验 P0 增强</span>
+                      </div>
+                    </div>
+
+                    <div class="prose">
+                      <h2>核心原则</h2>
+                      <p>
+                        面对移动端弱网抖动，客户端与网关层应采用带抖动的指数退避策略，首次重试 500ms 起步且总退避上限控制在 8 秒以内，避免请求风暴放大下游故障
+                        <span class="inline-anchor-wrap" data-cite-wrap="w1">
+                          <button type="button" class="footnote-ref" data-cite-btn="w1" aria-describedby="cite-pop-w1">[^w1]</button>
+                          ${state.docHoverCite === 'w1' ? renderCiteHoverCard('w1') : ''}
+                        </span>
+                        。详细参数基准请配合查阅
+                        <span class="inline-anchor-wrap">
+                          <button type="button" class="wikilink" id="btn-ambig-link">[[超时设置]]</button>
+                          ${state.docDisambigOpen ? `
+                            <div class="disambig-popover" role="menu" aria-label="同名双链消歧选择">
+                              <div class="disambig-head">
+                                <span>「超时设置」匹配到 2 篇知识页</span>
+                                <button type="button" class="icon-btn" id="btn-close-disambig" style="width:22px;height:22px;" aria-label="关闭">&times;</button>
+                              </div>
+                              <div class="disambig-list">
+                                <button type="button" class="disambig-item" data-pick-disambig="wiki/decisions/超时设置.md|超时设置（决策）">
+                                  <div class="row-between">
+                                    <strong style="font-size:12.5px;">超时设置</strong>
+                                    <span class="pill accent">决策</span>
+                                  </div>
+                                  <span class="mono" style="font-size:11px;color:var(--muted);">wiki/decisions/超时设置.md · 更新于 11-26</span>
+                                </button>
+                                <button type="button" class="disambig-item" data-pick-disambig="wiki/concepts/超时设置.md|超时设置（概念）">
+                                  <div class="row-between">
+                                    <strong style="font-size:12.5px;">超时设置</strong>
+                                    <span class="pill">概念</span>
+                                  </div>
+                                  <span class="mono" style="font-size:11px;color:var(--muted);">wiki/concepts/超时设置.md · 更新于 11-20</span>
+                                </button>
+                              </div>
+                            </div>
+                          ` : ''}
+                        </span>
+                        与
+                        <button type="button" class="wikilink" id="btn-unique-link">[[网关限流设计]]</button>
+                        。
+                      </p>
+
+                      <h2>恢复期防冲击</h2>
+                      <p>
+                        当下游触发熔断并进入半开恢复窗口时，仅放行单路探针校验服务健康度，确认成功后再逐步放开并发流量
+                        <span class="inline-anchor-wrap" data-cite-wrap="w2">
+                          <button type="button" class="footnote-ref" data-cite-btn="w2" aria-describedby="cite-pop-w2">[^w2]</button>
+                          ${state.docHoverCite === 'w2' ? renderCiteHoverCard('w2') : ''}
+                        </span>
+                        。
+                      </p>
+
+                      <section class="human-section">
+                        <div class="row-between" style="margin-bottom:6px;">
+                          <strong style="font-size:14.5px;">我的理解</strong>
+                          <span class="pill success">手动保护</span>
+                        </div>
+                        <p style="margin:0;color:var(--text-secondary);">
+                          任何重试机制都必须和「幂等性检查」一起考虑，否则会在弱网环境下造成重复扣款或重复提交。
+                        </p>
+                      </section>
+                    </div>
+                  </article>
+                </div>
+              </div>
+
+              ${splitCiteObj ? `
+                <aside class="evidence-pane" aria-label="原文对照分屏">
+                  <div class="pane-header">
+                    <div style="min-width:0;">
+                      <div style="font-size:12.5px;font-weight:650;">对照原文 · 已定位到引用段落</div>
+                      <div class="mono" style="font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                        ${esc(splitCiteObj.rawPath)}
+                      </div>
+                    </div>
+                    <button type="button" class="icon-btn" id="btn-close-split" aria-label="关闭分屏">&times;</button>
+                  </div>
+                  <div class="evidence-body">
+                    <div class="row-between" style="margin-bottom:10px;">
+                      <span class="pill">只读原件</span>
+                      <span class="pill ${splitCiteObj.verified ? 'success' : 'warning'}">
+                        ${splitCiteObj.verified ? '已核对原文逐字一致' : '原文段落有文字变动'}
+                      </span>
+                    </div>
+                    <div class="kicker" style="margin-bottom:6px;">原文上下文（已自动定位至高亮段）</div>
+                    ${splitCiteObj.paragraphs.map((p, i) => `
+                      <div class="raw-para-block ${i === splitCiteObj.hitIdx ? 'located' : ''}">
+                        ${i === splitCiteObj.hitIdx ? '<div class="kicker" style="color:var(--accent);margin-bottom:3px;">命中引文原段</div>' : ''}
+                        ${esc(p)}
+                      </div>
+                    `).join('')}
+                  </div>
+                </aside>
+              ` : ''}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderCiteHoverCard(key) {
+        const c = citationsData[key];
+        return `
+          <div class="cite-hover-card" id="cite-pop-${key}" role="tooltip">
+            <div class="row-between">
+              <strong style="font-size:12px;">${esc(c.label)}</strong>
+              <span class="pill ${c.verified ? 'success' : 'warning'}">${c.verified ? '已核对原件' : '原文有变动'}</span>
+            </div>
+            <div class="mono" style="font-size:11px;color:var(--muted);">${esc(c.rawPath)}</div>
+            <div class="cite-hover-quote">“${esc(c.quote)}”</div>
+            <div class="row-between">
+              <span class="hint">点击脚注或右侧按钮查看上下文</span>
+              <button type="button" class="btn primary xs" data-open-split="${key}">分屏对照并定位原段 →</button>
+            </div>
+          </div>
+        `;
+      }
+
+      // ======================================================================
+      // Pending Review Diff Modal Renderer
+      // ======================================================================
+      function renderDiffModal() {
+        const layer = document.getElementById('modal-layer');
+        const pr = state.pendingReviews.find((x) => x.id === state.activeDiffId);
+        if (!pr) {
+          layer.classList.add('hidden');
+          layer.innerHTML = '';
+          return;
+        }
+        const simDiskBtnText = !pr.externallyModified
+          ? '演示：模拟磁盘外部变动'
+          : (pr.diskState === 'external_dirty' ? '演示：模拟外部修改已还原基线' : '演示：改回磁盘仍有外部改动');
+        layer.classList.remove('hidden');
+        layer.innerHTML = `
+          <div class="diff-modal">
+            <div class="hud-head">
+              <div class="row-flex">
+                <strong style="font-size:14px;">确认待审改动 · ${esc(pr.pageTitle)}</strong>
+                <span class="cs-op-tag ${esc(pr.opTagClass)}">${esc(pr.opTag)}</span>
+                <span class="pill">${esc(pr.reasonLabel)}</span>
+                <span class="mono" style="font-size:11.5px;color:var(--muted);word-break:break-all;">${esc(pr.pagePath)}</span>
+              </div>
+              <div class="row-flex">
+                <button type="button" class="btn xs" id="btn-sim-vconflict">${simDiskBtnText}</button>
+                <button type="button" class="icon-btn" id="btn-close-diff" aria-label="关闭">&times;</button>
+              </div>
+            </div>
+
+            <div class="diff-modal-body">
+              ${pr.externallyModified ? `
+                <div class="version-conflict-bar" role="alert">
+                  <div style="flex:1;min-width:240px;">
+                    <strong>页面刚刚有新变动，为防覆盖你的编辑，本次未写入</strong>
+                    <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">
+                      检测到磁盘文件已被外部程序（如 Obsidian）或其他整理修改。仅当外部修改已还原回原基线时，「重新检查文件状态」才会重新解锁「采纳写入」；否则请打开页面手动合并或丢弃本次待审改动。
+                    </div>
+                    ${pr.diskState === 'baseline' ? `
+                      <div style="font-size:11.5px;color:var(--success);margin-top:4px;">
+                        演示状态：磁盘文件已模拟还原回原基线，点击「重新检查文件状态」即可核验并解锁「采纳写入」。
+                      </div>
+                    ` : ''}
+                  </div>
+                  <div class="row-flex">
+                    <button type="button" class="btn primary sm" id="btn-recheck-file-state">重新检查文件状态</button>
+                    <button type="button" class="btn sm" id="btn-open-manual-merge">打开页面手动合并</button>
+                  </div>
+                </div>
+              ` : ''}
+
+              ${pr.hasProtectZone ? `
+                <div class="cs-gentle-note">
+                  <span>该页包含「我的理解」手动保护区，AI 改动仅作用于保护区外章节，你的手写段落不受影响。</span>
+                </div>
+              ` : ''}
+
+              <div class="diff-pane-grid">
+                <div class="diff-doc-col">
+                  <div class="diff-doc-head">
+                    <span>当前页面内容（磁盘现状）</span>
+                    <span class="pill ${pr.externallyModified ? 'error' : ''}">${pr.externallyModified ? '磁盘含外部修改' : '修改前'}</span>
+                  </div>
+                  <div class="diff-code">
+                    ${pr.beforeLines.map((l) => `
+                      <div class="diff-line ${l.type}">
+                        <span class="diff-ln">${l.n}</span>
+                        <span>${esc(l.text || ' ')}</span>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+
+                <div class="diff-doc-col">
+                  <div class="diff-doc-head">
+                    <span>建议写入后的效果</span>
+                    <span class="pill success">修改后</span>
+                  </div>
+                  <div class="diff-code">
+                    ${pr.afterLines.map((l) => `
+                      <div class="diff-line ${l.type}">
+                        <span class="diff-ln">${l.n}</span>
+                        <span>${esc(l.text || ' ')}</span>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="hud-foot">
+              <span class="hint">采纳后将按原操作类型（${esc(pr.opTag)}）生成可单独撤销的子整理记录（关联批次 #${esc(pr.changesetId)}）</span>
+              <div class="row-flex">
+                ${pr.externallyModified ? '<button type="button" class="btn sm" id="btn-footer-manual-merge">打开页面手动合并</button>' : ''}
+                <button type="button" class="btn sm" id="btn-discard-review">丢弃此页改动</button>
+                <button type="button" class="btn primary sm" id="btn-apply-review" ${pr.externallyModified ? 'disabled' : ''}>
+                  采纳写入
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // Clamp floating popovers in Scene 4 horizontally within reading pane
+      function clampFloatingPopovers() {
+        const container = document.querySelector('.editor-main') || document.getElementById('stage-root');
+        if (!container) return;
+        const cRect = container.getBoundingClientRect();
+        document.querySelectorAll('.disambig-popover, .cite-hover-card').forEach((pop) => {
+          const pRect = pop.getBoundingClientRect();
+          const pad = 12;
+          let shiftX = 0;
+          if (pRect.right > cRect.right - pad) shiftX = (cRect.right - pad) - pRect.right;
+          if (pRect.left + shiftX < cRect.left + pad) shiftX += (cRect.left + pad) - (pRect.left + shiftX);
+          if (shiftX !== 0) {
+            const base = pop.classList.contains('cite-hover-card') ? 'translateX(-50%) ' : '';
+            pop.style.transform = `${base}translateX(${Math.round(shiftX)}px)`;
+          }
+        });
+      }
+
+      // ======================================================================
+      // Master Render + Event Wiring
+      // ======================================================================
+      function render() {
+        if (state.scene === 'wikidoc') {
+          state.l2ActiveDocTitle = state.docActiveTitle;
+        }
+        updateGlobalChrome();
+        const root = document.getElementById('stage-root');
+        if (state.scene === 'organize') root.innerHTML = renderOrganizeScene();
+        else if (state.scene === 'settings') root.innerHTML = renderSettingsScene();
+        else if (state.scene === 'autocomplete') root.innerHTML = renderAutocompleteScene();
+        else if (state.scene === 'wikidoc') root.innerHTML = renderWikiDocScene();
+
+        renderDiffModal();
+        bindDynamicEvents();
+        clampFloatingPopovers();
+      }
+
+      function pickAcCandidate(scope, idx) {
+        if (scope === 'hud') {
+          const m = matchAutocomplete(state.hudText, state.hudCursor);
+          if (!m) return;
+          const cands = filterCandidates(m.query);
+          const picked = cands[idx];
+          if (!picked) return;
+          state.hudPrevText = state.hudText;
+          const link = formatPickedLink(picked);
+          state.hudText = state.hudText.slice(0, m.start) + link + state.hudText.slice(m.end);
+          state.hudCursor = m.start + link.length;
+          const extras = [];
+          if (m.rawTrigger === '【【') extras.push('已将【【规范为 [[');
+          if (m.absorbedClosing) extras.push('已吸收右侧闭合符');
+          state.hudEscLog = `已插入 ${link}${extras.length ? `（${extras.join('，')}）` : ''}，可按 Ctrl+Z 一步回退`;
+          toast(`已插入双链 ${link}`);
+          render();
+          const ta = document.getElementById('hud-sim-input');
+          if (ta) { ta.focus(); ta.setSelectionRange(state.hudCursor, state.hudCursor); }
+        } else {
+          const m = matchAutocomplete(state.sourceText, state.srcCursor);
+          if (!m) return;
+          const cands = filterCandidates(m.query);
+          const picked = cands[idx];
+          if (!picked) return;
+          const link = formatPickedLink(picked);
+          state.sourceText = state.sourceText.slice(0, m.start) + link + state.sourceText.slice(m.end);
+          state.srcCursor = m.start + link.length;
+          toast(`源码已插入 ${link}`);
+          render();
+          const ta = document.getElementById('src-sim-input');
+          if (ta) { ta.focus(); ta.setSelectionRange(state.srcCursor, state.srcCursor); }
+        }
+      }
+
+      let hoverCloseTimer = null;
+
+      function bindDynamicEvents() {
+        // Go scene shortcuts inside stage
+        document.querySelectorAll('[data-go-scene]').forEach((el) => {
+          el.addEventListener('click', () => {
+            state.scene = el.dataset.goScene;
+            render();
+          });
+        });
+
+        // --- Scene 1 Events ---
+        // B4-2: 观点冲突按钮进入左右对比确认页，不直接结案
+        document.querySelectorAll('[data-open-conflict]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const c = state.conflicts.find((x) => x.id === btn.dataset.openConflict);
+            if (!c) return;
+            toast(`已进入「${c.topic}」左右对比确认页（复用既有冲突裁决视图，不直接结案）`);
+          });
+        });
+
+        document.querySelectorAll('[data-open-diff]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            if (!btn.dataset.openDiff) return;
+            state.activeDiffId = btn.dataset.openDiff;
+            renderDiffModal();
+            bindModalEvents();
+          });
+        });
+
+        document.querySelectorAll('[data-lint-filter]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.lintFilter = btn.dataset.lintFilter;
+            render();
+          });
+        });
+
+        const clearPageFilter = document.getElementById('btn-clear-page-filter');
+        if (clearPageFilter) {
+          clearPageFilter.addEventListener('click', () => {
+            state.lintPageFilter = null;
+            render();
+          });
+        }
+
+        const rerunLint = document.getElementById('btn-rerun-lint');
+        if (rerunLint) {
+          rerunLint.addEventListener('click', () => toast('已完成全库结构检查（耗时 42ms）'));
+        }
+
+        // B1: 批量修复严格限定 fix.kind === 'safe'，保留 broken_link（one_click）逐条确认
+        const fixAllBtn = document.getElementById('btn-fix-all-safe');
+        if (fixAllBtn) {
+          fixAllBtn.addEventListener('click', () => {
+            let count = 0;
+            state.lintFindings.forEach((f) => {
+              if (!f.fixed && !f.dismissed && f.fix && f.fix.kind === 'safe' && (!state.lintPageFilter || f.pagePath === state.lintPageFilter.path)) {
+                f.fixed = true;
+                count += 1;
+              }
+            });
+            const remainingOneClick = state.lintFindings.filter((f) => !f.fixed && !f.dismissed && f.fix && f.fix.kind === 'one_click').length;
+            toast(remainingOneClick > 0
+              ? `已修复 ${count} 项安全可修问题（${remainingOneClick} 项断链已保留供逐条核对）`
+              : `已修复 ${count} 项安全可修问题（内容页改动已记入可撤销整理记录）`);
+            render();
+          });
+        }
+
+        document.querySelectorAll('[data-fix-lint]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const f = state.lintFindings.find((x) => x.id === btn.dataset.fixLint);
+            if (!f) return;
+            f.fixed = true;
+            toast(f.rule === 'index_drift'
+              ? '已重新生成 wiki/index.md 托管目录块'
+              : `已完成「${f.fix.label}」，改动已记入可撤销整理记录`);
+            render();
+          });
+        });
+
+        document.querySelectorAll('[data-dismiss-lint]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const f = state.lintFindings.find((x) => x.id === btn.dataset.dismissLint);
+            if (f) { f.dismissed = true; toast('已忽略该体检提示，可在「已忽略」中恢复'); render(); }
+          });
+        });
+
+        document.querySelectorAll('[data-restore-lint]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const f = state.lintFindings.find((x) => x.id === btn.dataset.restoreLint);
+            if (f) { f.dismissed = false; toast('已恢复体检提示'); render(); }
+          });
+        });
+
+        document.querySelectorAll('[data-open-doc-from-lint]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.docActiveTitle = btn.dataset.openDocFromLint;
+            state.l2ActiveDocTitle = btn.dataset.openDocFromLint;
+            state.scene = 'wikidoc';
+            render();
+          });
+        });
+
+        document.querySelectorAll('[data-l2-scope]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            state.l2Scope = btn.dataset.l2Scope;
+            render();
+          });
+        });
+
+        const simOpenDocL2 = document.getElementById('btn-sim-open-doc-l2');
+        if (simOpenDocL2) {
+          simOpenDocL2.addEventListener('click', () => {
+            state.l2ActiveDocTitle = '重试与退避策略';
+            state.l2Scope = 'page';
+            toast('已关联当前知识页《重试与退避策略》，「当前页邻域」已解锁');
+            render();
+          });
+        }
+
+        const l2FolderSel = document.getElementById('l2-folder-sel');
+        if (l2FolderSel) {
+          l2FolderSel.addEventListener('change', () => {
+            state.l2Folder = l2FolderSel.value;
+            render();
+          });
+        }
+
+        const runL2Btn = document.getElementById('btn-run-l2');
+        if (runL2Btn) {
+          runL2Btn.addEventListener('click', () => {
+            const { budget } = getL2Budget();
+            if (budget.pairs === 0) return;
+            state.l2Running = true;
+            render();
+            window.setTimeout(() => {
+              state.l2Running = false;
+              state.l2Done = true;
+              state.l2Results.forEach((r) => { r.dismissed = false; });
+              toast('定向语义体检完成：发现 1 处双侧有据的潜在口径分歧');
+              render();
+            }, 420);
+          });
+        }
+
+        document.querySelectorAll('[data-escalate-l2]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const item = state.l2Results.find((r) => r.id === btn.dataset.escalateL2);
+            if (!item || item.escalated) return;
+            item.escalated = true;
+            state.conflicts.unshift({
+              id: `cf-l2-${Date.now()}`,
+              topic: `最大重试次数：${item.pageA}（2 次）vs ${item.pageB}（5 次）`,
+              currentLabel: `《${item.pageA}》`,
+              incomingLabel: `《${item.pageB}》`,
+              pagePath: 'wiki/concepts/重试与退避策略.md',
+              status: 'open',
+            });
+            toast('已转为待确认冲突，可在左栏顶部卡片中处理');
+            render();
+          });
+        });
+
+        document.querySelectorAll('[data-dismiss-l2]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const item = state.l2Results.find((r) => r.id === btn.dataset.dismissL2);
+            if (item) { item.dismissed = true; render(); }
+          });
+        });
+
+        const bufView = document.getElementById('btn-buffer-view');
+        if (bufView) bufView.addEventListener('click', () => toast('当前缓冲队列包含 2 条随手记，可在倒计时结束前移出'));
+        const bufFlush = document.getElementById('btn-buffer-flush');
+        if (bufFlush) bufFlush.addEventListener('click', () => toast('已触发立即合批整理'));
+
+        document.querySelectorAll('[data-revert-cs]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const cs = state.changesets.find((x) => x.id === btn.dataset.revertCs);
+            if (!cs) return;
+            // 子批次先撤拦截：行内持久展示提示，不随 Toast 消失
+            const activeChild = state.changesets.find((x) => x.parentId === cs.id && x.status !== 'reverted');
+            if (activeChild) {
+              cs.revertBlockedNote = `请先撤销由本次待审确认生成的子整理记录（#${activeChild.id}），再撤销本批。`;
+              cs.revertBlockedChildId = activeChild.id;
+              state.highlightCsId = activeChild.id;
+              toast(`请先撤销子整理记录 #${activeChild.id}`);
+              render();
+              return;
+            }
+            cs.revertBlockedNote = '';
+            cs.revertBlockedChildId = null;
+
+            // 严格按去重页面数（restored.length / keptModified.length）统计回滚
+            const modifiedPaths = new Set(
+              cs.ops.filter((op) => op.outcome === 'applied' && op.simulatedUserModified).map((op) => op.path)
+            );
+            const restoredPaths = new Set();
+            const keptPages = new Map();
+            cs.ops.forEach((op) => {
+              if (op.outcome === 'applied') {
+                if (modifiedPaths.has(op.path)) {
+                  op.pageState = 'kept_modified';
+                  keptPages.set(op.path, op.title);
+                } else {
+                  op.pageState = 'reverted';
+                  restoredPaths.add(op.path);
+                }
+              } else if (op.outcome === 'pending_review') {
+                op.outcome = 'discarded';
+              }
+            });
+            // 同步清理本批次关联的所有待审项（含 pr-1、pr-2）
+            state.pendingReviews = state.pendingReviews.filter((p) => p.changesetId !== cs.id);
+            if (state.activeDiffId && !state.pendingReviews.some((p) => p.id === state.activeDiffId)) {
+              state.activeDiffId = null;
+            }
+
+            const restoredCount = restoredPaths.size;
+            const keptTitles = Array.from(keptPages.values()).map((t) => `《${t}》`);
+            if (keptTitles.length > 0) {
+              cs.status = 'partially_reverted';
+              cs.rollbackNote = `已还原 ${restoredCount} 篇；${keptTitles.join('、')}因你后续手动修改，已原样保留。`;
+              toast(cs.rollbackNote);
+            } else {
+              cs.status = 'reverted';
+              cs.rollbackNote = `已还原本次涉及的 ${restoredCount} 篇页面并同步更新目录。`;
+              toast(cs.rollbackNote);
+            }
+
+            // 若当前为子批次且已撤销，清除父批次的行内拦截提示
+            if (cs.parentId) {
+              const parentCs = state.changesets.find((x) => x.id === cs.parentId);
+              if (parentCs && !state.changesets.some((x) => x.parentId === parentCs.id && x.status !== 'reverted')) {
+                parentCs.revertBlockedNote = '';
+                parentCs.revertBlockedChildId = null;
+              }
+            }
+            render();
+          });
+        });
+
+        document.querySelectorAll('[data-jump-parent]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.highlightCsId = btn.dataset.jumpParent;
+            render();
+            const target = document.getElementById(`cs-card-${btn.dataset.jumpParent}`);
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          });
+        });
+
+        // --- Scene 2 Events ---
+        const toggleMcp = document.getElementById('btn-toggle-mcp-exists');
+        if (toggleMcp) {
+          toggleMcp.addEventListener('click', () => {
+            state.mcpExeExists = !state.mcpExeExists;
+            state.mcpTestState = 'idle';
+            render();
+          });
+        }
+        const testMcp = document.getElementById('btn-test-mcp');
+        if (testMcp) {
+          testMcp.addEventListener('click', () => {
+            state.mcpTestState = 'ok';
+            toast('本地 MCP 只读握手通过（耗时 94ms）');
+            render();
+          });
+        }
+        const testMcpFail = document.getElementById('btn-test-mcp-fail');
+        if (testMcpFail) {
+          testMcpFail.addEventListener('click', () => {
+            state.mcpTestState = 'err';
+            toast('已切换为本地 MCP 连接失败态演示');
+            render();
+          });
+        }
+        document.querySelectorAll('[data-mcp-tab]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.mcpTab = btn.dataset.mcpTab;
+            render();
+          });
+        });
+        const copySnippet = document.getElementById('btn-copy-snippet');
+        if (copySnippet) {
+          copySnippet.addEventListener('click', () => copyText(getMcpSnippet().code, '接入配置片段'));
+        }
+        const exportSkill = document.getElementById('btn-export-skill');
+        if (exportSkill) {
+          exportSkill.addEventListener('click', () => {
+            state.skillExists = true;
+            state.skillFeedback = '已更新 Vault 根目录 SKILL.md（托管块已刷新，未改动你的自定义内容）';
+            toast('已更新 Vault 根目录 SKILL.md');
+            render();
+          });
+        }
+        document.querySelectorAll('[data-copy-path]').forEach((btn) => {
+          btn.addEventListener('click', () => copyText(btn.dataset.copyPath, '技能安装路径'));
+        });
+        document.querySelectorAll('[data-raw-allow-idx]').forEach((input) => {
+          input.addEventListener('change', () => {
+            const idx = Number(input.dataset.rawAllowIdx);
+            state.rawDirs[idx].allowed = input.checked;
+            state.rawAllowSavedFeedback = '';
+            render();
+          });
+        });
+        const saveRawAllow = document.getElementById('btn-save-raw-allow');
+        if (saveRawAllow) {
+          saveRawAllow.addEventListener('click', () => {
+            const n = state.rawDirs.filter((d) => d.allowed).length;
+            state.rawAllowSavedFeedback = n === 0
+              ? '已保存：外部 Agent 仅可读取 wiki/ 与页内短引'
+              : `已保存：已向外部 Agent 放开 ${n} 个原文目录`;
+            toast('原文目录授权已保存');
+            render();
+          });
+        }
+
+        // --- Scene 3 Events ---
+        document.querySelectorAll('[data-ac-preset]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const p = btn.dataset.acPreset;
+            state.hudComposing = false;
+            state.hudAcDismissed = false;
+            state.hudAcActiveIdx = 0;
+            state.hudPopoverPos = 'normal';
+            state.hudCursor = null;
+            if (p === 'ascii') state.hudText = '今天压测确认弱网退避逻辑需要同步更新到 [[重试';
+            if (p === 'cjk') {
+              state.hudText = '中文输入法直接敲双括号也能触发：【【重试】】';
+              state.hudCursor = state.hudText.length - 2; // 光标位于 】】 之前，验证闭合符吸收
+            }
+            if (p === 'alias') state.hudText = '按英文别名检索知识页：[[Retry';
+            if (p === 'dup') state.hudText = '检查同名知识页路径消歧：[[超时';
+            if (p === 'dup-alias') state.hudText = '重名文件通过别名命中：[[Timeout';
+            if (p === 'all') state.hudText = '查看全部候选并验证 540×380 高度上限：[[';
+            state.hudEscLog = p === 'cjk'
+              ? '光标位于【【重试|】】：选中后规范为 [[...]] 并吸收右侧 】】'
+              : '补全已展开：按 Esc 仅关闭补全弹层，绝不关窗';
+            render();
+            const ta = document.getElementById('hud-sim-input');
+            if (ta) {
+              const pos = typeof state.hudCursor === 'number' ? state.hudCursor : ta.value.length;
+              ta.focus();
+              ta.setSelectionRange(pos, pos);
+            }
+          });
+        });
+        document.querySelectorAll('[data-ac-pos]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.hudPopoverPos = state.hudPopoverPos === btn.dataset.acPos ? 'normal' : btn.dataset.acPos;
+            state.hudAcDismissed = false;
+            state.hudComposing = false;
+            if (!matchAutocomplete(state.hudText, state.hudCursor)) {
+              state.hudText = '测试边界定位时的弹层钳位效果 [[重试';
+              state.hudCursor = state.hudText.length;
+            }
+            render();
+          });
+        });
+        const toggleIme = document.getElementById('btn-toggle-ime');
+        if (toggleIme) {
+          toggleIme.addEventListener('click', () => {
+            state.hudComposing = !state.hudComposing;
+            render();
+          });
+        }
+        const hudInput = document.getElementById('hud-sim-input');
+        if (hudInput) {
+          hudInput.addEventListener('input', () => {
+            state.hudText = hudInput.value;
+            state.hudCursor = hudInput.selectionStart;
+            state.hudAcDismissed = false;
+            state.hudAcActiveIdx = 0;
+            render();
+            const ta = document.getElementById('hud-sim-input');
+            if (ta) {
+              const pos = typeof state.hudCursor === 'number' ? state.hudCursor : ta.value.length;
+              ta.focus();
+              ta.setSelectionRange(pos, pos);
+            }
+          });
+          hudInput.addEventListener('click', () => {
+            state.hudCursor = hudInput.selectionStart;
+          });
+          hudInput.addEventListener('keydown', (e) => {
+            if (state.hudComposing) {
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                state.hudComposing = false;
+                state.hudEscLog = '第 1 级触发：Esc 已交由中文输入法退出组词（窗口与补全未受干扰）';
+                toast(state.hudEscLog);
+                render();
+              }
+              return;
+            }
+            const curPos = hudInput.selectionStart;
+            state.hudCursor = curPos;
+            const m = matchAutocomplete(state.hudText, curPos);
+            const cands = m && !state.hudAcDismissed ? filterCandidates(m.query) : [];
+            if (cands.length > 0) {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                state.hudAcActiveIdx = (state.hudAcActiveIdx + 1) % cands.length;
+                render();
+                const ta = document.getElementById('hud-sim-input');
+                if (ta) { ta.focus(); ta.setSelectionRange(curPos, curPos); }
+                return;
+              }
+              if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                state.hudAcActiveIdx = (state.hudAcActiveIdx - 1 + cands.length) % cands.length;
+                render();
+                const ta = document.getElementById('hud-sim-input');
+                if (ta) { ta.focus(); ta.setSelectionRange(curPos, curPos); }
+                return;
+              }
+              if ((e.key === 'Enter' || e.key === 'Tab') && !e.ctrlKey && !e.shiftKey) {
+                e.preventDefault();
+                pickAcCandidate('hud', state.hudAcActiveIdx);
+                return;
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                state.hudAcDismissed = true;
+                state.hudEscLog = '第 2 级触发：仅关闭补全弹层，编辑器焦点与内容保持不变';
+                toast(state.hudEscLog);
+                render();
+                const ta = document.getElementById('hud-sim-input');
+                if (ta) { ta.focus(); ta.setSelectionRange(curPos, curPos); }
+                return;
+              }
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              if (!state.hudText.trim()) {
+                state.hudEscLog = '第 3 级触发：草稿为空，直接收起随手记浮窗';
+              } else {
+                state.hudEscLog = '第 4 级触发：已落盘暂存草稿并收起浮窗（绝不误提交）';
+              }
+              toast(state.hudEscLog);
+              render();
+            }
+            if (e.ctrlKey && e.key === 'Enter') {
+              e.preventDefault();
+              toast('Ctrl+Enter 穿透触发：已保存随手记并加入 60 秒合批队列');
+            }
+            if (e.ctrlKey && e.key.toLowerCase() === 'z' && state.hudPrevText) {
+              e.preventDefault();
+              state.hudText = state.hudPrevText;
+              state.hudPrevText = '';
+              state.hudCursor = null;
+              state.hudAcDismissed = false;
+              toast('Ctrl+Z 一步回退到补全前状态');
+              render();
+            }
+          });
+        }
+        const hudUndo = document.getElementById('btn-hud-undo');
+        if (hudUndo) {
+          hudUndo.addEventListener('click', () => {
+            state.hudText = state.hudPrevText;
+            state.hudPrevText = '';
+            state.hudCursor = null;
+            state.hudAcDismissed = false;
+            toast('已一步回退至补全前内容');
+            render();
+          });
+        }
+        const hudEscBtn = document.getElementById('btn-hud-sim-esc');
+        if (hudEscBtn) {
+          hudEscBtn.addEventListener('click', () => {
+            state.hudEscLog = state.hudText.trim()
+              ? '第 4 级触发：已保存草稿并收起浮窗，绝不误提交'
+              : '第 3 级触发：空草稿直接收起浮窗';
+            toast(state.hudEscLog);
+            render();
+          });
+        }
+        const hudSaveOnly = document.getElementById('btn-hud-save-only');
+        if (hudSaveOnly) hudSaveOnly.addEventListener('click', () => toast('已仅保存为本地原文（raw/notes）'));
+        const hudCommit = document.getElementById('btn-hud-commit');
+        if (hudCommit) hudCommit.addEventListener('click', () => toast('已保存原文并加入 60 秒自动整理队列'));
+
+        const srcInput = document.getElementById('src-sim-input');
+        if (srcInput) {
+          srcInput.addEventListener('input', () => {
+            state.sourceText = srcInput.value;
+            state.srcCursor = srcInput.selectionStart;
+            state.sourceAcOpen = true;
+            state.sourceAcActiveIdx = 0;
+            render();
+            const ta = document.getElementById('src-sim-input');
+            if (ta) {
+              const pos = typeof state.srcCursor === 'number' ? state.srcCursor : ta.value.length;
+              ta.focus();
+              ta.setSelectionRange(pos, pos);
+            }
+          });
+          srcInput.addEventListener('click', () => {
+            state.srcCursor = srcInput.selectionStart;
+          });
+        }
+        const srcSave = document.getElementById('btn-src-save');
+        if (srcSave) srcSave.addEventListener('click', () => toast('已保存 Markdown 源码（保留原文件 CRLF 换行符）'));
+
+        document.querySelectorAll('[data-ac-pick]').forEach((btn) => {
+          btn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const [scope, idxStr] = btn.dataset.acPick.split(':');
+            pickAcCandidate(scope, Number(idxStr));
+          });
+        });
+
+        // --- Scene 4 Events ---
+        const docLintBadge = document.getElementById('btn-doc-lint-badge');
+        if (docLintBadge) {
+          docLintBadge.addEventListener('click', () => {
+            state.lintPageFilter = { path: 'wiki/concepts/重试与退避策略.md', title: '重试与退避策略' };
+            state.lintFilter = 'attention';
+            state.scene = 'organize';
+            toast('已跳转至整理中心并按《重试与退避策略》过滤体检项');
+            render();
+          });
+        }
+        const toggleCleanDoc = document.getElementById('btn-toggle-clean-doc');
+        if (toggleCleanDoc) {
+          toggleCleanDoc.addEventListener('click', () => {
+            state.docBadgeMode = state.docBadgeMode === 'live'
+              ? 'warn_only'
+              : (state.docBadgeMode === 'warn_only' ? 'clean' : 'live');
+            render();
+          });
+        }
+        const toggleSplit = document.getElementById('btn-toggle-split');
+        if (toggleSplit) {
+          toggleSplit.addEventListener('click', () => {
+            state.docSplitCite = state.docSplitCite ? null : 'w1';
+            render();
+          });
+        }
+        const closeSplit = document.getElementById('btn-close-split');
+        if (closeSplit) {
+          closeSplit.addEventListener('click', () => {
+            state.docSplitCite = null;
+            render();
+          });
+        }
+        const ambigBtn = document.getElementById('btn-ambig-link');
+        if (ambigBtn) {
+          ambigBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            state.docDisambigOpen = !state.docDisambigOpen;
+            state.docHoverCite = null;
+            render();
+          });
+        }
+        const disambigPop = document.querySelector('.disambig-popover');
+        if (disambigPop) {
+          disambigPop.addEventListener('click', (e) => e.stopPropagation());
+        }
+        const closeDisambig = document.getElementById('btn-close-disambig');
+        if (closeDisambig) {
+          closeDisambig.addEventListener('click', () => {
+            state.docDisambigOpen = false;
+            render();
+          });
+        }
+        document.querySelectorAll('[data-pick-disambig]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const [path, label] = btn.dataset.pickDisambig.split('|');
+            state.docDisambigOpen = false;
+            toast(`已通过消歧浮层打开：${label}（${path}）`);
+            render();
+          });
+        });
+        const uniqueLink = document.getElementById('btn-unique-link');
+        if (uniqueLink) {
+          uniqueLink.addEventListener('click', () => toast('唯一命中：直接打开《网关限流设计》'));
+        }
+
+        // Footnote hover preview & click split
+        document.querySelectorAll('[data-cite-wrap]').forEach((wrap) => {
+          const key = wrap.dataset.citeWrap;
+          wrap.addEventListener('mouseenter', () => {
+            window.clearTimeout(hoverCloseTimer);
+            if (state.docHoverCite !== key) {
+              state.docHoverCite = key;
+              state.docDisambigOpen = false;
+              render();
+            }
+          });
+          wrap.addEventListener('mouseleave', () => {
+            hoverCloseTimer = window.setTimeout(() => {
+              if (state.docHoverCite === key) {
+                state.docHoverCite = null;
+                render();
+              }
+            }, 160);
+          });
+        });
+        document.querySelectorAll('[data-cite-btn]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.docSplitCite = btn.dataset.citeBtn;
+            state.docHoverCite = null;
+            render();
+          });
+          btn.addEventListener('focus', () => {
+            if (state.docHoverCite !== btn.dataset.citeBtn) {
+              state.docHoverCite = btn.dataset.citeBtn;
+              render();
+            }
+          });
+        });
+        document.querySelectorAll('[data-open-split]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            state.docSplitCite = btn.dataset.openSplit;
+            state.docHoverCite = null;
+            toast('已打开原文分屏并自动定位至证据段');
+            render();
+          });
+        });
+
+        bindModalEvents();
+      }
+
+      function bindModalEvents() {
+        const pr = state.pendingReviews.find((x) => x.id === state.activeDiffId);
+        if (!pr) return;
+
+        const closeBtn = document.getElementById('btn-close-diff');
+        if (closeBtn) closeBtn.addEventListener('click', () => { state.activeDiffId = null; render(); });
+
+        const simBtn = document.getElementById('btn-sim-vconflict');
+        if (simBtn) {
+          simBtn.addEventListener('click', () => {
+            if (!pr.externallyModified) {
+              pr.diskState = 'external_dirty';
+              pr.externallyModified = true;
+              pr.beforeLines = pr.externalBeforeLines.map((l) => ({ ...l }));
+              toast('已模拟磁盘外部变动：已拦截写入，请重新检查或手动合并');
+            } else if (pr.diskState === 'external_dirty') {
+              pr.diskState = 'baseline';
+              toast('演示状态：磁盘已模拟还原回原基线，请点击「重新检查文件状态」验证解锁');
+            } else {
+              pr.diskState = 'external_dirty';
+              toast('演示状态：磁盘仍存在外部改动');
+            }
+            renderDiffModal();
+            bindModalEvents();
+          });
+        }
+
+        // B2: 重新检查文件状态（诚实闭环 + 同步更新 beforeLines）
+        const recheckBtn = document.getElementById('btn-recheck-file-state');
+        if (recheckBtn) {
+          recheckBtn.addEventListener('click', () => {
+            if (pr.diskState === 'baseline') {
+              pr.externallyModified = false;
+              pr.beforeLines = pr.baseBeforeLines.map((l) => ({ ...l }));
+              toast('重新检查完成：磁盘文件已还原回原基线，已重新解锁「采纳写入」');
+            } else {
+              pr.externallyModified = true;
+              let tagged = false;
+              pr.beforeLines = pr.externalBeforeLines.map((l) => {
+                if (!tagged && l.type === 'del') {
+                  tagged = true;
+                  const suffix = '（刚重新检查：磁盘仍与原基线不一致）';
+                  return { ...l, text: l.text.includes(suffix) ? l.text : `${l.text}${suffix}` };
+                }
+                return { ...l };
+              });
+              toast('重新检查完成：磁盘仍存在外部改动，「采纳写入」保持禁用；请打开页面手动合并或丢弃此页改动');
+            }
+            renderDiffModal();
+            bindModalEvents();
+          });
+        }
+
+        const openManualMerge = () => {
+          state.activeDiffId = null;
+          state.docActiveTitle = pr.pageTitle;
+          state.l2ActiveDocTitle = pr.pageTitle;
+          state.scene = 'wikidoc';
+          toast(`已打开《${pr.pageTitle}》，手动合并后可返回整理页丢弃本次待审改动`);
+          render();
+        };
+        const manualMergeBtn = document.getElementById('btn-open-manual-merge');
+        if (manualMergeBtn) manualMergeBtn.addEventListener('click', openManualMerge);
+        const footerManualMergeBtn = document.getElementById('btn-footer-manual-merge');
+        if (footerManualMergeBtn) footerManualMergeBtn.addEventListener('click', openManualMerge);
+
+        const discardBtn = document.getElementById('btn-discard-review');
+        if (discardBtn) {
+          discardBtn.addEventListener('click', () => {
+            const parent = state.changesets.find((c) => c.id === pr.changesetId);
+            if (parent) {
+              parent.ops.forEach((op) => {
+                if (op.reviewId === pr.id) op.outcome = 'discarded';
+              });
+              if (!parent.ops.some((op) => op.outcome === 'pending_review')) parent.status = 'applied';
+            }
+            state.pendingReviews = state.pendingReviews.filter((x) => x.id !== pr.id);
+            state.activeDiffId = null;
+            toast(`已丢弃《${pr.pageTitle}》的待审改动`);
+            render();
+          });
+        }
+
+        // B4-4: 按原 op 类型生成子整理记录
+        const applyBtn = document.getElementById('btn-apply-review');
+        if (applyBtn) {
+          applyBtn.addEventListener('click', () => {
+            if (pr.externallyModified) return;
+            const childId = `cs-sub-${Math.floor(100 + Math.random() * 899)}`;
+            const parent = state.changesets.find((c) => c.id === pr.changesetId);
+            if (parent) {
+              parent.ops.forEach((op) => {
+                if (op.reviewId === pr.id) {
+                  op.outcome = 'applied';
+                  op.pageState = 'applied';
+                }
+              });
+              if (!parent.ops.some((op) => op.outcome === 'pending_review')) parent.status = 'applied';
+            }
+            state.changesets.unshift({
+              id: childId,
+              summary: `已采纳待审改动：《${pr.pageTitle}》（${pr.opTag}）`,
+              time: '刚刚',
+              trigger: '人工差异确认',
+              modelAlias: 'gpt-4.1-mini',
+              status: 'applied',
+              parentId: pr.changesetId,
+              droppedClaims: 0,
+              rollbackNote: '',
+              revertBlockedNote: '',
+              revertBlockedChildId: null,
+              ops: [
+                { op: pr.op, tag: pr.opTag, tagClass: pr.opTagClass, title: pr.pageTitle, path: pr.pagePath, detail: pr.reasonLabel, outcome: 'applied', pageState: 'applied' },
+              ],
+            });
+            state.pendingReviews = state.pendingReviews.filter((x) => x.id !== pr.id);
+            state.activeDiffId = null;
+            toast(`已写入《${pr.pageTitle}》并按「${pr.opTag}」生成关联子记录 #${childId}`);
+            render();
+          });
+        }
+      }
+
+      // ======================================================================
+      // Static Top Bar & Global Listeners
+      // ======================================================================
+      document.querySelectorAll('.p0-scene-tab').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.scene = btn.dataset.scene;
+          render();
+        });
+      });
+      document.querySelectorAll('.nav-item[data-rail-scene]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.scene = btn.dataset.railScene;
+          render();
+        });
+      });
+      const toggleTheme = () => {
+        state.theme = state.theme === 'slate' ? 'paper' : 'slate';
+        render();
+      };
+      document.getElementById('btn-theme-toggle').addEventListener('click', toggleTheme);
+      document.getElementById('rail-theme-btn').addEventListener('click', toggleTheme);
+
+      document.getElementById('btn-viewport-toggle').addEventListener('click', () => {
+        state.narrow = !state.narrow;
+        render();
+      });
+
+      document.getElementById('modal-layer').addEventListener('click', (e) => {
+        if (e.target.id === 'modal-layer') {
+          state.activeDiffId = null;
+          render();
+        }
+      });
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          if (state.activeDiffId) {
+            state.activeDiffId = null;
+            render();
+          } else if (state.docDisambigOpen || state.docHoverCite) {
+            state.docDisambigOpen = false;
+            state.docHoverCite = null;
+            render();
+          }
+        }
+      });
+
+      window.addEventListener('click', () => {
+        if (state.docDisambigOpen) {
+          state.docDisambigOpen = false;
+          render();
+        }
+      });
+
+      render();
+    })();
+  </script>
+</body>
+</html>

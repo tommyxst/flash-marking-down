@@ -105,7 +105,9 @@ type RenderCtx = {
   usedTaskIds: Set<string>
   onCite: (citation: CitationItem) => void
   onDocCite: (citation: DocCitation) => void
-  onWikilink: (target: string) => void
+  onDocCiteHover: (citation: DocCitation, el: HTMLElement, immediate: boolean) => void
+  onDocCiteLeave: () => void
+  onWikilink: (target: string, event: MouseEvent) => void
   onToggleTask: (task: DocTaskItem) => void
 }
 
@@ -131,8 +133,20 @@ function pushRichText(out: VNodeChild[], raw: string, ctx: RenderCtx) {
           {
             type: 'button',
             class: 'footnote-ref',
-            title: `对照原文：${docCit.label}`,
+            'aria-label': `对照原文引文：${docCit.label}`,
             onClick: () => ctx.onDocCite(docCit),
+            onMouseenter: (e: MouseEvent) => {
+              if (e.currentTarget instanceof HTMLElement) {
+                ctx.onDocCiteHover(docCit, e.currentTarget, false)
+              }
+            },
+            onMouseleave: () => ctx.onDocCiteLeave(),
+            onFocus: (e: FocusEvent) => {
+              if (e.currentTarget instanceof HTMLElement) {
+                ctx.onDocCiteHover(docCit, e.currentTarget, true)
+              }
+            },
+            onBlur: () => ctx.onDocCiteLeave(),
           },
           `[^${docCit.refLabel}]`,
         ),
@@ -173,7 +187,7 @@ function pushRichText(out: VNodeChild[], raw: string, ctx: RenderCtx) {
             type: 'button',
             class: 'wikilink',
             title: `打开知识页：${wikiTarget.trim()}`,
-            onClick: () => ctx.onWikilink(wikiTarget.trim()),
+            onClick: (e: MouseEvent) => ctx.onWikilink(wikiTarget.trim(), e),
           },
           `[[${display}]]`,
         ),
@@ -353,7 +367,9 @@ export default defineComponent({
   emits: {
     cite: (_citation: CitationItem) => true,
     docCite: (_citation: DocCitation) => true,
-    wikilink: (_target: string) => true,
+    docCiteHover: (_citation: DocCitation, _el: HTMLElement, _immediate: boolean) => true,
+    docCiteLeave: () => true,
+    wikilink: (_target: string, _event: MouseEvent) => true,
     toggleTask: (_task: DocTaskItem) => true,
   },
   setup(props, { emit }) {
@@ -375,7 +391,9 @@ export default defineComponent({
         usedTaskIds: new Set<string>(),
         onCite: (citation) => emit('cite', citation),
         onDocCite: (citation) => emit('docCite', citation),
-        onWikilink: (target) => emit('wikilink', target),
+        onDocCiteHover: (citation, el, immediate) => emit('docCiteHover', citation, el, immediate),
+        onDocCiteLeave: () => emit('docCiteLeave'),
+        onWikilink: (target, event) => emit('wikilink', target, event),
         onToggleTask: (task) => emit('toggleTask', task),
       }
       const children: VNodeChild[] = []

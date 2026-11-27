@@ -249,6 +249,8 @@ impl Storage {
                     .map_err(migration_error)?;
                 tx.execute_batch(NOTES_SCHEMA).map_err(migration_error)?;
                 tx.execute_batch(wikra::SCHEMA).map_err(migration_error)?;
+                tx.execute_batch(wikra::MIGRATE_V8)
+                    .map_err(migration_error)?;
                 tx.pragma_update(None, "application_id", APPLICATION_ID)
                     .map_err(migration_error)?;
                 tx.execute(
@@ -268,8 +270,12 @@ impl Storage {
                 if version < 6 {
                     migrate_to_v6(&tx)?;
                 }
-                if version < SCHEMA_VERSION {
+                if version < 7 {
                     tx.execute_batch(wikra::SCHEMA).map_err(migration_error)?;
+                }
+                if version < 8 {
+                    tx.execute_batch(wikra::MIGRATE_V8)
+                        .map_err(migration_error)?;
                     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
                         .map_err(migration_error)?;
                 }
@@ -1598,8 +1604,8 @@ fn revision_hash(bytes: &[u8]) -> String {
         .collect()
 }
 
-const APPLICATION_ID: i64 = i64::from_be_bytes(*b"\0\0\0\0FMD1");
-const SCHEMA_VERSION: i64 = 7;
+pub(crate) const APPLICATION_ID: i64 = i64::from_be_bytes(*b"\0\0\0\0FMD1");
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 const SCHEMA: &str = "
 CREATE TABLE workspace_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE drafts (id TEXT PRIMARY KEY, body TEXT, edit_revision INTEGER NOT NULL CHECK(edit_revision >= 0), persisted_revision INTEGER NOT NULL CHECK(persisted_revision = edit_revision), updated_at TEXT NOT NULL);";

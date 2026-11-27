@@ -1,12 +1,21 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../../api/client'
 import { parseAppError, type UiError } from '../../api/errors'
 import CaptureEditor from '../../CaptureEditor.vue'
 import ErrorNotice from '../ErrorNotice.vue'
 import MarkdownPreview from '../../MarkdownPreview.vue'
 import UiIcon from '../../UiIcon.vue'
-import type { DocCitation, DocTaskItem, DocumentDetail, DocWidthMode } from '../../m2'
+import type {
+  CitationContext,
+  DocCitation,
+  DocTaskItem,
+  DocumentDetail,
+  DocWidthMode,
+  LintFinding,
+  WikilinkCandidate,
+  WikilinkMatch,
+} from '../../m2'
 import { parseWikiBodyForView, shortDate } from '../../utils/wikra'
 
 const props = defineProps<{
@@ -21,6 +30,8 @@ const props = defineProps<{
   evidenceRawDoc: DocumentDetail | null
   evidenceLoading: boolean
   externalChanged: boolean
+  wikilinkCandidates?: WikilinkCandidate[]
+  pageLintFindings?: LintFinding[]
 }>()
 
 const emit = defineEmits<{
@@ -31,6 +42,8 @@ const emit = defineEmits<{
   closeEvidence: []
   openRaw: [path: string]
   openWikilink: [target: string]
+  openWikiPath: [path: string]
+  openPageLint: [path: string]
   openConflict: [conflictId: string]
   startTeachback: [pagePath: string]
   exitCurtain: []
@@ -40,6 +53,7 @@ const emit = defineEmits<{
   reloadDoc: [path: string]
   dismissExternal: []
   toggleTask: [task: DocTaskItem]
+  toast: [message: string]
 }>()
 
 const propsExpanded = ref(false)
@@ -54,6 +68,288 @@ const curtainOn = computed(() => Boolean(props.doc && props.recallCurtainPagePat
 const parsedBody = computed(() => (props.doc ? parseWikiBodyForView(props.doc.body) : null))
 const isFullWidth = computed(() => props.docWidth === 'full')
 
+// ============================================================================
+// P0 Scene 4.1: Lightweight L1 Lint Badge (only rendered for error / warn)
+// ============================================================================
+const openPageLint = computed(() =>
+  (props.pageLintFindings || []).filter(
+    (f) => !f.dismissed && (f.severity === 'error' || f.severity === 'warn'),
+  ),
+)
+const lintErrorCount = computed(() => openPageLint.value.filter((f) => f.severity === 'error').length)
+const lintWarnCount = computed(() => openPageLint.value.filter((f) => f.severity === 'warn').length)
+const showLintBadge = computed(() => lintErrorCount.value + lintWarnCount.value > 0)
+
+// ============================================================================
+// P0 Scene 4.2: Wikilink Resolution & Horizontally Clamped Disambiguation Popover
+// ============================================================================
+interface DisambigState {
+  target: string
+  matches: WikilinkMatch[]
+  left: number
+  top: number | null
+  bottom: number | null
+  activeIdx: number
+}
+
+const disambig = ref<DisambigState | null>(null)
+const disambigPopoverEl = ref<HTMLElement>()
+
+function closeDisambig() {
+  disambig.value = null
+}
+
+async function handleWikilinkClick(target: string, event?: MouseEvent) {
+  closeCiteHoverImmediately()
+  if (!props.session || !props.doc) {
+    emit('openWikilink', target)
+    return
+  }
+  const anchorEl = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  const anchorRect = anchorEl?.getBoundingClientRect()
+
+  try {
+    const resolution = await api.resolveWikilink(props.session, props.doc.path, target)
+    if (resolution.status === 'unique' && resolution.matches[0]) {
+      closeDisambig()
+      emit('openWikiPath', resolution.matches[0].path)
+      return
+    }
+    if (resolution.status === 'missing' || !resolution.matches.length) {
+      closeDisambig()
+      emit('toast', `未找到《${target}》，可在整理或新建时创建`)
+      return
+    }
+
+    // Ambiguous: compute viewport-clamped popover coordinates (min 12px horizontal margin)
+    const popWidth = Math.min(316, window.innerWidth - 24)
+    const rawLeft = anchorRect ? anchorRect.left : (event?.clientX ?? 24)
+    const left = Math.max(12, Math.min(rawLeft, window.innerWidth - popWidth - 12))
+    const estimatedHeight = Math.min(280, 44 + resolution.matches.length * 56)
+    const spaceBelow = anchorRect ? window.innerHeight - anchorRect.bottom : window.innerHeight - (event?.clientY ?? 120)
+    const above = spaceBelow < estimatedHeight + 16 && (anchorRect?.top ?? 0) > estimatedHeight + 16
+
+    disambig.value = {
+      target,
+      matches: resolution.matches,
+      left,
+      top: above ? null : Math.min(window.innerHeight - 60, (anchorRect?.bottom ?? event?.clientY ?? 120) + 6),
+      bottom: above ? Math.max(12, window.innerHeight - (anchorRect?.top ?? 120) + 6) : null,
+      activeIdx: 0,
+    }
+  } catch {
+    // Graceful fallback to local title lookup if resolve_wikilink errors unexpectedly
+    emit('openWikilink', target)
+  }
+}
+
+function selectDisambigMatch(match: WikilinkMatch) {
+  closeDisambig()
+  emit('openWikiPath', match.path)
+}
+
+// ============================================================================
+// P0 Scene 4.3: Footnote Hover / Focus Citation Preview Card + Evidence Locate
+// ============================================================================
+interface CiteHoverState {
+  citation: DocCitation
+  left: number
+  top: number | null
+  bottom: number | null
+  placement: 'above' | 'below'
+  context: CitationContext | null
+  loading: boolean
+}
+
+const citeHover = ref<CiteHoverState | null>(null)
+const citationCtxCache = ref<Record<string, CitationContext>>({})
+let citeShowTimer: number | undefined
+let citeHideTimer: number | undefined
+
+function citeCacheKey(pagePath: string, refLabel: string): string {
+  return `${pagePath}::${refLabel}`
+}
+
+async function fetchCitationContext(pagePath: string, refLabel: string): Promise<CitationContext | null> {
+  if (!props.session || !pagePath || !refLabel) return null
+  const key = citeCacheKey(pagePath, refLabel)
+  if (citationCtxCache.value[key]) return citationCtxCache.value[key]
+  try {
+    const ctx = await api.readCitationContext(props.session, pagePath, refLabel)
+    citationCtxCache.value = { ...citationCtxCache.value, [key]: ctx }
+    return ctx
+  } catch {
+    return null
+  }
+}
+
+function showCiteCardAt(citation: DocCitation, el: HTMLElement) {
+  const docPath = props.doc?.path
+  if (!docPath) return
+  const rect = el.getBoundingClientRect()
+  const cardWidth = Math.min(364, window.innerWidth - 24)
+  const centeredLeft = rect.left + rect.width / 2 - cardWidth / 2
+  const left = Math.max(12, Math.min(centeredLeft, window.innerWidth - cardWidth - 12))
+  const estimatedHeight = 180
+  const showBelow = rect.top < estimatedHeight + 24 && window.innerHeight - rect.bottom > estimatedHeight + 16
+  const placement: 'above' | 'below' = showBelow ? 'below' : 'above'
+
+  const cached = citationCtxCache.value[citeCacheKey(docPath, citation.refLabel)] ?? null
+  citeHover.value = {
+    citation,
+    left,
+    top: showBelow ? rect.bottom + 8 : null,
+    bottom: showBelow ? null : Math.max(12, window.innerHeight - rect.top + 8),
+    placement,
+    context: cached,
+    loading: !cached,
+  }
+
+  if (!cached) {
+    void fetchCitationContext(docPath, citation.refLabel).then((ctx) => {
+      if (
+        citeHover.value
+        && citeHover.value.citation.id === citation.id
+        && props.doc?.path === docPath
+      ) {
+        citeHover.value = { ...citeHover.value, context: ctx, loading: false }
+      }
+    })
+  }
+}
+
+function handleDocCiteHover(citation: DocCitation, el: HTMLElement, immediate: boolean) {
+  window.clearTimeout(citeHideTimer)
+  window.clearTimeout(citeShowTimer)
+  if (immediate) {
+    showCiteCardAt(citation, el)
+  } else {
+    citeShowTimer = window.setTimeout(() => {
+      showCiteCardAt(citation, el)
+    }, 180)
+  }
+}
+
+function scheduleCiteHide() {
+  window.clearTimeout(citeShowTimer)
+  window.clearTimeout(citeHideTimer)
+  citeHideTimer = window.setTimeout(() => {
+    citeHover.value = null
+  }, 150)
+}
+
+function cancelCiteHide() {
+  window.clearTimeout(citeHideTimer)
+}
+
+function closeCiteHoverImmediately() {
+  window.clearTimeout(citeShowTimer)
+  window.clearTimeout(citeHideTimer)
+  citeHover.value = null
+}
+
+function openEvidenceFromHover() {
+  if (!citeHover.value) return
+  const target = citeHover.value.citation
+  closeCiteHoverImmediately()
+  emit('openEvidence', target)
+}
+
+// ============================================================================
+// Evidence Split Paragraph Highlight & Auto-Scroll
+// ============================================================================
+const evidenceContext = ref<CitationContext | null>(null)
+const evidenceBodyEl = ref<HTMLElement>()
+
+function stripFrontmatterText(raw: string): string {
+  const norm = raw.replace(/^\uFEFF/, '').replaceAll('\r\n', '\n')
+  if (!norm.startsWith('---\n')) return norm
+  const end = norm.indexOf('\n---', 4)
+  if (end < 0) return norm
+  const afterClose = end + 4
+  if (afterClose < norm.length && norm[afterClose] !== '\n') return norm
+  return norm.slice(afterClose).replace(/^\n/, '')
+}
+
+function splitRawParagraphs(raw: string): string[] {
+  const clean = stripFrontmatterText(raw).trim()
+  if (!clean) return []
+  const lines = clean.split('\n')
+  const blocks: string[] = []
+  let buf: string[] = []
+  let inFence = false
+
+  for (const line of lines) {
+    if (/^\s*(?:```|~~~)/.test(line)) inFence = !inFence
+    if (!inFence && line.trim() === '') {
+      if (buf.length) {
+        blocks.push(buf.join('\n').trim())
+        buf = []
+      }
+    } else {
+      buf.push(line)
+    }
+  }
+  if (buf.length) blocks.push(buf.join('\n').trim())
+  return blocks.filter(Boolean)
+}
+
+function normalizeForMatch(s: string): string {
+  return s.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+const evidenceParagraphs = computed(() =>
+  props.evidenceRawDoc ? splitRawParagraphs(props.evidenceRawDoc.body) : [],
+)
+
+const locatedEvidenceIndex = computed(() => {
+  const blocks = evidenceParagraphs.value
+  if (!blocks.length || !props.evidenceCitation) return -1
+  const needles = [
+    evidenceContext.value?.paragraph || '',
+    evidenceContext.value?.quote || '',
+    props.evidenceCitation.quote || '',
+  ]
+    .map(normalizeForMatch)
+    .filter((n) => n.length >= 6)
+
+  for (const needle of needles) {
+    const idx = blocks.findIndex((b) => {
+      const normBlock = normalizeForMatch(b)
+      return normBlock.includes(needle) || (needle.length > 24 && normBlock.includes(needle.slice(0, 24)))
+    })
+    if (idx >= 0) return idx
+  }
+  return -1
+})
+
+watch(
+  () => [props.doc?.path, props.evidenceCitation?.refLabel] as const,
+  async ([docPath, refLabel]) => {
+    evidenceContext.value = null
+    if (!docPath || !refLabel) return
+    const ctx = await fetchCitationContext(docPath, refLabel)
+    if (props.doc?.path === docPath && props.evidenceCitation?.refLabel === refLabel) {
+      evidenceContext.value = ctx
+    }
+  },
+  { immediate: true },
+)
+
+watch(
+  () => [props.evidenceRawDoc?.path, locatedEvidenceIndex.value] as const,
+  ([rawPath, idx]) => {
+    if (!rawPath || idx < 0) return
+    void nextTick(() => {
+      const target = evidenceBodyEl.value?.querySelector<HTMLElement>(`[data-raw-para="${idx}"]`)
+      target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  },
+)
+
+// ============================================================================
+// Document Lifecycle & Source Editing
+// ============================================================================
 watch(
   () => props.doc?.path,
   () => {
@@ -63,6 +359,9 @@ watch(
     versionConflict.value = false
     sourceDraft.value = props.doc?.body ?? ''
     dirty.value = false
+    citationCtxCache.value = {}
+    closeDisambig()
+    closeCiteHoverImmediately()
   },
   { immediate: true },
 )
@@ -71,6 +370,7 @@ watch(
   () => props.doc?.contentHash,
   () => {
     if (!props.doc) return
+    citationCtxCache.value = {}
     if (!dirty.value || props.editorMode !== 'source') {
       sourceDraft.value = props.doc.body
       dirty.value = false
@@ -137,6 +437,7 @@ function reloadFromDisk() {
 }
 
 function handleSourceKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
   if (e.ctrlKey && e.key.toLowerCase() === 's') {
     e.preventDefault()
     void saveSource()
@@ -146,6 +447,62 @@ function handleSourceKeydown(e: KeyboardEvent) {
 function peekSection(key: string) {
   peekSections.value = { ...peekSections.value, [key]: true }
 }
+
+function handleGlobalKey(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
+  if (disambig.value) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      closeDisambig()
+      return
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      disambig.value = {
+        ...disambig.value,
+        activeIdx: (disambig.value.activeIdx + 1) % disambig.value.matches.length,
+      }
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      disambig.value = {
+        ...disambig.value,
+        activeIdx: (disambig.value.activeIdx - 1 + disambig.value.matches.length) % disambig.value.matches.length,
+      }
+      return
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      const chosen = disambig.value.matches[disambig.value.activeIdx] || disambig.value.matches[0]
+      if (chosen) selectDisambigMatch(chosen)
+      return
+    }
+  }
+  if (citeHover.value && e.key === 'Escape') {
+    e.preventDefault()
+    closeCiteHoverImmediately()
+  }
+}
+
+function handleGlobalMousedown(e: MouseEvent) {
+  if (!disambig.value) return
+  const target = e.target as HTMLElement | null
+  if (target && disambigPopoverEl.value?.contains(target)) return
+  closeDisambig()
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', handleGlobalKey)
+  window.addEventListener('mousedown', handleGlobalMousedown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleGlobalKey)
+  window.removeEventListener('mousedown', handleGlobalMousedown)
+  window.clearTimeout(citeShowTimer)
+  window.clearTimeout(citeHideTimer)
+})
 </script>
 
 <template>
@@ -167,7 +524,7 @@ function peekSection(key: string) {
       <div class="editor-main">
         <div class="doc-toolbar">
           <div class="breadcrumb" :title="doc.path">{{ doc.path }}</div>
-          <div style="display:flex;align-items:center;gap:5px;flex:none;">
+          <div class="doc-toolbar-actions">
             <button
               type="button"
               class="btn sm"
@@ -210,6 +567,17 @@ function peekSection(key: string) {
               @click="emit('startTeachback', doc.path)"
             >让我讲一遍</button>
             <button
+              v-if="showLintBadge"
+              type="button"
+              class="lint-toolbar-badge"
+              :class="lintErrorCount > 0 ? 'error' : 'warn'"
+              title="点击前往整理中心查看并修复本页体检项"
+              @click="emit('openPageLint', doc.path)"
+            >
+              <UiIcon name="alert" size="sm" />
+              <span>{{ lintErrorCount > 0 ? `${lintErrorCount + lintWarnCount} 项体检异常` : `${lintWarnCount} 项体检提醒` }}</span>
+            </button>
+            <button
               type="button"
               class="btn quiet sm"
               title="用系统默认关联程序（如 Obsidian）打开同一本地文件"
@@ -220,7 +588,7 @@ function peekSection(key: string) {
           </div>
         </div>
 
-        <div class="doc-scroll">
+        <div class="doc-scroll" @scroll.passive="closeDisambig(); closeCiteHoverImmediately()">
           <article class="doc-paper">
             <div class="doc-title-row">
               <h1>{{ doc.title }}</h1>
@@ -271,12 +639,13 @@ function peekSection(key: string) {
                 <CaptureEditor
                   :model-value="sourceDraft"
                   editor-id="wiki-source-editor"
-                  placeholder-text="在此编辑 Markdown 源码…"
+                  :wikilink-candidates="wikilinkCandidates"
+                  placeholder-text="在此编辑 Markdown 源码，输入 [[ 或 【【 可关联知识页…"
                   @update:model-value="onSourceUpdate"
                 />
               </div>
               <p class="hint" style="margin-top:8px;">
-                100% 兼容 Obsidian 本地 Markdown 格式，保留所有自定义标签与语法块。
+                100% 兼容 Obsidian 本地 Markdown 格式，保留所有自定义标签、换行符与语法块。
               </p>
             </template>
 
@@ -300,6 +669,10 @@ function peekSection(key: string) {
                   <div class="fm-val">{{ doc.typeLabel }}</div>
                   <span class="fm-key">别名</span>
                   <div class="fm-val">{{ doc.aliases.join('、') || '无' }}</div>
+                  <template v-if="doc.status">
+                    <span class="fm-key">页面状态</span>
+                    <div class="fm-val">{{ doc.status }}</div>
+                  </template>
                   <span class="fm-key">AI 更新规则</span>
                   <div class="fm-val">
                     {{ doc.wikraCore ? '核心页：涉及结论变化时先请你确认' : '常规页：后台自动补充，随时可撤销' }}
@@ -341,8 +714,10 @@ function peekSection(key: string) {
                     hide-frontmatter
                     :doc-citations="doc.citations"
                     :doc-tasks="doc.tasks"
-                    @doc-cite="emit('openEvidence', $event)"
-                    @wikilink="emit('openWikilink', $event)"
+                    @doc-cite="closeCiteHoverImmediately(); emit('openEvidence', $event)"
+                    @doc-cite-hover="handleDocCiteHover"
+                    @doc-cite-leave="scheduleCiteHide"
+                    @wikilink="handleWikilinkClick"
                     @toggle-task="emit('toggleTask', $event)"
                   />
                 </template>
@@ -361,8 +736,10 @@ function peekSection(key: string) {
                     hide-frontmatter
                     :doc-citations="doc.citations"
                     :doc-tasks="doc.tasks"
-                    @doc-cite="emit('openEvidence', $event)"
-                    @wikilink="emit('openWikilink', $event)"
+                    @doc-cite="closeCiteHoverImmediately(); emit('openEvidence', $event)"
+                    @doc-cite-hover="handleDocCiteHover"
+                    @doc-cite-leave="scheduleCiteHide"
+                    @wikilink="handleWikilinkClick"
                     @toggle-task="emit('toggleTask', $event)"
                   />
                 </template>
@@ -385,8 +762,10 @@ function peekSection(key: string) {
                     :base-path="doc.path"
                     hide-frontmatter
                     :doc-citations="doc.citations"
-                    @doc-cite="emit('openEvidence', $event)"
-                    @wikilink="emit('openWikilink', $event)"
+                    @doc-cite="closeCiteHoverImmediately(); emit('openEvidence', $event)"
+                    @doc-cite-hover="handleDocCiteHover"
+                    @doc-cite-leave="scheduleCiteHide"
+                    @wikilink="handleWikilinkClick"
                   />
                 </section>
 
@@ -450,11 +829,16 @@ function peekSection(key: string) {
           </div>
         </div>
 
-        <div class="evidence-body">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;">
-            <div style="display:flex;gap:6px;">
+        <div ref="evidenceBodyEl" class="evidence-body">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+            <div class="row-flex">
               <span class="pill">只读原件</span>
               <span v-if="evidenceRawDoc?.updatedAt" class="pill">{{ shortDate(evidenceRawDoc.updatedAt) }}</span>
+              <span
+                v-if="evidenceContext"
+                class="pill"
+                :class="evidenceContext.verified ? 'success' : 'warning'"
+              >{{ evidenceContext.verified ? '已核对原件' : '原文有变动' }}</span>
             </div>
             <button
               v-if="evidenceRawDoc?.sourceUrl"
@@ -467,10 +851,30 @@ function peekSection(key: string) {
           </div>
 
           <div class="kicker">引用片段</div>
-          <div class="quote-highlight">“{{ evidenceCitation.quote || evidenceCitation.label }}”</div>
+          <div class="quote-highlight">“{{ evidenceContext?.quote || evidenceCitation.quote || evidenceCitation.label }}”</div>
 
           <div class="kicker" style="margin-top:14px;">原文完整内容</div>
           <p v-if="evidenceLoading" class="hint" style="margin-top:8px;">正在读取原件全文…</p>
+          <div v-else-if="evidenceRawDoc && evidenceParagraphs.length > 0" style="margin-top:8px;">
+            <div
+              v-for="(block, idx) in evidenceParagraphs"
+              :key="idx"
+              :data-raw-para="idx"
+              class="raw-para-block"
+              :class="{ located: idx === locatedEvidenceIndex }"
+            >
+              <div v-if="idx === locatedEvidenceIndex" style="margin-bottom:4px;">
+                <span class="pill accent">定位原段</span>
+              </div>
+              <MarkdownPreview
+                :source="block"
+                :session="session"
+                :base-path="evidenceRawDoc.path"
+                hide-frontmatter
+                compact
+              />
+            </div>
+          </div>
           <div v-else-if="evidenceRawDoc" style="margin-top:8px;">
             <MarkdownPreview
               :source="evidenceRawDoc.body"
@@ -485,6 +889,99 @@ function peekSection(key: string) {
           </p>
         </div>
       </aside>
+    </div>
+
+    <!-- Disambiguation Popover (Viewport-Clamped Fixed Overlay) -->
+    <div
+      v-if="disambig"
+      ref="disambigPopoverEl"
+      class="disambig-popover"
+      role="listbox"
+      :aria-label="`「${disambig.target}」同名知识页选择`"
+      :style="{
+        left: `${disambig.left}px`,
+        top: disambig.top !== null ? `${disambig.top}px` : undefined,
+        bottom: disambig.bottom !== null ? `${disambig.bottom}px` : undefined,
+      }"
+    >
+      <div class="disambig-head">
+        <span>「{{ disambig.target }}」对应 {{ disambig.matches.length }} 篇同名知识页</span>
+        <button type="button" class="icon-btn sm" aria-label="关闭消歧列表" @click="closeDisambig">&times;</button>
+      </div>
+      <div class="disambig-list">
+        <button
+          v-for="(m, idx) in disambig.matches"
+          :key="m.path"
+          type="button"
+          class="disambig-item"
+          role="option"
+          :aria-selected="idx === disambig.activeIdx"
+          :class="{ active: idx === disambig.activeIdx }"
+          @mouseenter="disambig.activeIdx = idx"
+          @click="selectDisambigMatch(m)"
+        >
+          <div class="row-between" style="width:100%;">
+            <strong style="font-size:12.5px;">{{ m.title }}</strong>
+            <span class="pill">{{ m.typeLabel || '知识页' }}</span>
+          </div>
+          <div class="row-between" style="width:100%;font-size:11px;color:var(--muted);">
+            <span class="mono" style="word-break:break-all;">{{ m.path }}</span>
+            <span style="flex:none;">{{ shortDate(m.updatedAt) }}</span>
+          </div>
+        </button>
+      </div>
+    </div>
+
+    <!-- Footnote Citation Hover Preview Card (Viewport-Clamped with Anti-Flicker Bridge) -->
+    <div
+      v-if="citeHover"
+      class="cite-hover-card"
+      :class="citeHover.placement === 'below' ? 'below' : 'above'"
+      role="tooltip"
+      :style="{
+        left: `${citeHover.left}px`,
+        top: citeHover.top !== null ? `${citeHover.top}px` : undefined,
+        bottom: citeHover.bottom !== null ? `${citeHover.bottom}px` : undefined,
+      }"
+      @mouseenter="cancelCiteHide"
+      @mouseleave="scheduleCiteHide"
+    >
+      <div class="row-between">
+        <strong style="font-size:12.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+          {{ citeHover.citation.label }}
+        </strong>
+        <span
+          v-if="citeHover.context"
+          class="pill"
+          :class="citeHover.context.verified ? 'success' : 'warning'"
+        >{{ citeHover.context.verified ? '已核对原件' : '原文有变动' }}</span>
+        <span v-else-if="citeHover.loading" class="pill">核对中…</span>
+      </div>
+
+      <div
+        v-if="citeHover.context?.rawPath || citeHover.citation.rawPath"
+        class="mono hint"
+        style="font-size:11px;word-break:break-all;"
+      >
+        {{ citeHover.context?.rawPath || citeHover.citation.rawPath }}
+      </div>
+
+      <div class="cite-hover-quote">
+        “{{ citeHover.context?.quote || citeHover.citation.quote || citeHover.citation.label }}”
+      </div>
+
+      <div class="row-between">
+        <span v-if="citeHover.context?.reason" class="hint" style="color:var(--warning);">
+          {{ citeHover.context.reason }}
+        </span>
+        <span v-else class="hint">点击脚注可直接对照原文</span>
+        <button
+          type="button"
+          class="btn quiet xs"
+          style="color:var(--accent);"
+          @click="openEvidenceFromHover"
+        >分屏对照并定位原段 →</button>
+      </div>
     </div>
   </div>
 </template>

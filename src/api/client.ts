@@ -1,9 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AgentIntegration,
   CaptureCommitMode,
   CaptureCommitResult,
+  ChangesetDetail,
   ChangesetItem,
   ChatTurn,
+  CitationContext,
   ConflictItem,
   ConflictStatus,
   ConversationDetail,
@@ -15,6 +18,7 @@ import type {
   DocumentMapping,
   DocWidthMode,
   DrawerCounts,
+  ExportSkillResult,
   GlobalSearchHit,
   HotkeyStatus,
   InboxItemDetail,
@@ -23,6 +27,10 @@ import type {
   IntegrationsConfig,
   KnowledgeGraph,
   LibraryTree,
+  LintFinding,
+  LintFixResult,
+  LintReport,
+  McpTestResult,
   MemoryConfig,
   MemoryItem,
   ModelConfig,
@@ -32,11 +40,16 @@ import type {
   OrganizeOverview,
   RecentCapture,
   RecordSource,
+  RevertChangesetResult,
   SearchPage,
+  SemanticLintPreview,
+  SemanticLintScope,
   TaskList,
   TeachbackTurn,
   ThemeName,
   WikiDocument,
+  WikilinkCandidate,
+  WikilinkResolution,
   WikiSuggestion,
 } from '../m2'
 
@@ -142,10 +155,51 @@ export const api = {
     invoke<OrganizeOverview>('cancel_buffer_item', { session, itemId }),
   flushBufferNow: (session: string) =>
     invoke<OrganizeOverview>('flush_buffer_now', { session }),
+  getChangesetDetail: (session: string, changesetId: string) =>
+    invoke<ChangesetDetail>('get_changeset_detail', { session, changesetId }),
+  decideReview: (
+    session: string,
+    changesetId: string,
+    path: string,
+    decision: 'apply' | 'discard',
+  ) => invoke<ChangesetItem>('decide_review', { session, changesetId, path, decision }),
   revertChangeset: (session: string, changesetId: string) =>
-    invoke<ChangesetItem>('revert_changeset', { session, changesetId }),
+    invoke<RevertChangesetResult>('revert_changeset', { session, changesetId }),
   dismissSuggestion: (session: string, suggestionId: string) =>
     invoke<void>('dismiss_suggestion', { session, suggestionId }),
+  undismissSuggestion: (session: string, suggestionId: string) =>
+    invoke<void>('undismiss_suggestion', { session, suggestionId }),
+
+  // P0 Hybrid Lint (L1 Structure + L2 Semantic)
+  runStructureLint: (session: string) =>
+    invoke<LintReport>('run_structure_lint', { session }),
+  applyLintFix: (session: string, findingIds: string[]) =>
+    invoke<LintFixResult>('apply_lint_fix', { session, findingIds }),
+  previewSemanticLint: (session: string, scope: SemanticLintScope) =>
+    invoke<SemanticLintPreview>('preview_semantic_lint', { session, scope }),
+  runSemanticLint: (session: string, scope: SemanticLintScope) =>
+    invoke<LintFinding[]>('run_semantic_lint', { session, scope }),
+  escalateLintToConflict: (session: string, findingId: string) =>
+    invoke<ConflictItem>('escalate_lint_to_conflict', { session, findingId }),
+
+  // P0 Wikilinks & Citation Context
+  listWikilinkCandidates: (session: string) =>
+    invoke<WikilinkCandidate[]>('list_wikilink_candidates', { session }),
+  resolveWikilink: (session: string, fromPath: string, target: string) =>
+    invoke<WikilinkResolution>('resolve_wikilink', { session, fromPath, target }),
+  readCitationContext: (session: string, pagePath: string, refLabel: string) =>
+    invoke<CitationContext>('read_citation_context', { session, pagePath, refLabel }),
+
+  // P0 External Agent Integration (Read-Only MCP & SKILL.md)
+  getAgentIntegration: (session: string) =>
+    invoke<AgentIntegration>('get_agent_integration', { session }),
+  setMcpRawAllow: (session: string, folders: string[]) =>
+    invoke<string[]>('set_mcp_raw_allow', { session, folders }),
+  exportVaultSkill: (session: string) =>
+    invoke<ExportSkillResult>('export_vault_skill', { session }),
+  testMcpStdio: (session: string) =>
+    invoke<McpTestResult>('test_mcp_stdio', { session }),
+
   teachbackTurn: (session: string, pagePath: string, step: number, userAnswer?: string) =>
     invoke<TeachbackTurn>('teachback_turn', { session, pagePath, step, userAnswer }),
   saveAnswerToWiki: (session: string, conversationId: string, messageId: string, targetPath?: string) =>

@@ -1,3 +1,5 @@
+use serde::Deserialize;
+
 use super::*;
 
 pub(crate) fn local_teachback(

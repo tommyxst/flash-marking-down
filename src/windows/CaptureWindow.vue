@@ -6,17 +6,14 @@ import { api } from '../api/client'
 import { parseAppError, type UiError } from '../api/errors'
 import CaptureEditor from '../CaptureEditor.vue'
 import ErrorNotice from '../components/ErrorNotice.vue'
-import UiIcon from '../UiIcon.vue'
-import type { CaptureCommitMode, OpenedWorkspace, RecoveryErrorDto } from '../m2'
+import type { CaptureCommitMode, OpenedWorkspace, RecoveryErrorDto, WikilinkCandidate } from '../m2'
 import {
   WIKRA_PREFS_STORAGE_KEY,
-  WIKRA_WIKI_CACHE_KEY,
   applyBodyPreferences,
   readCachedPreferences,
 } from '../utils/wikra'
 
 type PendingCapture = { requestId: string; revision: number; body: string; mode: CaptureCommitMode }
-type WikiCandidate = { path: string; title: string; typeLabel: string }
 
 const desktopWindow = isTauri() ? getCurrentWindow() : undefined
 const workspace = ref<{ session: string; root: string; captureDir: string }>()
@@ -24,7 +21,7 @@ const opening = ref(true)
 const workspaceError = ref<UiError | null>(null)
 const recoveredPaths = ref<string[]>([])
 const recoveryErrors = ref<RecoveryErrorDto[]>([])
-const editor = ref<{ focus: () => void }>()
+const editor = ref<{ focus: () => void; isCompleting: () => boolean }>()
 
 const body = ref('')
 const revision = ref(0)
@@ -40,10 +37,8 @@ const composing = ref(false)
 const windowError = ref<UiError | null>(null)
 const copyStatus = ref('')
 
-// [[ wikilink autocomplete state
-const wikiPages = ref<WikiCandidate[]>([])
-const acDismissedAt = ref(-1)
-const acActiveIdx = ref(0)
+// Session-scoped wikilink candidates loaded directly via list_wikilink_candidates
+const wikilinkCandidates = ref<WikilinkCandidate[]>([])
 
 let draftWrite: Promise<boolean> | undefined
 let draftTimer: number | undefined
@@ -63,25 +58,6 @@ const canSave = computed(
 const hasWriteError = computed(() => Boolean(draftError.value || saveError.value))
 const showEscape = computed(() => Boolean(draftError.value || saveError.value || windowError.value || recoveryErrors.value.length))
 
-const acMatch = computed(() => {
-  const m = body.value.match(/\[\[([^\]\n]{0,40})$/)
-  if (!m) return null
-  const start = body.value.length - m[0].length
-  if (acDismissedAt.value === start) return null
-  return { start, query: m[1].trim().toLowerCase() }
-})
-
-const acSuggestions = computed(() => {
-  if (!acMatch.value) return []
-  const q = acMatch.value.query
-  const filtered = wikiPages.value.filter(
-    (p) => !q || p.title.toLowerCase().includes(q) || p.path.toLowerCase().includes(q),
-  )
-  return filtered.slice(0, 6)
-})
-
-const showAc = computed(() => Boolean(acMatch.value && acSuggestions.value.length > 0 && !composing.value))
-
 const draftStatus = computed(() => {
   if (composing.value) return '中文组词期：Enter 与 Esc 优先交给输入法'
   if (saving.value) return '正在保存原文…'
@@ -89,7 +65,7 @@ const draftStatus = computed(() => {
   if (revision.value !== persistedRevision.value) {
     return draftError.value ? '最新编辑暂存内存（写盘失败）' : '正在保留草稿…'
   }
-  return body.value ? 'Esc 仅收起并保留草稿，绝不误提交' : '支持 Markdown 与输入 [[ 关联已有知识页'
+  return body.value ? 'Esc 仅收起并保留草稿，绝不误提交' : '支持 Markdown 与输入 [[ 或 【【 关联已有知识页'
 })
 
 function focusCaptureEditor() {
@@ -103,18 +79,6 @@ function syncThemeFromCache() {
   if (!document.body.dataset.density) document.body.dataset.density = 'standard'
 }
 
-function loadCachedWikiCandidates() {
-  try {
-    const raw = window.localStorage.getItem(WIKRA_WIKI_CACHE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) wikiPages.value = parsed
-    }
-  } catch {
-    // Ignore invalid cache.
-  }
-}
-
 async function syncThemeFromSettings() {
   syncThemeFromCache()
   try {
@@ -125,21 +89,20 @@ async function syncThemeFromSettings() {
   }
 }
 
-async function loadWikiCandidates(session: string) {
-  loadCachedWikiCandidates()
+async function loadWikilinkCandidates(session: string) {
+  wikilinkCandidates.value = []
   try {
-    const tree = await api.listLibraryTree(session)
+    const candidates = await api.listWikilinkCandidates(session)
     if (workspace.value?.session === session) {
-      wikiPages.value = tree.wikiPages.map((p) => ({ path: p.path, title: p.title, typeLabel: p.typeLabel }))
+      wikilinkCandidates.value = candidates
     }
   } catch {
-    // Cached candidates from main window remain active.
+    // Keep empty candidate list cleanly if vault has no wiki pages yet.
   }
 }
 
 function handleStorageSync(event: StorageEvent) {
   if (event.key === WIKRA_PREFS_STORAGE_KEY) syncThemeFromCache()
-  if (event.key === WIKRA_WIKI_CACHE_KEY) loadCachedWikiCandidates()
 }
 
 function scheduleDraftPersist() {
@@ -163,29 +126,17 @@ const editorBody = computed({
     pendingCapture.value = null
     savedMessage.value = ''
     saveError.value = null
-    acDismissedAt.value = -1
-    acActiveIdx.value = 0
     body.value = value
     revision.value += 1
     scheduleDraftPersist()
   },
 })
 
-function insertWikilink(page: WikiCandidate) {
-  const m = acMatch.value
-  if (!m) return
-  const next = `${body.value.slice(0, m.start)}[[${page.title}]]`
-  editorBody.value = next
-  void nextTick(focusCaptureEditor)
-}
-
 function applyWorkspace(opened: OpenedWorkspace) {
   window.clearTimeout(draftTimer)
   draftWrite = undefined
   closing.value = composing.value = false
   windowError.value = null
-  acDismissedAt.value = -1
-  acActiveIdx.value = 0
   workspace.value = { session: opened.session, root: opened.root, captureDir: opened.captureDir }
   revision.value = persistedRevision.value = opened.draft.revision
   body.value = opened.draft.body ?? ''
@@ -196,7 +147,7 @@ function applyWorkspace(opened: OpenedWorkspace) {
     : null
   savedMessage.value = ''
   saveError.value = draftError.value = null
-  void loadWikiCandidates(opened.session)
+  void loadWikilinkCandidates(opened.session)
   void nextTick(focusCaptureEditor)
 }
 
@@ -355,53 +306,36 @@ async function copyMarkdown(text: string) {
 }
 
 function handleWindowKey(event: KeyboardEvent) {
-  // Level 1: IME composing priority — never intercept Enter or Esc during IME composition!
+  // Level 1: IME composing priority — never intercept any key during IME composition!
   if (composing.value || event.isComposing || event.keyCode === 229) return
 
-  // Handle [[ autocomplete navigation & selection
-  if (showAc.value) {
-    if (event.key === 'Escape') {
-      // Level 2: Close [[ autocomplete popup first
-      event.preventDefault()
-      event.stopPropagation()
-      if (acMatch.value) acDismissedAt.value = acMatch.value.start
-      return
-    }
-    if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      acActiveIdx.value = (acActiveIdx.value + 1) % acSuggestions.value.length
-      return
-    }
-    if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      acActiveIdx.value = (acActiveIdx.value - 1 + acSuggestions.value.length) % acSuggestions.value.length
-      return
-    }
-    if (event.key === 'Enter' && !event.ctrlKey && !event.shiftKey) {
-      event.preventDefault()
-      event.stopPropagation()
-      const picked = acSuggestions.value[acActiveIdx.value] || acSuggestions.value[0]
-      if (picked) insertWikilink(picked)
-      return
-    }
+  // Pass-through special case: Ctrl+Enter / Ctrl+Shift+Enter submit even when completion popup is open.
+  if (event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Enter') {
+    event.preventDefault()
+    void commitWithMode(event.shiftKey ? 'now' : 'queue')
+    return
   }
 
+  // Level 2: When CM6 completion is open, bare Esc / Enter / Tab / ArrowUp / ArrowDown return early to CM6.
+  const noModifier = !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
+  if (
+    editor.value?.isCompleting()
+    && noModifier
+    && (
+      event.key === 'Escape'
+      || event.key === 'Enter'
+      || event.key === 'Tab'
+      || event.key === 'ArrowUp'
+      || event.key === 'ArrowDown'
+    )
+  ) {
+    return
+  }
+
+  // Level 3 (empty -> close immediately) & Level 4 (non-empty -> persist draft and hide, never submit)
   if (event.key === 'Escape') {
     event.preventDefault()
-    // Level 3 (empty -> close immediately) & Level 4 (non-empty -> persist draft and hide, never submit)
     void closeCapture(!body.value.trim())
-    return
-  }
-
-  if (event.ctrlKey && event.shiftKey && event.key === 'Enter') {
-    event.preventDefault()
-    void commitWithMode('now')
-    return
-  }
-
-  if (event.ctrlKey && event.key === 'Enter') {
-    event.preventDefault()
-    void commitWithMode('queue')
   }
 }
 </script>
@@ -432,25 +366,13 @@ function handleWindowKey(event: KeyboardEvent) {
           ref="editor"
           v-model="editorBody"
           :readonly="saving || closing"
-          placeholder-text="记下想法，支持 Markdown 语法与输入 [[ 关联已有知识页…"
+          :wikilink-candidates="wikilinkCandidates"
+          compact-tooltip
+          placeholder-text="记下想法，支持 Markdown 语法与输入 [[ 或 【【 关联已有知识页…"
           @composition-change="composing = $event"
           @blur="!draftError && !closing && !composing && flushDraftNow()"
           @ready="nextTick(focusCaptureEditor)"
         />
-
-        <div v-if="showAc" class="hud-autocomplete" role="listbox" aria-label="双链补全候选">
-          <button
-            v-for="(p, idx) in acSuggestions"
-            :key="p.path"
-            type="button"
-            class="hud-ac-item"
-            :class="{ active: idx === acActiveIdx }"
-            @mousedown.prevent="insertWikilink(p)"
-          >
-            <span>[[{{ p.title }}]]</span>
-            <span style="color:var(--muted);">{{ p.typeLabel }}</span>
-          </button>
-        </div>
 
         <div v-if="hasWriteError" class="hud-error-bar" role="alert">
           <div style="display:flex;flex-direction:column;gap:2px;">

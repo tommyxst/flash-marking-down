@@ -350,6 +350,30 @@ pub(crate) async fn workspace_for_session(
     .await
 }
 
+fn wikilink_window_allowed(label: &str, capture_active: bool) -> bool {
+    label == MAIN_WINDOW || label == CAPTURE_WINDOW && capture_active
+}
+
+#[tauri::command]
+pub(crate) async fn list_wikilink_candidates(
+    window: WebviewWindow,
+    session: String,
+) -> Result<Vec<crate::dto::wikra::WikilinkCandidateDto>, AppError> {
+    let label = window.label().to_owned();
+    in_workspace_state(window.app_handle(), move |state, app| {
+        if !wikilink_window_allowed(&label, app.state::<DesktopWindows>().capture_active()) {
+            return Err(AppError::invalid(
+                "wikilink",
+                "请在主窗口或活动的快捷窗口补全双链",
+            ));
+        }
+        state
+            .workspace(&session)?
+            .with_storage(|storage| Ok(storage.list_wikilink_candidates()?))
+    })
+    .await
+}
+
 async fn with_draft_workspace<T: Send + 'static>(
     window: WebviewWindow,
     session: String,
@@ -977,6 +1001,39 @@ mod tests {
     use super::*;
     use crate::storage::tests::TestDir;
     use std::fs;
+
+    #[test]
+    fn wikilink_candidates_accept_main_and_active_capture_for_the_current_session() {
+        let directory = TestDir::new();
+        let settings = directory.0.join("settings.json");
+        let root = directory.0.to_str().unwrap();
+        let mut state = WorkspaceState::default();
+        let opened = state.activate(&settings, root, "notes", false).unwrap();
+        let desktop = DesktopWindows::default();
+        assert!(!wikilink_window_allowed(
+            CAPTURE_WINDOW,
+            desktop.capture_active()
+        ));
+        desktop.begin_capture().unwrap();
+        assert!(wikilink_window_allowed(
+            MAIN_WINDOW,
+            desktop.capture_active()
+        ));
+        assert!(wikilink_window_allowed(
+            CAPTURE_WINDOW,
+            desktop.capture_active()
+        ));
+        assert!(!wikilink_window_allowed("other", desktop.capture_active()));
+        assert!(state.workspace("expired-session").is_err());
+        let workspace = state.workspace(&opened.session).unwrap();
+        let candidates = workspace
+            .with_storage(|storage| {
+                storage.create_markdown_document("wiki/Inbox.md", "# Capture lookup\n")?;
+                storage.list_wikilink_candidates()
+            })
+            .unwrap();
+        assert_eq!(candidates[0].link_text, "[[Inbox|Capture lookup]]");
+    }
 
     #[test]
     fn active_capture_allows_main_close_and_prevents_workspace_switch() {

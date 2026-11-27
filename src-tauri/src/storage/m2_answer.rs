@@ -1126,6 +1126,10 @@ mod tests {
                  );
                  INSERT INTO search_documents SELECT * FROM legacy_search_backup;
                  DROP TABLE legacy_search_backup;
+                 DROP TABLE wikra_changeset_ops; DROP TABLE wikra_changeset_pages;
+                 DROP TABLE wikra_lint_findings; DROP TABLE wikra_changesets;
+                 DROP TABLE inbox_paragraphs; DROP TABLE inbox_items; DROP TABLE capture_buffer_queue;
+                 DROP TABLE dismissed_suggestions; DROP TABLE dismissed_graph_gaps;
                  DROP TABLE conflicts;
                  DROP TABLE background_jobs; DROP TABLE chat_messages; DROP TABLE conversations; DROP TABLE notes;
                  CREATE TABLE m2_disagreements (id TEXT PRIMARY KEY, data TEXT NOT NULL);
